@@ -1,0 +1,973 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>TaskFlow — Async Task Queue Dashboard</title>
+  <meta name="description" content="Real-time monitoring and management dashboard for the Redis-backed asynchronous task queue. Track task status, queue metrics, and manage failed tasks." />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+
+  <style>
+    /* ── Design System ──────────────────────────────────────────────────────── */
+    :root {
+      --bg-base:       #0a0d14;
+      --bg-surface:    #111520;
+      --bg-card:       #161b2e;
+      --bg-card-hover: #1c2340;
+      --border:        rgba(99, 120, 255, 0.15);
+      --border-bright: rgba(99, 120, 255, 0.4);
+
+      --accent-blue:   #6378ff;
+      --accent-cyan:   #00d4ff;
+      --accent-green:  #00e5a0;
+      --accent-yellow: #ffd166;
+      --accent-red:    #ff5572;
+      --accent-purple: #b96bff;
+
+      --text-primary:  #e8ecff;
+      --text-secondary:#8b95c4;
+      --text-muted:    #4a5280;
+
+      --radius-sm: 8px;
+      --radius-md: 14px;
+      --radius-lg: 20px;
+
+      --shadow-glow-blue:   0 0 30px rgba(99, 120, 255, 0.15);
+      --shadow-glow-green:  0 0 20px rgba(0, 229, 160, 0.15);
+      --shadow-glow-red:    0 0 20px rgba(255, 85, 114, 0.15);
+    }
+
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: 'Inter', sans-serif;
+      background: var(--bg-base);
+      color: var(--text-primary);
+      min-height: 100vh;
+      overflow-x: hidden;
+    }
+
+    /* Ambient background blobs */
+    body::before {
+      content: '';
+      position: fixed;
+      top: -20%;
+      left: -10%;
+      width: 600px;
+      height: 600px;
+      background: radial-gradient(circle, rgba(99,120,255,0.08) 0%, transparent 70%);
+      pointer-events: none;
+      z-index: 0;
+    }
+    body::after {
+      content: '';
+      position: fixed;
+      bottom: -20%;
+      right: -10%;
+      width: 500px;
+      height: 500px;
+      background: radial-gradient(circle, rgba(0,212,255,0.06) 0%, transparent 70%);
+      pointer-events: none;
+      z-index: 0;
+    }
+
+    /* ── Layout ─────────────────────────────────────────────────────────────── */
+    .app-wrapper {
+      position: relative;
+      z-index: 1;
+      max-width: 1280px;
+      margin: 0 auto;
+      padding: 0 24px 60px;
+    }
+
+    /* ── Header ─────────────────────────────────────────────────────────────── */
+    header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 28px 0 36px;
+      border-bottom: 1px solid var(--border);
+      margin-bottom: 36px;
+    }
+    .logo {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+    .logo-icon {
+      width: 42px;
+      height: 42px;
+      border-radius: var(--radius-sm);
+      background: linear-gradient(135deg, var(--accent-blue), var(--accent-cyan));
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 20px;
+      box-shadow: 0 4px 20px rgba(99,120,255,0.4);
+    }
+    .logo-text h1 {
+      font-size: 20px;
+      font-weight: 700;
+      background: linear-gradient(90deg, var(--accent-blue), var(--accent-cyan));
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+    }
+    .logo-text p {
+      font-size: 12px;
+      color: var(--text-muted);
+      font-weight: 400;
+      margin-top: 2px;
+    }
+    .header-status {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 13px;
+      color: var(--text-secondary);
+      background: rgba(0,229,160,0.08);
+      border: 1px solid rgba(0,229,160,0.2);
+      padding: 6px 14px;
+      border-radius: 999px;
+    }
+    .pulse-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: var(--accent-green);
+      animation: pulse 2s ease infinite;
+    }
+    @keyframes pulse {
+      0%, 100% { opacity: 1; transform: scale(1); }
+      50%       { opacity: 0.5; transform: scale(0.8); }
+    }
+
+    /* ── Section heading ────────────────────────────────────────────────────── */
+    .section-label {
+      font-size: 11px;
+      font-weight: 600;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+      color: var(--text-muted);
+      margin-bottom: 14px;
+    }
+
+    /* ── Metrics grid ───────────────────────────────────────────────────────── */
+    .metrics-grid {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 16px;
+      margin-bottom: 36px;
+    }
+    .metric-card {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-md);
+      padding: 20px 22px;
+      position: relative;
+      overflow: hidden;
+      transition: border-color 0.25s, transform 0.2s;
+    }
+    .metric-card:hover { border-color: var(--border-bright); transform: translateY(-2px); }
+    .metric-card::before {
+      content: '';
+      position: absolute;
+      top: 0; left: 0; right: 0;
+      height: 2px;
+    }
+    .metric-card.pending::before  { background: linear-gradient(90deg, var(--accent-blue), var(--accent-cyan)); }
+    .metric-card.processing::before { background: linear-gradient(90deg, var(--accent-purple), var(--accent-blue)); }
+    .metric-card.delayed::before  { background: linear-gradient(90deg, var(--accent-yellow), #ff9a3c); }
+    .metric-card.dlq::before      { background: linear-gradient(90deg, var(--accent-red), #ff8a70); }
+
+    .metric-label {
+      font-size: 12px;
+      color: var(--text-secondary);
+      margin-bottom: 10px;
+      font-weight: 500;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .metric-value {
+      font-size: 36px;
+      font-weight: 700;
+      font-family: 'JetBrains Mono', monospace;
+      line-height: 1;
+      transition: color 0.3s;
+    }
+    .metric-value.pending   { color: var(--accent-blue); }
+    .metric-value.processing{ color: var(--accent-purple); }
+    .metric-value.delayed   { color: var(--accent-yellow); }
+    .metric-value.dlq       { color: var(--accent-red); }
+    .metric-sub {
+      font-size: 11px;
+      color: var(--text-muted);
+      margin-top: 6px;
+    }
+
+    /* ── Two-column layout ──────────────────────────────────────────────────── */
+    .main-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 24px;
+      margin-bottom: 24px;
+    }
+
+    /* ── Card ───────────────────────────────────────────────────────────────── */
+    .card {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-lg);
+      padding: 24px;
+    }
+    .card-title {
+      font-size: 15px;
+      font-weight: 600;
+      margin-bottom: 20px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .card-title span { font-size: 18px; }
+
+    /* ── Forms ──────────────────────────────────────────────────────────────── */
+    .form-group { margin-bottom: 14px; }
+    label.field-label {
+      display: block;
+      font-size: 12px;
+      font-weight: 500;
+      color: var(--text-secondary);
+      margin-bottom: 6px;
+    }
+    input[type="text"],
+    input[type="email"],
+    input[type="number"],
+    textarea {
+      width: 100%;
+      background: rgba(255,255,255,0.04);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-sm);
+      padding: 10px 14px;
+      font-size: 14px;
+      color: var(--text-primary);
+      font-family: 'Inter', sans-serif;
+      transition: border-color 0.2s, box-shadow 0.2s;
+      outline: none;
+    }
+    input:focus, textarea:focus {
+      border-color: var(--accent-blue);
+      box-shadow: 0 0 0 3px rgba(99,120,255,0.12);
+    }
+    textarea { resize: none; height: 72px; }
+
+    /* ── Buttons ────────────────────────────────────────────────────────────── */
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      padding: 10px 20px;
+      border-radius: var(--radius-sm);
+      font-size: 13px;
+      font-weight: 600;
+      font-family: 'Inter', sans-serif;
+      border: none;
+      cursor: pointer;
+      transition: all 0.2s;
+      white-space: nowrap;
+    }
+    .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+    .btn-primary {
+      background: linear-gradient(135deg, var(--accent-blue), #4f65ff);
+      color: #fff;
+      box-shadow: 0 4px 16px rgba(99,120,255,0.3);
+    }
+    .btn-primary:hover:not(:disabled) {
+      transform: translateY(-1px);
+      box-shadow: 0 6px 24px rgba(99,120,255,0.45);
+    }
+    .btn-green {
+      background: linear-gradient(135deg, var(--accent-green), #00b87d);
+      color: #001a12;
+      box-shadow: 0 4px 14px rgba(0,229,160,0.25);
+    }
+    .btn-green:hover:not(:disabled) { transform: translateY(-1px); }
+    .btn-yellow {
+      background: rgba(255,209,102,0.15);
+      border: 1px solid rgba(255,209,102,0.35);
+      color: var(--accent-yellow);
+      padding: 5px 12px;
+      font-size: 12px;
+    }
+    .btn-yellow:hover { background: rgba(255,209,102,0.25); }
+    .btn-red {
+      background: rgba(255,85,114,0.12);
+      border: 1px solid rgba(255,85,114,0.3);
+      color: var(--accent-red);
+      padding: 5px 12px;
+      font-size: 12px;
+    }
+    .btn-red:hover { background: rgba(255,85,114,0.22); }
+    .btn-red-solid {
+      background: linear-gradient(135deg, var(--accent-red), #e03060);
+      color: #fff;
+      box-shadow: 0 4px 14px rgba(255,85,114,0.3);
+    }
+    .btn-red-solid:hover:not(:disabled) { transform: translateY(-1px); }
+    .btn-full { width: 100%; }
+
+    /* ── Toast notification ─────────────────────────────────────────────────── */
+    #toast-container {
+      position: fixed;
+      bottom: 28px;
+      right: 28px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      z-index: 9999;
+    }
+    .toast {
+      background: var(--bg-card);
+      border: 1px solid var(--border-bright);
+      border-radius: var(--radius-sm);
+      padding: 12px 18px;
+      font-size: 13px;
+      max-width: 300px;
+      animation: slideIn 0.3s ease;
+      box-shadow: var(--shadow-glow-blue);
+    }
+    .toast.success { border-color: rgba(0,229,160,0.4); box-shadow: var(--shadow-glow-green); }
+    .toast.error   { border-color: rgba(255,85,114,0.4); box-shadow: var(--shadow-glow-red); }
+    @keyframes slideIn {
+      from { opacity: 0; transform: translateX(20px); }
+      to   { opacity: 1; transform: translateX(0); }
+    }
+
+    /* ── Task list ──────────────────────────────────────────────────────────── */
+    .task-list {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      max-height: 360px;
+      overflow-y: auto;
+      padding-right: 4px;
+    }
+    .task-list::-webkit-scrollbar { width: 4px; }
+    .task-list::-webkit-scrollbar-track { background: transparent; }
+    .task-list::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
+
+    .task-item {
+      background: rgba(255,255,255,0.03);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-sm);
+      padding: 12px 14px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      transition: border-color 0.2s;
+    }
+    .task-item:hover { border-color: var(--border-bright); }
+    .task-info { flex: 1; min-width: 0; }
+    .task-name {
+      font-size: 13px;
+      font-weight: 500;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .task-id-display {
+      font-size: 11px;
+      color: var(--text-muted);
+      font-family: 'JetBrains Mono', monospace;
+      margin-top: 3px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    /* Status badge */
+    .badge {
+      font-size: 11px;
+      font-weight: 600;
+      padding: 3px 10px;
+      border-radius: 999px;
+      white-space: nowrap;
+      display: flex;
+      align-items: center;
+      gap: 5px;
+    }
+    .badge-queued      { background: rgba(99,120,255,0.15);  color: var(--accent-blue);   border: 1px solid rgba(99,120,255,0.3); }
+    .badge-processing  { background: rgba(185,107,255,0.15); color: var(--accent-purple); border: 1px solid rgba(185,107,255,0.3); }
+    .badge-success     { background: rgba(0,229,160,0.12);   color: var(--accent-green);  border: 1px solid rgba(0,229,160,0.3); }
+    .badge-retryscheduled { background: rgba(255,209,102,0.12); color: var(--accent-yellow); border: 1px solid rgba(255,209,102,0.3); }
+    .badge-deadletter  { background: rgba(255,85,114,0.12);  color: var(--accent-red);    border: 1px solid rgba(255,85,114,0.3); }
+    .badge-failed      { background: rgba(255,85,114,0.12);  color: var(--accent-red);    border: 1px solid rgba(255,85,114,0.3); }
+    .badge-unknown     { background: rgba(139,149,196,0.12); color: var(--text-secondary);border: 1px solid rgba(139,149,196,0.2);}
+
+    /* Spinner for in-progress tasks */
+    .spinner {
+      width: 10px;
+      height: 10px;
+      border: 2px solid transparent;
+      border-top-color: currentColor;
+      border-radius: 50%;
+      animation: spin 0.7s linear infinite;
+      display: inline-block;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    /* Empty state */
+    .empty-state {
+      text-align: center;
+      padding: 40px 20px;
+      color: var(--text-muted);
+      font-size: 13px;
+    }
+    .empty-state .icon { font-size: 32px; margin-bottom: 10px; }
+
+    /* ── DLQ Inspector ──────────────────────────────────────────────────────── */
+    .dlq-item {
+      background: rgba(255,85,114,0.04);
+      border: 1px solid rgba(255,85,114,0.15);
+      border-radius: var(--radius-sm);
+      margin-bottom: 10px;
+      overflow: hidden;
+      transition: border-color 0.2s;
+    }
+    .dlq-item:hover { border-color: rgba(255,85,114,0.3); }
+    .dlq-item-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 12px 14px;
+      cursor: pointer;
+      gap: 12px;
+      user-select: none;
+    }
+    .dlq-item-meta { flex: 1; min-width: 0; }
+    .dlq-task-name {
+      font-size: 13px;
+      font-weight: 500;
+      color: var(--accent-red);
+    }
+    .dlq-task-id {
+      font-size: 11px;
+      color: var(--text-muted);
+      font-family: 'JetBrains Mono', monospace;
+      margin-top: 2px;
+    }
+    .dlq-actions { display: flex; gap: 6px; align-items: center; flex-shrink: 0; }
+    .dlq-expand { color: var(--text-muted); transition: transform 0.2s; font-size: 12px; }
+    .dlq-expand.open { transform: rotate(180deg); }
+    .dlq-json {
+      display: none;
+      padding: 0 14px 12px;
+    }
+    .dlq-json.visible { display: block; }
+    .dlq-json pre {
+      background: rgba(0,0,0,0.3);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-sm);
+      padding: 10px 12px;
+      font-size: 11px;
+      font-family: 'JetBrains Mono', monospace;
+      color: var(--text-secondary);
+      overflow-x: auto;
+      white-space: pre-wrap;
+      word-break: break-all;
+    }
+
+    /* ── DLQ header bar ─────────────────────────────────────────────────────── */
+    .dlq-header-bar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 16px;
+    }
+    .dlq-count-badge {
+      font-size: 12px;
+      font-weight: 600;
+      padding: 3px 10px;
+      border-radius: 999px;
+      background: rgba(255,85,114,0.12);
+      color: var(--accent-red);
+      border: 1px solid rgba(255,85,114,0.25);
+    }
+
+    /* ── Dispatcher tabs ────────────────────────────────────────────────────── */
+    .tabs {
+      display: flex;
+      gap: 4px;
+      background: rgba(255,255,255,0.04);
+      border-radius: var(--radius-sm);
+      padding: 4px;
+      margin-bottom: 18px;
+    }
+    .tab {
+      flex: 1;
+      padding: 8px 12px;
+      border-radius: 6px;
+      font-size: 13px;
+      font-weight: 500;
+      cursor: pointer;
+      border: none;
+      background: transparent;
+      color: var(--text-secondary);
+      transition: all 0.2s;
+      font-family: 'Inter', sans-serif;
+    }
+    .tab.active {
+      background: var(--bg-card-hover);
+      color: var(--text-primary);
+      border: 1px solid var(--border);
+    }
+    .tab-panel { display: none; }
+    .tab-panel.active { display: block; }
+
+    /* ── Result toast strip ─────────────────────────────────────────────────── */
+    .result-strip {
+      background: rgba(0,229,160,0.06);
+      border: 1px solid rgba(0,229,160,0.2);
+      border-radius: var(--radius-sm);
+      padding: 10px 14px;
+      font-size: 12px;
+      color: var(--accent-green);
+      margin-top: 12px;
+      display: none;
+      font-family: 'JetBrains Mono', monospace;
+      word-break: break-all;
+    }
+    .result-strip.show { display: block; }
+
+    /* ── Full-width DLQ section ─────────────────────────────────────────────── */
+    .full-width-card { margin-bottom: 24px; }
+
+    /* ── Scrollable DLQ list ────────────────────────────────────────────────── */
+    .dlq-list {
+      max-height: 400px;
+      overflow-y: auto;
+      padding-right: 4px;
+    }
+    .dlq-list::-webkit-scrollbar { width: 4px; }
+    .dlq-list::-webkit-scrollbar-thumb { background: rgba(255,85,114,0.3); border-radius: 4px; }
+
+    /* ── Responsive ─────────────────────────────────────────────────────────── */
+    @media (max-width: 900px) {
+      .metrics-grid { grid-template-columns: repeat(2, 1fr); }
+      .main-grid { grid-template-columns: 1fr; }
+    }
+    @media (max-width: 560px) {
+      .metrics-grid { grid-template-columns: 1fr 1fr; }
+    }
+  </style>
+</head>
+<body>
+
+<div class="app-wrapper">
+
+  <!-- ── HEADER ─────────────────────────────────────────────────────────── -->
+  <header>
+    <div class="logo">
+      <div class="logo-icon">⚡</div>
+      <div class="logo-text">
+        <h1>TaskFlow</h1>
+        <p>Async Queue Dashboard</p>
+      </div>
+    </div>
+    <div class="header-status">
+      <div class="pulse-dot"></div>
+      Live · updates every 2s
+    </div>
+  </header>
+
+  <!-- ── METRICS STRIP ──────────────────────────────────────────────────── -->
+  <p class="section-label">Queue Overview</p>
+  <div class="metrics-grid">
+    <div class="metric-card pending">
+      <div class="metric-label">📥 Pending</div>
+      <div class="metric-value pending" id="metric-pending">—</div>
+      <div class="metric-sub">task_queue</div>
+    </div>
+    <div class="metric-card processing">
+      <div class="metric-label">⚙️ Processing</div>
+      <div class="metric-value processing" id="metric-processing">—</div>
+      <div class="metric-sub">processing_queue</div>
+    </div>
+    <div class="metric-card delayed">
+      <div class="metric-label">⏱ Retrying</div>
+      <div class="metric-value delayed" id="metric-delayed">—</div>
+      <div class="metric-sub">delayed_tasks</div>
+    </div>
+    <div class="metric-card dlq">
+      <div class="metric-label">💀 Dead Letter</div>
+      <div class="metric-value dlq" id="metric-dlq">—</div>
+      <div class="metric-sub">dead_letter_queue</div>
+    </div>
+  </div>
+
+  <!-- ── MAIN GRID: Dispatcher + Task Tracker ───────────────────────────── -->
+  <div class="main-grid">
+
+    <!-- Task Dispatcher -->
+    <div class="card">
+      <div class="card-title"><span>🚀</span> Dispatch Task</div>
+
+      <div class="tabs">
+        <button class="tab active" id="tab-email-btn" onclick="switchTab('email')">✉️ Send Email</button>
+        <button class="tab" id="tab-cpu-btn" onclick="switchTab('cpu')">🔢 Matrix Multiply</button>
+      </div>
+
+      <!-- Email Panel -->
+      <div class="tab-panel active" id="tab-email">
+        <form id="email-form" onsubmit="submitEmail(event)">
+          <div class="form-group">
+            <label class="field-label" for="email-input">Recipient Email</label>
+            <input type="email" id="email-input" name="email" placeholder="user@example.com" required />
+          </div>
+          <div class="form-group">
+            <label class="field-label" for="title-input">Subject</label>
+            <input type="text" id="title-input" name="title" placeholder="Hello there!" required />
+          </div>
+          <div class="form-group">
+            <label class="field-label" for="body-input">Message Body</label>
+            <textarea id="body-input" name="body" placeholder="Type your message here…" required></textarea>
+          </div>
+          <button type="submit" class="btn btn-green btn-full" id="btn-send-email">
+            ✉️ Queue Email Task
+          </button>
+          <div class="result-strip" id="email-result"></div>
+        </form>
+      </div>
+
+      <!-- CPU Panel -->
+      <div class="tab-panel" id="tab-cpu">
+        <form id="cpu-form" onsubmit="submitCPU(event)">
+          <div class="form-group">
+            <label class="field-label" for="size-input">Matrix Size (N×N)</label>
+            <input type="number" id="size-input" name="size" value="10" min="1" max="500" />
+          </div>
+          <p style="font-size: 12px; color: var(--text-muted); margin-bottom: 16px;">
+            Runs <code style="color: var(--accent-cyan); font-family: JetBrains Mono;">N³</code> multiplications using a <strong>ProcessPoolExecutor</strong> (bypasses GIL). Larger N = heavier CPU work.
+          </p>
+          <button type="submit" class="btn btn-primary btn-full" id="btn-send-cpu">
+            🔢 Queue Matrix Task
+          </button>
+          <div class="result-strip" id="cpu-result"></div>
+        </form>
+      </div>
+    </div>
+
+    <!-- Recent Tasks Tracker -->
+    <div class="card">
+      <div class="card-title"><span>📋</span> Recent Tasks</div>
+      <div class="task-list" id="task-list">
+        <div class="empty-state">
+          <div class="icon">📭</div>
+          No tasks submitted yet.<br />Dispatch one to get started.
+        </div>
+      </div>
+    </div>
+
+  </div>
+
+  <!-- ── DLQ INSPECTOR ──────────────────────────────────────────────────── -->
+  <div class="card full-width-card">
+    <div class="dlq-header-bar">
+      <div class="card-title" style="margin-bottom:0"><span>💀</span> Dead Letter Queue</div>
+      <div style="display:flex; align-items:center; gap:10px;">
+        <span class="dlq-count-badge" id="dlq-count-badge">0 tasks</span>
+        <button class="btn btn-red-solid" id="btn-purge-all" onclick="purgeAll()">🗑 Purge All</button>
+      </div>
+    </div>
+
+    <div class="dlq-list" id="dlq-list">
+      <div class="empty-state" id="dlq-empty">
+        <div class="icon">✅</div>
+        No failed tasks — system is healthy.
+      </div>
+    </div>
+  </div>
+
+</div>
+
+<!-- ── TOAST CONTAINER ────────────────────────────────────────────────────── -->
+<div id="toast-container"></div>
+
+
+<script>
+  // ── State ─────────────────────────────────────────────────────────────────
+  const submittedTasks = []; // [{task_id, task_name, submitted_at}]
+
+  // ── Tab switcher ──────────────────────────────────────────────────────────
+  function switchTab(name) {
+    ['email', 'cpu'].forEach(t => {
+      document.getElementById(`tab-${t}`).classList.toggle('active', t === name);
+      document.getElementById(`tab-${t}-btn`).classList.toggle('active', t === name);
+    });
+  }
+
+  // ── Toast ─────────────────────────────────────────────────────────────────
+  function showToast(msg, type = 'info') {
+    const el = document.createElement('div');
+    el.className = `toast ${type}`;
+    el.textContent = msg;
+    document.getElementById('toast-container').appendChild(el);
+    setTimeout(() => el.remove(), 3500);
+  }
+
+  // ── Submit email task ──────────────────────────────────────────────────────
+  async function submitEmail(e) {
+    e.preventDefault();
+    const btn = document.getElementById('btn-send-email');
+    btn.disabled = true;
+    btn.textContent = '⏳ Queuing…';
+
+    const form = document.getElementById('email-form');
+    const data = new FormData(form);
+    try {
+      const res = await fetch('/task/send_email', { method: 'POST', body: data });
+      const json = await res.json();
+      if (res.ok) {
+        showToast(`✅ Email task queued! ID: ${json.task_id.slice(0,8)}…`, 'success');
+        submittedTasks.unshift({ task_id: json.task_id, task_name: 'send_email', submitted_at: new Date() });
+        renderTaskList();
+        const strip = document.getElementById('email-result');
+        strip.textContent = `task_id: ${json.task_id}`;
+        strip.classList.add('show');
+        form.reset();
+      } else {
+        showToast('❌ Failed to queue task', 'error');
+      }
+    } catch {
+      showToast('❌ Network error', 'error');
+    } finally {
+      btn.disabled = false;
+      btn.textContent = '✉️ Queue Email Task';
+    }
+  }
+
+  // ── Submit CPU task ────────────────────────────────────────────────────────
+  async function submitCPU(e) {
+    e.preventDefault();
+    const btn = document.getElementById('btn-send-cpu');
+    btn.disabled = true;
+    btn.textContent = '⏳ Queuing…';
+
+    const size = document.getElementById('size-input').value || 10;
+    try {
+      const res = await fetch(`/task/mul?size=${size}`);
+      const json = await res.json();
+      if (res.ok) {
+        showToast(`✅ Matrix task queued! ID: ${json.task_id.slice(0,8)}…`, 'success');
+        submittedTasks.unshift({ task_id: json.task_id, task_name: 'matrix_multiply', submitted_at: new Date() });
+        renderTaskList();
+        const strip = document.getElementById('cpu-result');
+        strip.textContent = `task_id: ${json.task_id}`;
+        strip.classList.add('show');
+      } else {
+        showToast('❌ Failed to queue task', 'error');
+      }
+    } catch {
+      showToast('❌ Network error', 'error');
+    } finally {
+      btn.disabled = false;
+      btn.textContent = '🔢 Queue Matrix Task';
+    }
+  }
+
+  // ── Status helpers ─────────────────────────────────────────────────────────
+  const STATUS_META = {
+    Success:        { cls: 'badge-success',        label: '✓ Success',       spin: false },
+    DeadLetter:     { cls: 'badge-deadletter',      label: '💀 Dead Letter',  spin: false },
+    RetryScheduled: { cls: 'badge-retryscheduled',  label: '⏱ Retrying',     spin: false },
+    Failed:         { cls: 'badge-failed',          label: '✗ Failed',        spin: false },
+    queued:         { cls: 'badge-queued',          label: '📥 Queued',       spin: false },
+    Processing:     { cls: 'badge-processing',      label: '⚙ Running',      spin: true  },
+    unknown:        { cls: 'badge-unknown',          label: '⏳ Waiting…',    spin: true  },
+  };
+
+  function makeBadge(status) {
+    const meta = STATUS_META[status] || STATUS_META['unknown'];
+    const spinHtml = meta.spin ? '<span class="spinner"></span>' : '';
+    return `<span class="badge ${meta.cls}">${spinHtml}${meta.label}</span>`;
+  }
+
+  // ── Render task list ──────────────────────────────────────────────────────
+  function renderTaskList() {
+    const container = document.getElementById('task-list');
+    if (submittedTasks.length === 0) {
+      container.innerHTML = `<div class="empty-state"><div class="icon">📭</div>No tasks submitted yet.<br/>Dispatch one to get started.</div>`;
+      return;
+    }
+    container.innerHTML = submittedTasks.slice(0, 20).map(t => {
+      const meta = t._meta || {};
+      const status = meta.status || 'unknown';
+      const shortId = t.task_id.slice(0, 8);
+      const label   = t.task_name === 'matrix_multiply' ? '🔢 Matrix Multiply' : '✉️ Send Email';
+      return `
+        <div class="task-item">
+          <div class="task-info">
+            <div class="task-name">${label}</div>
+            <div class="task-id-display">${t.task_id}</div>
+          </div>
+          ${makeBadge(status)}
+        </div>`;
+    }).join('');
+  }
+
+  // ── Poll individual task statuses ─────────────────────────────────────────
+  async function pollTaskStatuses() {
+    const active = submittedTasks.filter(t => {
+      const s = t._meta?.status;
+      return !s || (s !== 'Success' && s !== 'DeadLetter' && s !== 'Failed');
+    });
+    await Promise.all(active.map(async t => {
+      try {
+        const res  = await fetch(`/task/${t.task_id}`);
+        const json = await res.json();
+        const meta = json.result || {};
+        if (Object.keys(meta).length > 0) {
+          t._meta = meta;
+        }
+      } catch { /* network blip — ignore */ }
+    }));
+    renderTaskList();
+  }
+
+  // ── Fetch queue metrics ────────────────────────────────────────────────────
+  async function fetchMetrics() {
+    try {
+      const res  = await fetch('/metrics');
+      const data = await res.json();
+      document.getElementById('metric-pending').textContent    = data.pending    ?? '—';
+      document.getElementById('metric-processing').textContent = data.processing ?? '—';
+      document.getElementById('metric-delayed').textContent    = data.delayed    ?? '—';
+      document.getElementById('metric-dlq').textContent        = data.dlq        ?? '—';
+    } catch { /* ignore */ }
+  }
+
+  // ── Fetch & render DLQ ────────────────────────────────────────────────────
+  async function fetchDLQ() {
+    try {
+      const res  = await fetch('/dlq');
+      const data = await res.json();
+      const tasks = data.tasks || [];
+
+      const badge = document.getElementById('dlq-count-badge');
+      badge.textContent = `${tasks.length} task${tasks.length !== 1 ? 's' : ''}`;
+
+      const container = document.getElementById('dlq-list');
+      const empty     = document.getElementById('dlq-empty');
+
+      // Remove old dlq-item rows (preserve dlq-empty)
+      container.querySelectorAll('.dlq-item').forEach(el => el.remove());
+
+      if (tasks.length === 0) {
+        empty.style.display = 'block';
+        return;
+      }
+      empty.style.display = 'none';
+
+      tasks.forEach(task => {
+        const id = task.task_id || 'unknown';
+        const div = document.createElement('div');
+        div.className = 'dlq-item';
+        div.id = `dlq-${id}`;
+        div.innerHTML = `
+          <div class="dlq-item-header" onclick="toggleDLQExpand('${id}')">
+            <div class="dlq-item-meta">
+              <div class="dlq-task-name">💀 ${task.task_name || 'unknown'}</div>
+              <div class="dlq-task-id">${id}</div>
+            </div>
+            <div class="dlq-actions">
+              <button class="btn btn-yellow" onclick="event.stopPropagation(); replayTask('${id}')">↩ Replay</button>
+              <button class="btn btn-red"    onclick="event.stopPropagation(); purgeTask('${id}')">✕ Delete</button>
+              <span class="dlq-expand" id="dlq-expand-${id}">▼</span>
+            </div>
+          </div>
+          <div class="dlq-json" id="dlq-json-${id}">
+            <pre>${JSON.stringify(task, null, 2)}</pre>
+          </div>`;
+        container.appendChild(div);
+      });
+    } catch { /* ignore */ }
+  }
+
+  function toggleDLQExpand(id) {
+    const json   = document.getElementById(`dlq-json-${id}`);
+    const arrow  = document.getElementById(`dlq-expand-${id}`);
+    const isOpen = json.classList.toggle('visible');
+    arrow.classList.toggle('open', isOpen);
+  }
+
+  // ── Replay a task from DLQ ────────────────────────────────────────────────
+  async function replayTask(task_id) {
+    try {
+      const res = await fetch(`/dlq/replay/${task_id}`, { method: 'POST' });
+      if (res.ok) {
+        showToast('↩ Task re-queued for processing', 'success');
+        fetchDLQ();
+        fetchMetrics();
+      } else if (res.status === 404) {
+        showToast('Task not found in DLQ', 'error');
+      } else {
+        showToast('Failed to replay task', 'error');
+      }
+    } catch {
+      showToast('Network error', 'error');
+    }
+  }
+
+  // ── Purge one task from DLQ ───────────────────────────────────────────────
+  async function purgeTask(task_id) {
+    try {
+      const res = await fetch(`/dlq/purge/${task_id}`, { method: 'POST' });
+      if (res.ok) {
+        showToast('🗑 Task permanently deleted', 'success');
+        fetchDLQ();
+        fetchMetrics();
+      } else if (res.status === 404) {
+        showToast('Task not found in DLQ', 'error');
+      } else {
+        showToast('Failed to purge task', 'error');
+      }
+    } catch {
+      showToast('Network error', 'error');
+    }
+  }
+
+  // ── Purge entire DLQ ──────────────────────────────────────────────────────
+  async function purgeAll() {
+    const btn = document.getElementById('btn-purge-all');
+    btn.disabled = true;
+    try {
+      const res = await fetch('/dlq/purge_all', { method: 'POST' });
+      if (res.ok) {
+        showToast('🗑 All DLQ tasks purged', 'success');
+        fetchDLQ();
+        fetchMetrics();
+      } else {
+        showToast('Failed to purge DLQ', 'error');
+      }
+    } catch {
+      showToast('Network error', 'error');
+    } finally {
+      btn.disabled = false;
+    }
+  }
+
+  // ── Polling loop ──────────────────────────────────────────────────────────
+  async function poll() {
+    await Promise.all([fetchMetrics(), pollTaskStatuses(), fetchDLQ()]);
+  }
+
+  poll();
+  setInterval(poll, 2000);
+</script>
+
+</body>
+</html>
