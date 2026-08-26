@@ -1,0 +1,19 @@
+FROM python:3.11-slim
+
+#make a app dir in conatiner
+WORKDIR /app
+
+# 1. Install dependencies first (for layer caching)
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# 2. Copy source code
+COPY . /app
+
+# 3. Create non-root user and assign ownership
+RUN useradd -m myuser && chown -R myuser:myuser /app
+USER myuser
+
+# 4. Expose port and start Uvicorn using src.app:app
+EXPOSE 8000
+CMD ["uvicorn", "src.app:app", "--host", "0.0.0.0", "--port", "8000"]

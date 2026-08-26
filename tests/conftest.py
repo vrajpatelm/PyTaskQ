@@ -60,8 +60,8 @@ def pytest_configure(config):
 
     mock_task_registery = MagicMock()
     mock_task_registery.TASKS = {
-        "send_email": fake_send_email,
-        "matrix_multiply": fake_matrix_multiply,
+        "send_email": {"handler": fake_send_email, "type": "io"},
+        "matrix_multiply": {"handler": fake_matrix_multiply, "type": "cpu"},
     }
     sys.modules["task_registery"] = mock_task_registery
 

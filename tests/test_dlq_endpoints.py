@@ -29,6 +29,7 @@ WHAT IS "DLQ"?
 """
 
 import json
+import time
 import pytest
 import pytest_asyncio
 import fakeredis.aioredis as fakeredis
@@ -68,7 +69,6 @@ def make_dlq_task(task_id, task_name="send_email"):
         "task_name": task_name,
         "args": ["a@b.com", "Hello", "Body"],
         "retry_count": 3,
-        "task_type": "io",
     })
 
 
@@ -109,7 +109,8 @@ async def test_metrics_reflects_task_queue_count(test_client):
 
     for i in range(3):
         await r.lpush("task_queue", make_dlq_task(f"pending-{i}"))
-    await r.lpush("processing_queue", make_dlq_task("processing-1"))
+    await r.zadd("active_workers", {"test_worker": time.time() + 30})
+    await r.lpush("processing_queue:test_worker", make_dlq_task("processing-1"))
     for i in range(2):
         await r.lpush("dead_letter_queue", make_dlq_task(f"dlq-{i}"))
 

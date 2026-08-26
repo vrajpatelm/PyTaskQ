@@ -2,28 +2,33 @@ from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 import json
 import time
 from typing import Any,List
-
+import uuid
 from pydantic import BaseModel
-from task_registery import TASKS
+from src.task_registery import TASKS
 import asyncio
 import redis.asyncio as redis
 import signal
+import os
 
-"Assign the Task to worker here "
+
+REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
+REDIS_PORT = int(os.getenv("REDIS_PORT", 6379))
+WORKER_ID=str(uuid.uuid4())
+
 # for incoming taks VALIDATION
 class Taskloader(BaseModel):
     task_id:str
     task_name:str
     args:List[Any]
     retry_count:int = 0 
-    task_type:str  # "cpu" or "io" 
+    task_type:str = "io"  # Legacy field — execution type is now looked up from the registry
 # for VALIDATION of result of task 
 class Taskresult(BaseModel):
     task_id:str
     status:str
     result:str
     
-r = redis.Redis(host='localhost', port=6379, decode_responses=True)
+r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
 shutdown_event = asyncio.Event()
 active_tasks = set()
 
@@ -43,8 +48,33 @@ async def retry_scheduler():
                       f"(retry #{task_data.get('retry_count')})")
         
         await asyncio.sleep(1)  
-            
+
+async def heartbeat():
+    while True:
+        try:
+            await r.zadd("active_workers",{WORKER_ID:time.time()+30})
+            await asyncio.sleep(10)
+        except Exception as e:
+            print(f"[Heartbeat] Redis unreachable: {e}. Retrying in 5s")
+            await asyncio.sleep(5)
     
+async def zombie_sweeper():
+    while True:
+        try:
+            expired = await r.zrangebyscore("active_workers", "-inf", time.time())
+            for worker_id in expired:
+                while True:
+                    result = await r.rpoplpush(f"processing_queue:{worker_id}", "task_queue")
+                    if not result:
+                        break  # No more tasks for this dead worker
+                # NOW remove the dead worker from the registry
+                await r.zrem("active_workers", worker_id)
+                print(f"[Sweeper] Recovered tasks from dead worker: {worker_id}")
+        except Exception as e:
+            print(f"[Sweeper] Redis error: {e}. Retrying in 5s...")
+            await asyncio.sleep(5)
+        await asyncio.sleep(15)
+
 async def consumer_task():
     process_pool = ProcessPoolExecutor(max_workers=4)
     thread_pool = ThreadPoolExecutor(max_workers=10)
@@ -54,8 +84,6 @@ async def consumer_task():
     def _signal_handler():
         print("Shutdown signal received. Cleaning up...")
         shutdown_event.set()
-
-    # loop.add_signal_handler() is Linux/macOS only — NOT supported on Windows.
     # We use a try/except so the worker runs on both platforms.
     try:
         loop.add_signal_handler(signal.SIGINT, _signal_handler)
@@ -71,7 +99,7 @@ async def consumer_task():
     while not shutdown_event.is_set():
         try:
             while True:
-                leftover = await r.rpoplpush("processing_queue", "task_queue")
+                leftover = await r.rpoplpush(f"processing_queue:{WORKER_ID}", "task_queue")
                 if not leftover:
                     break
                 print(f"Recovered crashed task on startup: {leftover}")
@@ -82,12 +110,14 @@ async def consumer_task():
             await asyncio.sleep(5)
 
     asyncio.create_task(retry_scheduler())
+    asyncio.create_task(heartbeat())
+    asyncio.create_task(zombie_sweeper())
     while not shutdown_event.is_set():
 
         # Unpack the Redis response first
         try:
             await sem.acquire()  # Wait for a free slot
-            task_json = await r.brpoplpush("task_queue", "processing_queue", timeout=2)
+            task_json = await r.brpoplpush("task_queue", f"processing_queue:{WORKER_ID}", timeout=2)
             if task_json is None:
                 sem.release()  # Release the semaphore if no task was fetched
                 continue
@@ -136,8 +166,10 @@ async def handle_task(task_json, sem, loop, process_pool, thread_pool):
         # If task_name is unknown, KeyError is caught here
         # and goes through the normal retry → DLQ pipeline.
         try:
-            func = TASKS[tasks.task_name]   # KeyError caught below if unknown
-            if tasks.task_type == "cpu":
+            entry = TASKS[tasks.task_name]   # KeyError caught below if unknown
+            func = entry["handler"]
+            task_type = entry["type"]
+            if task_type == "cpu":
                 # Run in a process to use another CPU core without GIL blocking
                 result = await loop.run_in_executor(process_pool, func, *tasks.args)
             else:
@@ -174,7 +206,7 @@ async def handle_task(task_json, sem, loop, process_pool, thread_pool):
                 })
             
     finally:
-        await r.lrem("processing_queue",count=1, value=task_json)
+        await r.lrem(f"processing_queue:{WORKER_ID}",count=1, value=task_json)
         sem.release()
 #Start the event loop
 if __name__ == "__main__":

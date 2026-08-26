@@ -44,7 +44,6 @@ def make_task(task_id, retry_count=0):
         "task_name": "send_email",
         "args": ["a@b.com", "Hi", "Body"],
         "retry_count": retry_count,
-        "task_type": "io",
     })
 
 

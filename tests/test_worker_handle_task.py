@@ -38,14 +38,11 @@ from unittest.mock import AsyncMock, patch, MagicMock
 
 def make_task_json(task_name="send_email", retry_count=0, task_id="test-001"):
     """Builds a JSON string exactly like app.py produces."""
-    # Matrix multiply needs 'cpu' pool, emails need 'io' pool
-    task_type = "cpu" if task_name == "matrix_multiply" else "io"
     return json.dumps({
         "task_id": task_id,
         "task_name": task_name,
         "args": ["a@b.com", "Hi", "Body"] if task_name == "send_email" else [3],
         "retry_count": retry_count,
-        "task_type": task_type,
     })
 
 
@@ -83,7 +80,7 @@ async def test_invalid_json_is_logged_as_failed(r, sem, thread_pool):
     with patch.object(worker, "r", r):
         # Put bad JSON in processing_queue first (simulating it was already popped)
         bad_json = "{ this is not valid JSON !!!"
-        await r.lpush("processing_queue", bad_json)
+        await r.lpush(f"processing_queue:{worker.WORKER_ID}", bad_json)
 
         await worker.handle_task(bad_json, sem, loop, thread_pool, thread_pool)
 
@@ -97,7 +94,7 @@ async def test_invalid_json_is_logged_as_failed(r, sem, thread_pool):
     assert dlq_length == 0
 
     # Must be removed from processing_queue
-    proc_length = await r.llen("processing_queue")
+    proc_length = await r.llen(f"processing_queue:{worker.WORKER_ID}")
     assert proc_length == 0
 
 
@@ -112,7 +109,7 @@ async def test_missing_required_field_fails_validation(r, sem, thread_pool):
 
     # Missing task_name and args — Pydantic will reject this
     incomplete = json.dumps({"task_id": "abc-123", "retry_count": 0})
-    await r.lpush("processing_queue", incomplete)
+    await r.lpush(f"processing_queue:{worker.WORKER_ID}", incomplete)
 
     with patch.object(worker, "r", r):
         await worker.handle_task(incomplete, sem, loop, thread_pool, thread_pool)
@@ -138,7 +135,7 @@ async def test_first_failure_schedules_retry(r, sem, thread_pool):
     import worker
     loop = asyncio.get_running_loop()
     task_json = make_task_json(retry_count=0, task_id="retry-test-001")
-    await r.lpush("processing_queue", task_json)
+    await r.lpush(f"processing_queue:{worker.WORKER_ID}", task_json)
 
     # Mock the executor to RAISE an exception (simulate task failure)
     failing_executor = AsyncMock(side_effect=Exception("SMTP server unreachable"))
@@ -181,7 +178,7 @@ async def test_exponential_backoff_delay(r, sem, thread_pool):
     for retry_count, expected_delay in [(0, 2), (1, 4), (2, 8)]:
         await r.flushall()  # Clean slate for each sub-test
         task_json = make_task_json(retry_count=retry_count, task_id="backoff-test")
-        await r.lpush("processing_queue", task_json)
+        await r.lpush(f"processing_queue:{worker.WORKER_ID}", task_json)
 
         before = time.time()
         with patch.object(worker, "r", r):
@@ -219,7 +216,7 @@ async def test_task_goes_to_dlq_after_3_retries(r, sem, thread_pool):
     import worker
     loop = asyncio.get_running_loop()
     task_json = make_task_json(retry_count=3, task_id="dlq-test-001")
-    await r.lpush("processing_queue", task_json)
+    await r.lpush(f"processing_queue:{worker.WORKER_ID}", task_json)
 
     failing_executor = AsyncMock(side_effect=Exception("Still failing"))
 
@@ -244,7 +241,7 @@ async def test_task_goes_to_dlq_after_3_retries(r, sem, thread_pool):
     assert await r.zcard("delayed_tasks") == 0
 
     # 5. Must be removed from processing_queue
-    assert await r.llen("processing_queue") == 0
+    assert await r.llen(f"processing_queue:{worker.WORKER_ID}") == 0
 
 
 @pytest.mark.asyncio
@@ -257,7 +254,7 @@ async def test_dlq_preserves_full_task_data(r, sem, thread_pool):
     import worker
     loop = asyncio.get_running_loop()
     task_json = make_task_json(retry_count=3, task_id="dlq-data-test")
-    await r.lpush("processing_queue", task_json)
+    await r.lpush(f"processing_queue:{worker.WORKER_ID}", task_json)
 
     failing_executor = AsyncMock(side_effect=Exception("Unrecoverable"))
 
@@ -290,7 +287,7 @@ async def test_successful_task_saves_result(r, sem, thread_pool):
     import worker
     loop = asyncio.get_running_loop()
     task_json = make_task_json(task_id="success-test-001")
-    await r.lpush("processing_queue", task_json)
+    await r.lpush(f"processing_queue:{worker.WORKER_ID}", task_json)
 
     success_executor = AsyncMock(return_value={"result": "Email sent to a@b.com"})
 
@@ -310,7 +307,7 @@ async def test_successful_task_saves_result(r, sem, thread_pool):
     assert ttl <= 86400
 
     # 3. Removed from processing_queue
-    assert await r.llen("processing_queue") == 0
+    assert await r.llen(f"processing_queue:{worker.WORKER_ID}") == 0
 
     # 4. No retry or DLQ entries
     assert await r.zcard("delayed_tasks") == 0
@@ -330,7 +327,7 @@ async def test_semaphore_is_always_released(r, sem, thread_pool):
     import worker
     loop = asyncio.get_running_loop()
     task_json = make_task_json(retry_count=3, task_id="sem-test-001")
-    await r.lpush("processing_queue", task_json)
+    await r.lpush(f"processing_queue:{worker.WORKER_ID}", task_json)
 
     # Acquire one slot to start (simulating what consumer_task does)
     await sem.acquire()
