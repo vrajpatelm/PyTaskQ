@@ -1,120 +1,102 @@
-# PyTaskQ — Python Async Task Queue
+# PyTaskQ
 
-A lightweight, reliable, multi-worker async task queue built with **FastAPI** and **Asyncio**, using **Redis** as the message broker, state manager, and storage engine.
-
----
-
-## 🚀 Key Features
-
-*   **GIL-Bypassing Concurrency**: Separate execution engines based on job type:
-    *   **CPU-bound tasks**: Runs in a `ProcessPoolExecutor` utilizing multiple CPU cores.
-    *   **I/O-bound tasks**: Runs in a `ThreadPoolExecutor` for high-throughput, low-overhead scheduling.
-*   **At-Least-Once Delivery**: Employs reliable queue patterns (`BRPOPLPUSH` with a `processing_queue`) to ensure tasks are not lost in the event of a worker crash.
-*   **Crash Recovery**: Automatic startup routines to reclaim interrupted tasks from the processing queue and schedule them for reprocessing.
-*   **Exponential Backoff**: Automatic retry pipeline with increasing retry delays (`2 ** retry_count`) for failing tasks.
-*   **Dead-Letter Queue (DLQ)**: Failing tasks are safely set aside after 3 failures, with support for manual inspection, purge, or replay via API.
-*   **Connection Resilience**: Automatically handles Redis network connectivity losses by pausing execution and backing off instead of crashing.
-*   **Graceful Shutdown**: Signal handling (`SIGINT`, `SIGTERM`) enables workers to complete currently running tasks before shutting down pools cleanly.
+A Python async task queue built with FastAPI and Redis. Submit tasks via HTTP, workers execute them in the background, results are stored in Redis.
 
 ---
 
-## 📁 Directory Structure
+## What it does
+
+- Accepts tasks over a REST API (email sending, matrix multiplication)
+- Workers pick up tasks from a Redis queue and execute them
+- CPU-bound tasks run in a `ProcessPoolExecutor`, I/O-bound in a `ThreadPoolExecutor`
+- Failed tasks are retried up to 3 times with exponential backoff, then moved to a Dead Letter Queue
+- Tasks are not lost if a worker crashes — recovered automatically on restart
+- Multiple workers can run simultaneously without stepping on each other
+
+---
+
+## Stack
+
+- **API**: FastAPI + Uvicorn
+- **Worker**: Python asyncio
+- **Broker / Storage**: Redis
+- **Validation**: Pydantic
+- **Tests**: pytest + fakeredis
+
+---
+
+## Project Structure
 
 ```
-pytaskq/
-├── README.md               # Main documentation
-├── LICENSE                 # MIT License
-├── CONTRIBUTING.md         # Contribution guidelines
-├── ARCHITECTURE.md         # Detailed system design
-├── API.md                  # REST API reference
-├── docs/                   # Internal project design guides
-│   ├── app.md              # Detailed API server specification
-│   ├── worker.md           # Worker engine specifications
-│   ├── redis_start.md      # WSL Redis setup guide
-│   └── start_doc.md        # Command instructions
-├── examples/               # Example client scripts
-│   └── client_demo.py      # Python integration client
-├── src/                    # Primary source code
-│   ├── app.py              # FastAPI Web API
-│   ├── worker.py           # Background Worker Daemon
-│   ├── task_registery.py   # Registered task handlers
-│   └── static/             # Single Page Dashboard (HTML/CSS)
-│       └── index.html
-├── tests/                  # Pytest automated test suite
-└── pytest.ini              # Pytest configuration
+src/
+├── app.py              # FastAPI routes (task submission, DLQ, metrics)
+├── worker.py           # Background worker daemon
+└── task_registery.py   # Task handler definitions
+
+tests/                  # pytest test suite
+examples/
+└── client_demo.py      # Example client script
 ```
 
 ---
 
-## 🛠️ Getting Started
+## Running Locally
 
-### Prerequisites
+**Prerequisites**: Python 3.10+, Redis running on `localhost:6379`
 
-*   **Python 3.10+** (with virtual environment support)
-*   **Redis Server** (Installed locally or via WSL)
-
-### 1. Setup Environment
-Clone the repository, create a virtual environment, and install dependencies:
-```powershell
-# Create virtual environment
-python -m venv .venv
-
-# Activate virtual environment
-.venv\Scripts\Activate.ps1   # Windows PowerShell
-source .venv/bin/activate    # macOS/Linux
-
-# Install dependencies (FastAPI, uvicorn, redis, pydantic, pytest, etc.)
-pip install fastapi uvicorn redis pydantic pytest pytest-asyncio fakeredis httpx yagmail python-dotenv
-```
-
-Configure your `.env` file at the root:
-```env
-EMAIL=your-email@gmail.com
-EMAIL_PASSWORD=your-app-password
-```
-
----
-
-## 🖥️ Running the Application
-
-Running the system requires three terminals:
-
-### Step 1: Start Redis
-Make sure Redis is running and listening on port `6379`.
 ```bash
-# Example if using WSL
+# 1. Install dependencies
+pip install -r requirements.txt
+
+# 2. Copy env file and fill in credentials
+cp .env.example .env
+
+# 3. Start Redis (if using WSL)
 wsl sudo service redis-server start
-wsl redis-cli ping  # Should return PONG
-```
 
-### Step 2: Run the Worker Daemon
-Start the worker from the project root inside your activated environment:
-```powershell
+# 4. Start the worker (terminal 1)
 python src/worker.py
-```
 
-### Step 3: Run the API Server
-Start the FastAPI server from the project root:
-```powershell
+# 5. Start the API server (terminal 2)
 uvicorn src.app:app --reload
 ```
 
-Open `http://127.0.0.1:8000/` in your browser to view the real-time task dashboard.
+Open `http://127.0.0.1:8000` to see the dashboard.
+
+**Or run everything with Docker:**
+
+```bash
+docker compose up
+```
 
 ---
 
-## 🧪 Running Tests
+## API
 
-The project includes unit, integration, and failure-injection tests using `pytest`:
+| Method | Route | Description |
+|--------|-------|-------------|
+| `GET` | `/task/mul?size=50` | Queue a matrix multiply (CPU task) |
+| `POST` | `/task/send_email` | Queue an email (I/O task) |
+| `GET` | `/task/{task_id}` | Check task status / result |
+| `GET` | `/metrics` | Queue depth metrics |
+| `GET` | `/dlq` | View failed tasks |
+| `POST` | `/dlq/replay/{task_id}` | Re-queue a failed task |
+| `POST` | `/dlq/purge/{task_id}` | Delete a failed task |
+| `POST` | `/dlq/purge_all` | Clear the entire DLQ |
 
-```powershell
-# Run the entire test suite
+Full API reference: [API.md](API.md)
+
+---
+
+## Tests
+
+```bash
 pytest
 ```
 
 ---
 
-## 📚 Further Reading
+## Further Reading
 
-*   For API routes and JSON shapes, check [API.md](file:///c:/Users/VRAJ/redis/API.md).
-*   For details on internal components, retry logic, and reliability systems, read [ARCHITECTURE.md](file:///c:/Users/VRAJ/redis/ARCHITECTURE.md).
+- [ARCHITECTURE.md](ARCHITECTURE.md) — how the queue, worker, retry, and DLQ work internally
+- [API.md](API.md) — full API reference with request/response examples
