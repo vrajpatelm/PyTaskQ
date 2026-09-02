@@ -5,8 +5,8 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 
 
-API_URL = "http://localhost:8000"
-NUM_TASKS = 40
+API_URL = "http://130.210.43.191:8000"
+NUM_TASKS = 50
 MATRIX_SIZE = 180
 
 
