@@ -1,18 +1,36 @@
 from fastapi import Depends
+from fastapi.middleware.cors import CORSMiddleware
+from src.Schema import TaskRequest
 from fastapi import FastAPI, Request, Form, HTTPException
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from redis import asyncio as redis
 from redis.exceptions import ConnectionError as RedisConnectionError
+from src.task_registery import TASKS
+import logging
 import uuid
 import json
 import os
 
-
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] [%(processName)s] %(message)s",
+    datefmt="%Y-%M-%D %H-%M-%S"
+)
+logger = logging.getLogger("api")
 REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
 REDIS_PORT = int(os.getenv("REDIS_PORT", 6379))
 QUEUE_CAPACITY=500
 app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
 app.mount("/static", StaticFiles(directory="src/static"), name="static")
 
@@ -39,38 +57,45 @@ async def check_backpressure():
 def homepage():
     return FileResponse("src/static/index.html")
 
-@app.get("/task/mul",dependencies=[Depends(check_backpressure)])
-async def matrix_multiply(size:int| None = 10):
-    taks_id=str(uuid.uuid4())
-    task={
-            "task_name":"matrix_multiply",
-            "args":[size],
-            "task_id": taks_id,
-            "retry_count": 0,  # Initialize retry count  
-    }
-    
-    await r.lpush("task_queue",json.dumps(task))
-    
-    return {"task_id": taks_id, "status": "queued"}
-    
-#Create task endpoint which will add task to redis and worker will consume it and return the result to the user
-@app.post("/task/send_email",dependencies=[Depends(check_backpressure)])
-async def create_task(email: str = Form(...),
-    title: str = Form(...),
-    body: str = Form(...)):
-    # add task to redis and send sucessfully added task msg
-     # for task identifiaction we will use uuid to generate unique task id  
+@app.post("/task/enqueue",dependencies=[Depends(check_backpressure)])
+async def enqueue_task(request:TaskRequest):
+    if request.task_name not in TASKS:
+        raise HTTPException(status_code=400,
+                            detail=f"Unknown Task{request.task_name}, Available Task: {list(TASKS.keys())}"
+                            )
     task_id=str(uuid.uuid4())
-    task={
-            "task_name":"send_email",
-            "args":[email, title, body],
-            "task_id": task_id,
-            "retry_count": 0,  # Initialize retry count
+    tasks={
+        "task_name":request.task_name,
+        "args":request.args,
+        "task_id": task_id,
+        "retry_count":0,
+        "webhook_url": request.webhook_url
     }
-    # Serialized the Task to JSON string and push to Redis list
-    await r.lpush("task_queue",json.dumps(task))
-    
+    await r.lpush("task_queue",json.dumps(tasks))
+    logger.info(f"Enqueued generic task: {request.task_name} with ID {task_id}")
     return {"task_id": task_id, "status": "queued"}
+
+@app.post("/task/schedule")
+async def schedule_task(request: TaskRequest, delay_seconds: int = 60):
+    if request.task_name not in TASKS:
+        raise HTTPException(status_code=400, detail="Unknown Task")
+        
+    import time
+    task_id = str(uuid.uuid4())
+    tasks = {
+        "task_name": request.task_name,
+        "args": request.args,
+        "task_id": task_id,
+        "retry_count": 0,
+        "webhook_url": request.webhook_url
+    }
+    execute_at = time.time() + delay_seconds
+    
+    # We use the existing delayed_tasks ZSET which our worker's retry_scheduler already watches!
+    await r.zadd("delayed_tasks", {json.dumps(tasks): execute_at})
+    logger.info(f"Scheduled task {request.task_name} (ID: {task_id}) to run in {delay_seconds}s")
+    
+    return {"task_id": task_id, "status": "scheduled", "execute_in_seconds": delay_seconds}
 
 @app.get("/task/{task_id}")
 async def task_result_disaplay(task_id:str):
