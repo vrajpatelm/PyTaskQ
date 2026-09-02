@@ -79,7 +79,7 @@ def poll_task_status(task_id, max_retries=10, delay=1.5):
     return False
 
 if __name__ == "__main__":
-    print("=== Distributed Queue Client Demo ===")
+    print("=== PyTaskQ Client Demo ===")
     
     # 1. Print current queue metrics
     check_metrics()

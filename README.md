@@ -1,6 +1,6 @@
-# Asynchronous Distributed Task Queue
+# PyTaskQ — Python Async Task Queue
 
-A lightweight, reliable, asynchronous task queue system built with **FastAPI** and **Asyncio**, using **Redis** as the message broker, state manager, and storage engine.
+A lightweight, reliable, multi-worker async task queue built with **FastAPI** and **Asyncio**, using **Redis** as the message broker, state manager, and storage engine.
 
 ---
 
@@ -21,7 +21,7 @@ A lightweight, reliable, asynchronous task queue system built with **FastAPI** a
 ## 📁 Directory Structure
 
 ```
-distributed-queue/
+pytaskq/
 ├── README.md               # Main documentation
 ├── LICENSE                 # MIT License
 ├── CONTRIBUTING.md         # Contribution guidelines

@@ -1,12 +1,12 @@
-# High-Level System Architecture
+# PyTaskQ — High-Level System Architecture
 
-This document provides a comprehensive overview of the custom, asynchronous Redis-backed distributed task queuing system implemented in this workspace.
+This document provides a comprehensive overview of PyTaskQ: a custom, asynchronous Redis-backed multi-worker task queue implemented in this workspace.
 
 ---
 
 ## 1. System Overview
 
-The system is a lightweight, reliable distributed task queue built in Python. It is designed to decouple heavy calculations (CPU-bound) and external integrations (I/O-bound) from the client-facing HTTP interface.
+PyTaskQ is a lightweight, reliable multi-worker async task queue built in Python. It is designed to decouple heavy calculations (CPU-bound) and external integrations (I/O-bound) from the client-facing HTTP interface.
 
 The architecture comprises three primary physical layers:
 1. **Client / Frontend Interface**: A single-page dashboard serving as the control panel.

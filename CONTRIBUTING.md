@@ -1,4 +1,4 @@
-# Contributing to Distributed Task Queue
+# Contributing to PyTaskQ
 
 Thank you for your interest in contributing to this project! Please review the guidelines below to help make the process smooth and productive.
 
