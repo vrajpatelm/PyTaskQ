@@ -181,7 +181,8 @@ async def handle_task(task_json, sem, loop, process_pool, thread_pool):
             task_type = entry["type"]
             
             logger.info(f"Executing task {task_id} ({tasks.task_name})")
-            
+            await r.incr("stats:processing")  # Atomic counter: task is now actively executing
+
             if task_type == "cpu":
                 # Run in a process to use another CPU core without GIL blocking
                 result = await loop.run_in_executor(process_pool, func, *tasks.args)
@@ -195,6 +196,7 @@ async def handle_task(task_json, sem, loop, process_pool, thread_pool):
             task_result = Taskresult(task_id=task_id, status="Success", result=str(result))
             await r.hset(f"Task id{task_id}", mapping=task_result.model_dump())
             await r.expire(f"Task id{task_id}", 86400)
+            await r.incr("stats:completed_total")  # Cumulative: total tasks ever completed
             logger.info(f"Task {task_id} completed successfully.")
             
             # --- WEBHOOK FEATURE ---
@@ -205,6 +207,7 @@ async def handle_task(task_json, sem, loop, process_pool, thread_pool):
             
         except Exception as e:
             logger.error(f"Error occurred while executing task: {e}")
+            await r.incr("stats:failed_total")   # Cumulative: total tasks ever failed/retried
             if getattr(tasks, 'retry_count', 0) >= 3:
                logger.error(f"[DLQ] Task {task_id} failed after 3 retries. Moving to dead-letter queue.")
                await r.lpush("dead_letter_queue", task_json)
@@ -226,7 +229,8 @@ async def handle_task(task_json, sem, loop, process_pool, thread_pool):
                 })
             
     finally:
-        await r.lrem(f"processing_queue:{WORKER_ID}",count=1, value=task_json)
+        await r.lrem(f"processing_queue:{WORKER_ID}", count=1, value=task_json)
+        await r.decr("stats:processing")  # Always runs: task is no longer executing
         sem.release()
 
 #Start the event loop

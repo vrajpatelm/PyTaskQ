@@ -145,15 +145,29 @@ async def task_result_disaplay(task_id:str):
 
 @app.get("/metrics")
 async def metrics():
-    
     pending = await r.llen("task_queue")
-    worker_ids = await r.zrange("active_workers", 0, -1)
-    processing = 0
-    for worker_id in worker_ids:
-        processing += await r.llen(f"processing_queue:{worker_id}")
+
+    # Read the atomic counter incremented/decremented by the worker on each task execution.
+    # This is accurate even for sub-millisecond tasks unlike the old zrange→llen approach.
+    processing_raw = await r.get("stats:processing")
+    processing = max(0, int(processing_raw or 0))  # Guard against None or negative drift
+
     delayed = await r.zcard("delayed_tasks")
     dlq = await r.llen("dead_letter_queue")
-    return {"pending": pending, "processing": processing, "delayed": delayed, "dlq": dlq}
+
+    # Cumulative counters — useful for dashboards and future monitoring
+    completed = int(await r.get("stats:completed_total") or 0)
+    failed = int(await r.get("stats:failed_total") or 0)
+
+    return {
+        "pending": pending,
+        "processing": processing,
+        "delayed": delayed,
+        "dlq": dlq,
+        "completed_total": completed,
+        "failed_total": failed,
+    }
+
 
 @app.get("/dlq")
 async def get_dlq():
