@@ -9,7 +9,7 @@ function App() {
   });
 
   // Task Submission State
-  const [taskName, setTaskName] = useState('send_email'); // Default to send_email
+  const [taskName, setTaskName] = useState('matrix_multiply'); // send_email disabled
   const [taskArgs, setTaskArgs] = useState('50'); // For matrix or custom
   
   // Specific state for the Email Form
@@ -165,7 +165,7 @@ function App() {
                   onChange={(e) => setTaskName(e.target.value)} 
                   style={{ padding: '0.75rem', borderRadius: '6px', border: '1px solid var(--border-color)', fontSize: '1rem', backgroundColor: 'white' }}
                 >
-                  <option value="send_email">📧 Send Email</option>
+                  {/* <option value="send_email">📧 Send Email</option> */}{/* Disabled: would send from platform owner's Gmail */}
                   <option value="matrix_multiply">🧮 Matrix Multiplication</option>
                   <option value="custom">⚙️ Custom Task...</option>
                 </select>

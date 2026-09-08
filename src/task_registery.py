@@ -30,6 +30,6 @@ TASKS = {
     # Dynamic dispatch to handle multiple tasks
     # Each entry defines the handler function AND its execution type.
     # The worker looks up both — the API never needs to know.
-    "send_email": {"handler": send_email, "type": "io"},
+    # "send_email": {"handler": send_email, "type": "io"},  # Disabled: emails would send from platform owner's Gmail
     "matrix_multiply": {"handler": matrix_multiply, "type": "cpu"},
 }
