@@ -156,6 +156,7 @@ def fire_webhook(url, result_payload):
         logger.error(f"[Webhook] Failed to send to {url}: {e}")
         
 async def handle_task(task_json, sem, loop, process_pool, thread_pool):
+    incr_done = False  # Guard: only DECR stats:processing if we actually INCRed it
     try:  # <--- Outer try block starts here
         # 1. Validation
         try:
@@ -182,6 +183,7 @@ async def handle_task(task_json, sem, loop, process_pool, thread_pool):
             
             logger.info(f"Executing task {task_id} ({tasks.task_name})")
             await r.incr("stats:processing")  # Atomic counter: task is now actively executing
+            incr_done = True  # Mark that we INCRed so finally block will DECR
 
             if task_type == "cpu":
                 # Run in a process to use another CPU core without GIL blocking
@@ -230,7 +232,8 @@ async def handle_task(task_json, sem, loop, process_pool, thread_pool):
             
     finally:
         await r.lrem(f"processing_queue:{WORKER_ID}", count=1, value=task_json)
-        await r.decr("stats:processing")  # Always runs: task is no longer executing
+        if incr_done:  # Only DECR if we actually INCRed — prevents counter going negative
+            await r.decr("stats:processing")
         sem.release()
 
 #Start the event loop
