@@ -43,7 +43,7 @@ function App() {
     };
 
     fetchMetrics();
-    const interval = setInterval(fetchMetrics, 2000);
+    const interval = setInterval(fetchMetrics, 750); // Increased from 2000ms to catch fast task completions
     return () => clearInterval(interval);
   }, []);
 
