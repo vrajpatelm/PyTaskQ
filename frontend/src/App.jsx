@@ -1,4 +1,5 @@
 import { useState, useEffect } from 'react'
+import { Send, Search, AlertOctagon, Inbox, Activity, Clock, AlertTriangle, CheckCircle, XCircle, RotateCcw, Trash2 } from 'lucide-react'
 
 // Detect if we are running locally via Vite or on the Cloud via FastAPI
 const API_URL = import.meta.env.DEV ? 'http://localhost:8000' : '';
@@ -132,27 +133,27 @@ function App() {
       {/* METRICS ROW */}
       <div className="metrics-grid">
         <div className="metric-box pending">
-          <div className="metric-title">Pending</div>
+          <div className="metric-title"><Inbox size={16} /> Pending</div>
           <div className="metric-value" style={{color: 'var(--accent-color)'}}>{metrics.pending}</div>
         </div>
         <div className="metric-box processing">
-          <div className="metric-title">Active Now</div>
+          <div className="metric-title"><Activity size={16} /> Active Now</div>
           <div className="metric-value" style={{color: 'var(--success-color)'}}>{metrics.processing}</div>
         </div>
         <div className="metric-box delayed">
-          <div className="metric-title">Delayed</div>
+          <div className="metric-title"><Clock size={16} /> Delayed</div>
           <div className="metric-value" style={{color: 'var(--warning-color)'}}>{metrics.delayed}</div>
         </div>
         <div className="metric-box dlq">
-          <div className="metric-title">Dead Letters</div>
+          <div className="metric-title"><AlertTriangle size={16} /> Dead Letters</div>
           <div className="metric-value" style={{color: 'var(--danger-color)'}}>{metrics.dlq}</div>
         </div>
         <div className="metric-box">
-          <div className="metric-title">✅ Completed</div>
+          <div className="metric-title"><CheckCircle size={16} /> Completed</div>
           <div className="metric-value" style={{color: 'var(--success-color)'}}>{metrics.completed_total}</div>
         </div>
         <div className="metric-box">
-          <div className="metric-title">❌ Failed</div>
+          <div className="metric-title"><XCircle size={16} /> Failed</div>
           <div className="metric-value" style={{color: 'var(--danger-color)'}}>{metrics.failed_total}</div>
         </div>
       </div>
@@ -162,7 +163,7 @@ function App() {
         <div>
           {/* TASK SUBMISSION CARD */}
           <div className="card" style={{ marginBottom: '2rem' }}>
-            <h2>🚀 Dispatch New Task</h2>
+            <h2><Send size={24} style={{ color: 'var(--accent-color)' }} /> Dispatch New Task</h2>
             <form onSubmit={handleEnqueue}>
               
               {/* Task Selector Dropdown */}
@@ -173,9 +174,9 @@ function App() {
                   onChange={(e) => setTaskName(e.target.value)} 
                   style={{ padding: '0.75rem', borderRadius: '6px', border: '1px solid var(--border-color)', fontSize: '1rem', backgroundColor: 'white' }}
                 >
-                  {/* <option value="send_email">📧 Send Email</option> */}{/* Disabled: would send from platform owner's Gmail */}
-                  <option value="matrix_multiply">🧮 Matrix Multiplication</option>
-                  <option value="custom">⚙️ Custom Task...</option>
+                  {/* <option value="send_email">Send Email</option> */}{/* Disabled: would send from platform owner's Gmail */}
+                  <option value="matrix_multiply">Matrix Multiplication</option>
+                  <option value="custom">Custom Task...</option>
                 </select>
               </div>
 
@@ -243,7 +244,7 @@ function App() {
 
           {/* TASK LOOKUP CARD */}
           <div className="card">
-            <h2>🔍 Check Task Status</h2>
+            <h2><Search size={24} style={{ color: 'var(--accent-color)' }} /> Check Task Status</h2>
             <form onSubmit={handleLookup} style={{ display: 'flex', gap: '1rem' }}>
               <input 
                 type="text" 
@@ -267,7 +268,7 @@ function App() {
         <div>
           <div className="card" style={{ height: '100%' }}>
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1.5rem' }}>
-              <h2 style={{ color: 'var(--danger-color)', margin: 0 }}>☠️ Dead Letter Queue</h2>
+              <h2 style={{ color: 'var(--danger-color)', margin: 0, display: 'flex', alignItems: 'center', gap: '0.5rem' }}><AlertOctagon size={24} /> Dead Letter Queue</h2>
               {dlqTasks.length > 0 && (
                 <button onClick={() => fetch(`${API_URL}/dlq/purge_all`, { method: 'POST' })} className="btn btn-danger" style={{ padding: '0.5rem 1rem', fontSize: '0.875rem' }}>
                   Purge All
@@ -293,8 +294,8 @@ function App() {
                         <td style={{ fontFamily: 'monospace', fontSize: '0.875rem' }}>{t.task_id.substring(0, 10)}...</td>
                         <td style={{ fontWeight: 600 }}>{t.task_name}</td>
                         <td style={{ display: 'flex', gap: '0.5rem' }}>
-                          <button onClick={() => handleReplay(t.task_id)} className="btn btn-secondary" style={{ padding: '0.25rem 0.5rem', fontSize: '0.75rem' }}>Replay</button>
-                          <button onClick={() => handlePurge(t.task_id)} className="btn btn-danger" style={{ padding: '0.25rem 0.5rem', fontSize: '0.75rem' }}>Delete</button>
+                          <button onClick={() => handleReplay(t.task_id)} className="btn btn-secondary" style={{ padding: '0.25rem 0.5rem', fontSize: '0.75rem', display: 'flex', alignItems: 'center', gap: '0.25rem' }}><RotateCcw size={14} /> Replay</button>
+                          <button onClick={() => handlePurge(t.task_id)} className="btn btn-danger" style={{ padding: '0.25rem 0.5rem', fontSize: '0.75rem', display: 'flex', alignItems: 'center', gap: '0.25rem' }}><Trash2 size={14} /> Delete</button>
                         </td>
                       </tr>
                     ))}
