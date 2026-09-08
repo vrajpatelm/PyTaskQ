@@ -101,6 +101,7 @@ async def enqueue_task(request:TaskRequest, req: Request):
                             )
     if request.task_name=="matrix_multiply" and int(request.args[0])>1000:
         raise HTTPException(status_code=429,detail="Matrix Size Cannot Exceed 1000")
+    task_id = str(uuid.uuid4())
     client_ip = req.client.host
     tasks={
         "task_name":request.task_name,
@@ -123,6 +124,7 @@ async def schedule_task(request: TaskRequest, req: Request, delay_seconds: int =
     # for Security
     if request.task_name=="matrix_multiply" and int(request.args[0])>1000:
         raise HTTPException(status_code=429,detail="Matrix Size Cannot Exceed 1000")
+    task_id = str(uuid.uuid4())
     client_ip = req.client.host
     tasks = {
         "task_name": request.task_name,
