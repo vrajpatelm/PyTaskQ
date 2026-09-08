@@ -50,7 +50,7 @@ function App() {
   const handleEnqueue = async (e) => {
     e.preventDefault();
     setSubmitStatus({ type: 'info', msg: 'Submitting...' });
-    
+
     let parsedArgs = [];
     
     // Dynamically build the arguments array based on which task is selected
@@ -67,6 +67,10 @@ function App() {
     }
 
     const delay = parseInt(delaySeconds, 10);
+    if (taskName=="matrix_multiplication" && parsedArgs[0]>1000){
+      setSubmitStatus({type:"Error",msg:"Size cannot Exceed 1000"})
+      return;
+    }
     const endpoint = delay > 0 ? `${API_URL}/task/schedule?delay_seconds=${delay}` : `${API_URL}/task/enqueue`;
 
     try {
@@ -192,7 +196,7 @@ function App() {
               ) : taskName === 'matrix_multiply' ? (
                 <div className="form-group">
                   <label>Matrix Size (N x N)</label>
-                  <input type="number" value={taskArgs} onChange={(e) => setTaskArgs(e.target.value)} required />
+                  <input type="number" min="1" max="1000" value={taskArgs} onChange={(e) => setTaskArgs(e.target.value)} required />
                 </div>
               ) : (
                 <>

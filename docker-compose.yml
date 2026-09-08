@@ -7,6 +7,20 @@ services:
       - ./redis.conf:/usr/local/etc/redis/redis.conf
       - redis-data:/data
     command: redis-server /usr/local/etc/redis/redis.conf
+    # Reason: Without a health check, Docker marks Redis as "ready" the instant
+    # the process starts — before it can actually accept connections.
+    # The web/worker services then crash on startup trying to connect to Redis.
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    # Reason: Prevent logs from filling up disk on a long-running server.
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
 
   web:
     build:
@@ -20,8 +34,24 @@ services:
       - REDIS_HOST=redis
       - REDIS_PORT=6379
       - PYTHONUNBUFFERED=1
+    # Reason: `depends_on` by default only waits for the container to START,
+    # not for Redis to be READY to accept connections. `condition: service_healthy`
+    # uses our health check above to wait until Redis responds to PING.
     depends_on:
-      - redis
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
 
   worker:
     build:
@@ -35,7 +65,16 @@ services:
       - REDIS_PORT=6379
       - PYTHONUNBUFFERED=1
     depends_on:
-      - redis
+      redis:
+        condition: service_healthy
+    # Reason: If the worker crashes (OOM from a bad task, unhandled exception, etc.)
+    # it will automatically restart instead of silently dying.
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
 
 volumes:
   redis-data:

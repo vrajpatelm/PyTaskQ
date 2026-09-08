@@ -208,7 +208,7 @@ async def handle_task(task_json, sem, loop, process_pool, thread_pool):
             if getattr(tasks, 'retry_count', 0) >= 3:
                logger.error(f"[DLQ] Task {task_id} failed after 3 retries. Moving to dead-letter queue.")
                await r.lpush("dead_letter_queue", task_json)
-               await r.hset(f"Task id{task_id}", mapping={
+               await r.hset(f"Task_id:{task_id}", mapping={
                     "task_id": task_id,
                     "status": "DeadLetter",
                     "error": f"Failed after 3 retries.Last error: {str(e)} "}
@@ -218,7 +218,7 @@ async def handle_task(task_json, sem, loop, process_pool, thread_pool):
                 delay = 2 ** tasks.retry_count  # Exponential backoff
                 await r.zadd("delayed_tasks", {json.dumps(tasks.model_dump()): time.time() + delay})
                 logger.warning(f"[Retry] Task {task_id} failed. Scheduled for retry #{tasks.retry_count} after {delay} seconds.")
-                await r.hset(f"Task id{task_id}", mapping={
+                await r.hset(f"Task_id:{task_id}", mapping={
                     "task_id": task_id,
                     "status": "RetryScheduled",
                     "retry_count": tasks.retry_count,

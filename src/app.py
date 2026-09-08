@@ -11,24 +11,37 @@ import logging
 import uuid
 import json
 import os
+import time
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] [%(processName)s] %(message)s",
-    datefmt="%Y-%M-%D %H-%M-%S"
+    datefmt="%Y-%m-%d %H:%M:%S"  # Fixed: was %Y-%M-%D (wrong — minutes/undefined)
 )
 logger = logging.getLogger("api")
+
 REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
 REDIS_PORT = int(os.getenv("REDIS_PORT", 6379))
-QUEUE_CAPACITY=500
-app = FastAPI()
+QUEUE_CAPACITY = int(os.getenv("QUEUE_CAPACITY", 500))  # Configurable via env
+ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*").split(",")
+
+app = FastAPI(
+    title="PyTaskQ",
+    description="Distributed async task queue API",
+    version="1.0.0",
+    # Disable docs in production by reading an env var
+    docs_url=None if os.getenv("ENVIRONMENT") == "production" else "/docs",
+    redoc_url=None if os.getenv("ENVIRONMENT") == "production" else "/redoc",
+)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    # Reason: wildcard CORS in production allows ANY website to call your API.
+    # Set ALLOWED_ORIGINS=https://yourdomain.com in production .env
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "DELETE"],
+    allow_headers=["Authorization", "Content-Type"],
 )
 
 r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
@@ -46,23 +59,48 @@ async def redis_connection_error_handler(request: Request, exc: RedisConnectionE
     )
 
 async def check_backpressure():
-    queue_len= await r.llen("task_queue")
-    if queue_len >=QUEUE_CAPACITY:
+    queue_len = await r.llen("task_queue")
+    if queue_len >= QUEUE_CAPACITY:
         raise HTTPException(
             status_code=429,
             detail="Server is busy. Please retry after a few seconds."
-            )
+        )
+
+
+async def rate_limiter(request: Request):
+    """Limit Request Per IP"""
+    client_ip=request.client.host
+    current_time_in_minute = int(time.time()/60)
+    redis_key=f"rate_limit:{client_ip}:{current_time_in_minute}" 
+    request_count = await r.incr(redis_key)
+    
+    if request_count==1:
+        await r.expire(redis_key,60)
+    if request_count>10:
+        raise HTTPException(status_code=429,detail="Too many Requests. Please wait a minute")
+    
+@app.get("/health", tags=["ops"])
+async def health_check():
+    """Used by Docker health checks and load balancers to verify the service is alive."""
+    try:
+        await r.ping()
+        return {"status": "ok", "redis": "connected"}
+    except Exception:
+        return JSONResponse(status_code=503, content={"status": "degraded", "redis": "unreachable"})
+
 
 @app.get("/")
 def homepage():
     return FileResponse("src/static/index.html")
 
-@app.post("/task/enqueue",dependencies=[Depends(check_backpressure)])
+@app.post("/task/enqueue",dependencies=[Depends(check_backpressure),Depends(rate_limiter)])
 async def enqueue_task(request:TaskRequest):
     if request.task_name not in TASKS:
         raise HTTPException(status_code=400,
                             detail=f"Unknown Task{request.task_name}, Available Task: {list(TASKS.keys())}"
                             )
+    if request.task_name=="matrix_multiply" and int(request.args[0])>1000:
+        raise HTTPException(status_code=429,detail="Matrix Size Cannot Exceed 1000")
     task_id=str(uuid.uuid4())
     tasks={
         "task_name":request.task_name,
@@ -75,12 +113,14 @@ async def enqueue_task(request:TaskRequest):
     logger.info(f"Enqueued generic task: {request.task_name} with ID {task_id}")
     return {"task_id": task_id, "status": "queued"}
 
-@app.post("/task/schedule")
+@app.post("/task/schedule",dependencies=[Depends(rate_limiter)])
 async def schedule_task(request: TaskRequest, delay_seconds: int = 60):
     if request.task_name not in TASKS:
         raise HTTPException(status_code=400, detail="Unknown Task")
         
-    import time
+    # for Security
+    if request.task_name=="matrix_multiply" and int(request.args[0])>1000:
+        raise HTTPException(status_code=429,detail="Matrix Size Cannot Exceed 1000")
     task_id = str(uuid.uuid4())
     tasks = {
         "task_name": request.task_name,
