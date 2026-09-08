@@ -5,7 +5,7 @@ const API_URL = import.meta.env.DEV ? 'http://localhost:8000' : '';
 
 function App() {
   const [metrics, setMetrics] = useState({
-    pending: 0, processing: 0, delayed: 0, dlq: 0
+    pending: 0, processing: 0, delayed: 0, dlq: 0, completed_total: 0, failed_total: 0
   });
 
   // Task Submission State
@@ -136,7 +136,7 @@ function App() {
           <div className="metric-value" style={{color: 'var(--accent-color)'}}>{metrics.pending}</div>
         </div>
         <div className="metric-box processing">
-          <div className="metric-title">Processing</div>
+          <div className="metric-title">Active Now</div>
           <div className="metric-value" style={{color: 'var(--success-color)'}}>{metrics.processing}</div>
         </div>
         <div className="metric-box delayed">
@@ -146,6 +146,14 @@ function App() {
         <div className="metric-box dlq">
           <div className="metric-title">Dead Letters</div>
           <div className="metric-value" style={{color: 'var(--danger-color)'}}>{metrics.dlq}</div>
+        </div>
+        <div className="metric-box">
+          <div className="metric-title">✅ Completed</div>
+          <div className="metric-value" style={{color: 'var(--success-color)'}}>{metrics.completed_total}</div>
+        </div>
+        <div className="metric-box">
+          <div className="metric-title">❌ Failed</div>
+          <div className="metric-value" style={{color: 'var(--danger-color)'}}>{metrics.failed_total}</div>
         </div>
       </div>
 
