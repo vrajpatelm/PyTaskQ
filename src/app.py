@@ -58,6 +58,13 @@ async def redis_connection_error_handler(request: Request, exc: RedisConnectionE
         },
     )
 
+def get_client_ip(req: Request) -> str:
+    """Extract true client IP, respecting proxy headers if behind Docker/Ngrok/Nginx"""
+    forwarded = req.headers.get("x-forwarded-for")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return req.client.host
+
 async def check_backpressure():
     queue_len = await r.llen("task_queue")
     if queue_len >= QUEUE_CAPACITY:
@@ -69,7 +76,7 @@ async def check_backpressure():
 
 async def rate_limiter(request: Request):
     """Limit Request Per IP"""
-    client_ip=request.client.host
+    client_ip = get_client_ip(request)
     current_time_in_minute = int(time.time()/60)
     redis_key=f"rate_limit:{client_ip}:{current_time_in_minute}" 
     request_count = await r.incr(redis_key)
@@ -102,7 +109,7 @@ async def enqueue_task(request:TaskRequest, req: Request):
     if request.task_name=="matrix_multiply" and int(request.args[0])>1000:
         raise HTTPException(status_code=429,detail="Matrix Size Cannot Exceed 1000")
     task_id = str(uuid.uuid4())
-    client_ip = req.client.host
+    client_ip = get_client_ip(req)
     tasks={
         "task_name":request.task_name,
         "args":request.args,
@@ -125,7 +132,7 @@ async def schedule_task(request: TaskRequest, req: Request, delay_seconds: int =
     if request.task_name=="matrix_multiply" and int(request.args[0])>1000:
         raise HTTPException(status_code=429,detail="Matrix Size Cannot Exceed 1000")
     task_id = str(uuid.uuid4())
-    client_ip = req.client.host
+    client_ip = get_client_ip(req)
     tasks = {
         "task_name": request.task_name,
         "args": request.args,
@@ -151,7 +158,7 @@ async def task_result_disaplay(task_id:str):
 
 @app.get("/metrics")
 async def metrics(req: Request):
-    client_ip = req.client.host
+    client_ip = get_client_ip(req)
     pending = int(await r.get(f"stats:pending:{client_ip}") or 0)
     processing_raw = await r.get(f"stats:processing:{client_ip}")
     processing = max(0, int(processing_raw or 0))
@@ -174,14 +181,14 @@ async def metrics(req: Request):
 
 @app.get("/dlq")
 async def get_dlq(req: Request):
-    client_ip = req.client.host
+    client_ip = get_client_ip(req)
     view_dlq = await r.lrange(f"dlq:{client_ip}", 0, -1)
     tasks = [json.loads(item) for item in view_dlq]
     return {"tasks": tasks}
 
 @app.post("/dlq/replay/{task_id}")
 async def replay_task(task_id: str, req: Request):
-    client_ip = req.client.host
+    client_ip = get_client_ip(req)
     dlq_key = f"dlq:{client_ip}"
     view_by_id = await r.lrange(dlq_key, 0, -1)
     matched_item = None
@@ -207,7 +214,7 @@ async def replay_task(task_id: str, req: Request):
 
 @app.post("/dlq/purge/{task_id}")
 async def purge_task(task_id: str, req: Request):
-    client_ip = req.client.host
+    client_ip = get_client_ip(req)
     dlq_key = f"dlq:{client_ip}"
     view_by_id = await r.lrange(dlq_key, 0, -1)
     matched_item = None
@@ -230,7 +237,7 @@ async def purge_task(task_id: str, req: Request):
 # Clear entire dlq
 @app.post("/dlq/purge_all")
 async def purge_all(req: Request):
-    client_ip = req.client.host
+    client_ip = get_client_ip(req)
     await r.delete(f"dlq:{client_ip}")
     await r.set(f"stats:dlq:{client_ip}", 0)
     return {
