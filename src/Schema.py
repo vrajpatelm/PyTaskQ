@@ -8,6 +8,7 @@ class Taskloader(BaseModel):
     retry_count:int = 0 
     task_type:str = "io"  # Legacy field — execution type is now looked up from the registry
     webhook_url: Optional[str] = None
+    client_ip: str = "unknown"
     
 # for VALIDATION of result of task 
 class Taskresult(BaseModel):

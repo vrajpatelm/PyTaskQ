@@ -94,46 +94,50 @@ def homepage():
     return FileResponse("src/static/index.html")
 
 @app.post("/task/enqueue",dependencies=[Depends(check_backpressure),Depends(rate_limiter)])
-async def enqueue_task(request:TaskRequest):
+async def enqueue_task(request:TaskRequest, req: Request):
     if request.task_name not in TASKS:
         raise HTTPException(status_code=400,
                             detail=f"Unknown Task{request.task_name}, Available Task: {list(TASKS.keys())}"
                             )
     if request.task_name=="matrix_multiply" and int(request.args[0])>1000:
         raise HTTPException(status_code=429,detail="Matrix Size Cannot Exceed 1000")
-    task_id=str(uuid.uuid4())
+    client_ip = req.client.host
     tasks={
         "task_name":request.task_name,
         "args":request.args,
         "task_id": task_id,
         "retry_count":0,
-        "webhook_url": request.webhook_url
+        "webhook_url": request.webhook_url,
+        "client_ip": client_ip
     }
     await r.lpush("task_queue",json.dumps(tasks))
-    logger.info(f"Enqueued generic task: {request.task_name} with ID {task_id}")
+    await r.incr(f"stats:pending:{client_ip}")
+    logger.info(f"Enqueued generic task: {request.task_name} with ID {task_id} from IP {client_ip}")
     return {"task_id": task_id, "status": "queued"}
 
 @app.post("/task/schedule",dependencies=[Depends(rate_limiter)])
-async def schedule_task(request: TaskRequest, delay_seconds: int = 60):
+async def schedule_task(request: TaskRequest, req: Request, delay_seconds: int = 60):
     if request.task_name not in TASKS:
         raise HTTPException(status_code=400, detail="Unknown Task")
         
     # for Security
     if request.task_name=="matrix_multiply" and int(request.args[0])>1000:
         raise HTTPException(status_code=429,detail="Matrix Size Cannot Exceed 1000")
-    task_id = str(uuid.uuid4())
+    client_ip = req.client.host
     tasks = {
         "task_name": request.task_name,
         "args": request.args,
         "task_id": task_id,
         "retry_count": 0,
-        "webhook_url": request.webhook_url
+        "webhook_url": request.webhook_url,
+        "client_ip": client_ip
     }
     execute_at = time.time() + delay_seconds
     
     # We use the existing delayed_tasks ZSET which our worker's retry_scheduler already watches!
     await r.zadd("delayed_tasks", {json.dumps(tasks): execute_at})
-    logger.info(f"Scheduled task {request.task_name} (ID: {task_id}) to run in {delay_seconds}s")
+    await r.incr(f"stats:delayed:{client_ip}")
+    logger.info(f"Scheduled task {request.task_name} (ID: {task_id}) from IP {client_ip} to run in {delay_seconds}s")
     
     return {"task_id": task_id, "status": "scheduled", "execute_in_seconds": delay_seconds}
 
@@ -144,20 +148,17 @@ async def task_result_disaplay(task_id:str):
 
 
 @app.get("/metrics")
-async def metrics():
-    pending = await r.llen("task_queue")
+async def metrics(req: Request):
+    client_ip = req.client.host
+    pending = int(await r.get(f"stats:pending:{client_ip}") or 0)
+    processing_raw = await r.get(f"stats:processing:{client_ip}")
+    processing = max(0, int(processing_raw or 0))
+    delayed = int(await r.get(f"stats:delayed:{client_ip}") or 0)
+    dlq = await r.llen(f"dlq:{client_ip}")
 
-    # Read the atomic counter incremented/decremented by the worker on each task execution.
-    # This is accurate even for sub-millisecond tasks unlike the old zrange→llen approach.
-    processing_raw = await r.get("stats:processing")
-    processing = max(0, int(processing_raw or 0))  # Guard against None or negative drift
-
-    delayed = await r.zcard("delayed_tasks")
-    dlq = await r.llen("dead_letter_queue")
-
-    # Cumulative counters — useful for dashboards and future monitoring
-    completed = int(await r.get("stats:completed_total") or 0)
-    failed = int(await r.get("stats:failed_total") or 0)
+    # Cumulative counters
+    completed = int(await r.get(f"stats:completed:{client_ip}") or 0)
+    failed = int(await r.get(f"stats:failed:{client_ip}") or 0)
 
     return {
         "pending": pending,
@@ -170,14 +171,17 @@ async def metrics():
 
 
 @app.get("/dlq")
-async def get_dlq():
-    view_dlq = await r.lrange("dead_letter_queue", 0, -1)
+async def get_dlq(req: Request):
+    client_ip = req.client.host
+    view_dlq = await r.lrange(f"dlq:{client_ip}", 0, -1)
     tasks = [json.loads(item) for item in view_dlq]
     return {"tasks": tasks}
 
 @app.post("/dlq/replay/{task_id}")
-async def replay_task(task_id: str):
-    view_by_id = await r.lrange("dead_letter_queue", 0, -1)
+async def replay_task(task_id: str, req: Request):
+    client_ip = req.client.host
+    dlq_key = f"dlq:{client_ip}"
+    view_by_id = await r.lrange(dlq_key, 0, -1)
     matched_item = None
     matched_dict = None
     for raw in view_by_id:
@@ -190,16 +194,20 @@ async def replay_task(task_id: str):
         raise HTTPException(status_code=404, detail="Task for particular id is not found")
     
     matched_dict["retry_count"] = 0
-    await r.lrem("dead_letter_queue", 1, matched_item)
+    await r.lrem(dlq_key, 1, matched_item)
     await r.rpush("task_queue", json.dumps(matched_dict))
+    await r.incr(f"stats:pending:{client_ip}")
+    await r.decr(f"stats:dlq:{client_ip}")
     return {
         "message": "Task replayed successfully",
         "task": matched_dict
     }
 
 @app.post("/dlq/purge/{task_id}")
-async def purge_task(task_id: str):
-    view_by_id = await r.lrange("dead_letter_queue", 0, -1)
+async def purge_task(task_id: str, req: Request):
+    client_ip = req.client.host
+    dlq_key = f"dlq:{client_ip}"
+    view_by_id = await r.lrange(dlq_key, 0, -1)
     matched_item = None
     matched_dict = None
     for raw in view_by_id:
@@ -210,8 +218,8 @@ async def purge_task(task_id: str):
             break
     if matched_item is None:
         raise HTTPException(status_code=404, detail="Task for particular id is not found")
-    
-    await r.lrem("dead_letter_queue", 1, matched_item)
+    await r.lrem(dlq_key, 1, matched_item)
+    await r.decr(f"stats:dlq:{client_ip}")
     return {
         "message": "tasked is Deleted",
         "task": matched_dict
@@ -219,8 +227,10 @@ async def purge_task(task_id: str):
 
 # Clear entire dlq
 @app.post("/dlq/purge_all")
-async def purge_all():
-    await r.delete("dead_letter_queue")
+async def purge_all(req: Request):
+    client_ip = req.client.host
+    await r.delete(f"dlq:{client_ip}")
+    await r.set(f"stats:dlq:{client_ip}", 0)
     return {
         "message": "Enitre dlq is cleared"
     }
