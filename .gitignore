@@ -32,3 +32,5 @@ desktop.ini
 *.sln
 *.swp
 .agents
+
+result.json

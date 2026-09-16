@@ -3,17 +3,17 @@ test_crash_recovery.py — Tests for crash recovery and retry scheduler
 ======================================================================
 
 WHAT WE TEST HERE:
-    1. Crash recovery: on startup, tasks in processing_queue are moved back
-    2. Retry scheduler: expired delayed_tasks are re-queued
+    1. Crash recovery: on startup, tasks in processing_queue are moved to queue:high
+    2. Retry scheduler: expired delayed_tasks are re-queued to their original priority queue
 
 ARCHITECTURE TESTED:
-    processing_queue → (startup) → task_queue
-    delayed_tasks    → (scheduler tick) → task_queue
+    processing_queue → (startup) → queue:high
+    delayed_tasks    → (scheduler tick) → queue:{priority}
 
 WHY CRASH RECOVERY MATTERS:
     If the worker dies mid-task (power loss, OOM kill, Ctrl+C before graceful
     shutdown), the task is still sitting in processing_queue forever.
-    Nobody else will pick it up. On restart, we sweep it back to task_queue.
+    Nobody else will pick it up. On restart, we sweep it back to queue:high.
 
 WHY RETRY SCHEDULER MATTERS:
     Tasks with exponential backoff sit in a sorted set waiting for their timer.
@@ -38,52 +38,52 @@ async def r():
     await redis.aclose()
 
 
-def make_task(task_id, retry_count=0):
+def make_task(task_id, retry_count=0, priority="default"):
     return json.dumps({
         "task_id": task_id,
         "task_name": "send_email",
         "args": ["a@b.com", "Hi", "Body"],
         "retry_count": retry_count,
+        "priority": priority,
+        "client_ip": "127.0.0.1",
     })
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# TEST GROUP 1: Crash Recovery (processing_queue → task_queue on startup)
+# TEST GROUP 1: Crash Recovery (processing_queue → queue:high on startup)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @pytest.mark.asyncio
 async def test_single_crashed_task_recovered(r):
     """
     SCENARIO: Worker was killed mid-task. One task is stuck in processing_queue.
-    EXPECT:   On next startup, that task is moved back to task_queue.
+    EXPECT:   On next startup, that task is moved back to queue:high.
 
     HOW WE TEST startup logic:
-        consumer_task() runs the recovery loop at startup, then blocks on
-        brpoplpush forever. We interrupt it after the recovery loop runs
-        by making brpoplpush return None immediately.
+        We replicate the recovery loop from worker.py directly.
+        Recovered tasks always go to queue:high for immediate reprocessing.
     """
     import worker
 
     stuck_task = make_task("crashed-task-001")
     await r.lpush("processing_queue", stuck_task)
 
-    # Ensure task_queue starts empty
-    assert await r.llen("task_queue") == 0
+    # Ensure queue:high starts empty
+    assert await r.llen("queue:high") == 0
     assert await r.llen("processing_queue") == 1
 
     # Run just the crash recovery loop (not the full consumer loop)
-    # We extract the logic and test it directly
     with patch.object(worker, "r", r):
         while True:
-            leftover = await r.rpoplpush("processing_queue", "task_queue")
+            leftover = await r.rpoplpush("processing_queue", "queue:high")
             if not leftover:
                 break
 
-    # After recovery: processing_queue empty, task_queue has the task
+    # After recovery: processing_queue empty, queue:high has the task
     assert await r.llen("processing_queue") == 0
-    assert await r.llen("task_queue") == 1
+    assert await r.llen("queue:high") == 1
 
-    recovered = json.loads(await r.lindex("task_queue", 0))
+    recovered = json.loads(await r.lindex("queue:high", 0))
     assert recovered["task_id"] == "crashed-task-001"
 
 
@@ -91,7 +91,7 @@ async def test_single_crashed_task_recovered(r):
 async def test_multiple_crashed_tasks_all_recovered(r):
     """
     SCENARIO: Worker crashed with 3 tasks in-flight simultaneously
-    EXPECT:   All 3 are moved back to task_queue
+    EXPECT:   All 3 are moved back to queue:high
 
     WHY: Crash recovery must loop — rpoplpush moves one item at a time.
          If the loop ran only once, 2 tasks would be permanently lost.
@@ -105,57 +105,57 @@ async def test_multiple_crashed_tasks_all_recovered(r):
 
     with patch.object(worker, "r", r):
         while True:
-            leftover = await r.rpoplpush("processing_queue", "task_queue")
+            leftover = await r.rpoplpush("processing_queue", "queue:high")
             if not leftover:
                 break
 
     assert await r.llen("processing_queue") == 0
-    assert await r.llen("task_queue") == 3
+    assert await r.llen("queue:high") == 3
 
 
 @pytest.mark.asyncio
 async def test_clean_startup_with_empty_processing_queue(r):
     """
     SCENARIO: Worker starts normally (no previous crash)
-    EXPECT:   Recovery loop exits immediately without touching task_queue
+    EXPECT:   Recovery loop exits immediately without touching queue:high
     """
     import worker
 
     # Both queues start empty
     assert await r.llen("processing_queue") == 0
-    assert await r.llen("task_queue") == 0
+    assert await r.llen("queue:high") == 0
 
     with patch.object(worker, "r", r):
         while True:
-            leftover = await r.rpoplpush("processing_queue", "task_queue")
+            leftover = await r.rpoplpush("processing_queue", "queue:high")
             if not leftover:
                 break
 
     # Nothing should have changed
-    assert await r.llen("task_queue") == 0
+    assert await r.llen("queue:high") == 0
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# TEST GROUP 2: Retry Scheduler (delayed_tasks → task_queue)
+# TEST GROUP 2: Retry Scheduler (delayed_tasks → queue:{priority})
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @pytest.mark.asyncio
 async def test_expired_delayed_task_is_requeued(r):
     """
     SCENARIO: A task in delayed_tasks has a score in the past (timer expired)
-    EXPECT:   One scheduler tick moves it to task_queue
+    EXPECT:   One scheduler tick moves it to its original priority queue
 
     HOW: We add a task with score = NOW - 10 (already past due).
          Then run retry_scheduler() for just ONE tick (not forever).
     """
     import worker
 
-    expired_task = make_task("expired-retry-001", retry_count=1)
+    expired_task = make_task("expired-retry-001", retry_count=1, priority="default")
     past_time = time.time() - 10  # 10 seconds in the past = already expired
     await r.zadd("delayed_tasks", {expired_task: past_time})
 
     assert await r.zcard("delayed_tasks") == 1
-    assert await r.llen("task_queue") == 0
+    assert await r.llen("queue:default") == 0
 
     # Run ONE tick of the scheduler manually
     with patch.object(worker, "r", r):
@@ -164,22 +164,47 @@ async def test_expired_delayed_task_is_requeued(r):
         for task_json in ready_tasks:
             removed = await r.zrem("delayed_tasks", task_json)
             if removed:
-                await r.lpush("task_queue", task_json)
+                task_data = json.loads(task_json)
+                await r.lpush(f"queue:{task_data.get('priority', 'default')}", task_json)
 
-    # Task must now be in task_queue
-    assert await r.llen("task_queue") == 1
+    # Task must now be in queue:default (its original priority)
+    assert await r.llen("queue:default") == 1
     assert await r.zcard("delayed_tasks") == 0
 
-    requeued = json.loads(await r.lindex("task_queue", 0))
+    requeued = json.loads(await r.lindex("queue:default", 0))
     assert requeued["task_id"] == "expired-retry-001"
     assert requeued["retry_count"] == 1  # count preserved for next handle_task
+
+
+@pytest.mark.asyncio
+async def test_high_priority_retry_goes_to_queue_high(r):
+    """
+    SCENARIO: A high-priority task was retried and is now ready
+    EXPECT:   Scheduler puts it back in queue:high, not queue:default
+    """
+    import worker
+
+    high_task = make_task("high-retry-001", retry_count=1, priority="high")
+    await r.zadd("delayed_tasks", {high_task: time.time() - 5})
+
+    with patch.object(worker, "r", r):
+        now = time.time()
+        ready_tasks = await r.zrangebyscore("delayed_tasks", "-inf", now)
+        for task_json in ready_tasks:
+            removed = await r.zrem("delayed_tasks", task_json)
+            if removed:
+                task_data = json.loads(task_json)
+                await r.lpush(f"queue:{task_data.get('priority', 'default')}", task_json)
+
+    assert await r.llen("queue:high") == 1
+    assert await r.llen("queue:default") == 0
 
 
 @pytest.mark.asyncio
 async def test_future_delayed_task_is_not_requeued(r):
     """
     SCENARIO: A task in delayed_tasks has a score in the FUTURE (timer not expired)
-    EXPECT:   Scheduler tick does NOT move it to task_queue
+    EXPECT:   Scheduler tick does NOT move it to any queue
 
     WHY: If we moved future tasks, the backoff would be useless — they'd
          get retried immediately and hammer the failing service.
@@ -196,10 +221,12 @@ async def test_future_delayed_task_is_not_requeued(r):
         for task_json in ready_tasks:
             removed = await r.zrem("delayed_tasks", task_json)
             if removed:
-                await r.lpush("task_queue", task_json)
+                task_data = json.loads(task_json)
+                await r.lpush(f"queue:{task_data.get('priority', 'default')}", task_json)
 
-    # Task must still be in delayed_tasks, NOT in task_queue
-    assert await r.llen("task_queue") == 0
+    # Task must still be in delayed_tasks, NOT in any queue
+    assert await r.llen("queue:default") == 0
+    assert await r.llen("queue:high") == 0
     assert await r.zcard("delayed_tasks") == 1
 
 
@@ -207,7 +234,7 @@ async def test_future_delayed_task_is_not_requeued(r):
 async def test_only_expired_tasks_are_requeued(r):
     """
     SCENARIO: 3 tasks in delayed_tasks: 2 expired, 1 future
-    EXPECT:   Only the 2 expired ones go to task_queue
+    EXPECT:   Only the 2 expired ones go to their priority queues
 
     WHY: The sorted set query zrangebyscore("-inf", now) is the key filter.
          This test verifies that filter works correctly with mixed data.
@@ -230,9 +257,10 @@ async def test_only_expired_tasks_are_requeued(r):
         for task_json in ready:
             removed = await r.zrem("delayed_tasks", task_json)
             if removed:
-                await r.lpush("task_queue", task_json)
+                task_data = json.loads(task_json)
+                await r.lpush(f"queue:{task_data.get('priority', 'default')}", task_json)
 
-    assert await r.llen("task_queue") == 2, "Should have re-queued exactly 2 tasks"
+    assert await r.llen("queue:default") == 2, "Should have re-queued exactly 2 tasks"
     assert await r.zcard("delayed_tasks") == 1, "Future task should remain in delayed_tasks"
 
 
@@ -241,7 +269,7 @@ async def test_zrem_prevents_duplicate_requeue(r):
     """
     SCENARIO: Two scheduler instances try to re-queue the same task (race condition)
     EXPECT:   zrem returns 1 for the first caller and 0 for the second.
-              Only one lpush happens — the task appears in task_queue exactly once.
+              Only one lpush happens — the task appears in queue:default exactly once.
 
     WHY: zrem is atomic in Redis. This test proves no duplicate processing.
     """
@@ -255,11 +283,12 @@ async def test_zrem_prevents_duplicate_requeue(r):
         removed_1 = await r.zrem("delayed_tasks", task)
         removed_2 = await r.zrem("delayed_tasks", task)  # second attempt
 
+        task_data = json.loads(task)
         if removed_1:
-            await r.lpush("task_queue", task)
+            await r.lpush(f"queue:{task_data.get('priority', 'default')}", task)
         if removed_2:
-            await r.lpush("task_queue", task)  # should not execute
+            await r.lpush(f"queue:{task_data.get('priority', 'default')}", task)  # should not execute
 
     assert removed_1 == 1
     assert removed_2 == 0
-    assert await r.llen("task_queue") == 1, "Task was duplicated in task_queue!"
+    assert await r.llen("queue:default") == 1, "Task was duplicated in queue!"

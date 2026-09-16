@@ -64,6 +64,7 @@ def pytest_configure(config):
         "matrix_multiply": {"handler": fake_matrix_multiply, "type": "cpu"},
     }
     sys.modules["task_registery"] = mock_task_registery
+    sys.modules["src.task_registery"] = mock_task_registery
 
 
 # ── Redis fixture ─────────────────────────────────────────────────────────────
@@ -114,6 +115,8 @@ def sample_email_task():
         "task_name": "send_email",
         "args": ["test@example.com", "Hello", "Test body"],
         "retry_count": 0,
+        "priority": "default",
+        "client_ip": "127.0.0.1",
     }
 
 
@@ -125,6 +128,8 @@ def sample_matrix_task():
         "task_name": "matrix_multiply",
         "args": [5],   # small size so tests are fast
         "retry_count": 0,
+        "priority": "default",
+        "client_ip": "127.0.0.1",
     }
 
 
@@ -139,4 +144,6 @@ def exhausted_task():
         "task_name": "send_email",
         "args": ["test@example.com", "Subject", "Body"],
         "retry_count": 3,
+        "priority": "default",
+        "client_ip": "127.0.0.1",
     }

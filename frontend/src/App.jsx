@@ -68,8 +68,8 @@ function App() {
     }
 
     const delay = parseInt(delaySeconds, 10);
-    if (taskName=="matrix_multiplication" && parsedArgs[0]>1000){
-      setSubmitStatus({type:"Error",msg:"Size cannot Exceed 1000"})
+    if (taskName=="matrix_multiply" && parsedArgs[0]>1000){
+      setSubmitStatus({type:"error",msg:"Size cannot Exceed 1000"})
       return;
     }
     const endpoint = delay > 0 ? `${API_URL}/task/schedule?delay_seconds=${delay}` : `${API_URL}/task/enqueue`;

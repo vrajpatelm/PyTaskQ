@@ -43,6 +43,8 @@ def make_task_json(task_name="send_email", retry_count=0, task_id="test-001"):
         "task_name": task_name,
         "args": ["a@b.com", "Hi", "Body"] if task_name == "send_email" else [3],
         "retry_count": retry_count,
+        "priority": "default",
+        "client_ip": "127.0.0.1",
     })
 
 
@@ -85,12 +87,12 @@ async def test_invalid_json_is_logged_as_failed(r, sem, thread_pool):
         await worker.handle_task(bad_json, sem, loop, thread_pool, thread_pool)
 
     # Result hash should exist with status=Failed
-    result = await r.hgetall("Task idUnknown")
+    result = await r.hgetall("task:Unknown")
     assert result["status"] == "Failed"
     assert "JSON Validation Error" in result["error"]
 
     # Must NOT be in DLQ (bad JSON is not a retryable error)
-    dlq_length = await r.llen("dead_letter_queue")
+    dlq_length = await r.llen("dlq:127.0.0.1")
     assert dlq_length == 0
 
     # Must be removed from processing_queue
@@ -114,7 +116,7 @@ async def test_missing_required_field_fails_validation(r, sem, thread_pool):
     with patch.object(worker, "r", r):
         await worker.handle_task(incomplete, sem, loop, thread_pool, thread_pool)
 
-    result = await r.hgetall("Task idUnknown")
+    result = await r.hgetall("task:Unknown")
     assert result["status"] == "Failed"
 
 
@@ -154,12 +156,12 @@ async def test_first_failure_schedules_retry(r, sem, thread_pool):
     assert retried_task["retry_count"] == 1
 
     # 3. Status must be RetryScheduled
-    result = await r.hgetall(f"Task idretry-test-001")
+    result = await r.hgetall(f"task:retry-test-001")
     assert result["status"] == "RetryScheduled"
     assert result["retry_count"] == "1"
 
     # 4. NOT in DLQ
-    assert await r.llen("dead_letter_queue") == 0
+    assert await r.llen("dlq:127.0.0.1") == 0
 
 
 @pytest.mark.asyncio
@@ -225,15 +227,15 @@ async def test_task_goes_to_dlq_after_3_retries(r, sem, thread_pool):
             await worker.handle_task(task_json, sem, loop, thread_pool, thread_pool)
 
     # 1. Must be in DLQ
-    dlq_length = await r.llen("dead_letter_queue")
+    dlq_length = await r.llen("dlq:127.0.0.1")
     assert dlq_length == 1, f"Expected task in DLQ, got {dlq_length} items"
 
     # 2. DLQ item must be the original task JSON
-    dlq_item = await r.lindex("dead_letter_queue", 0)
+    dlq_item = await r.lindex("dlq:127.0.0.1", 0)
     assert json.loads(dlq_item)["task_id"] == "dlq-test-001"
 
     # 3. Status must be DeadLetter
-    result = await r.hgetall("Task iddlq-test-001")
+    result = await r.hgetall("task:dlq-test-001")
     assert result["status"] == "DeadLetter"
     assert "Failed after 3 retries" in result["error"]
 
@@ -262,7 +264,7 @@ async def test_dlq_preserves_full_task_data(r, sem, thread_pool):
         with patch.object(loop, "run_in_executor", failing_executor):
             await worker.handle_task(task_json, sem, loop, thread_pool, thread_pool)
 
-    raw = await r.lindex("dead_letter_queue", 0)
+    raw = await r.lindex("dlq:127.0.0.1", 0)
     preserved = json.loads(raw)
 
     assert preserved["task_id"] == "dlq-data-test"
@@ -296,13 +298,13 @@ async def test_successful_task_saves_result(r, sem, thread_pool):
             await worker.handle_task(task_json, sem, loop, thread_pool, thread_pool)
 
     # 1. Result hash must exist with Success status
-    result = await r.hgetall("Task idsuccess-test-001")
+    result = await r.hgetall("task:success-test-001")
     assert result["status"] == "Success"
     assert result["task_id"] == "success-test-001"
     assert "result" in result
 
     # 2. TTL must be set (~86400 seconds = 24h)
-    ttl = await r.ttl("Task idsuccess-test-001")
+    ttl = await r.ttl("task:success-test-001")
     assert ttl > 0, "TTL was not set — result will never expire"
     assert ttl <= 86400
 
@@ -311,7 +313,7 @@ async def test_successful_task_saves_result(r, sem, thread_pool):
 
     # 4. No retry or DLQ entries
     assert await r.zcard("delayed_tasks") == 0
-    assert await r.llen("dead_letter_queue") == 0
+    assert await r.llen("dlq:127.0.0.1") == 0
 
 
 @pytest.mark.asyncio

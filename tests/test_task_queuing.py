@@ -4,7 +4,7 @@ test_task_queuing.py — Tests for the Producer side (app.py)
 
 WHAT WE TEST HERE:
     The "enqueue" contract: when an API endpoint is called, does the task
-    land in Redis with the correct shape?
+    land in the correct priority queue in Redis with the correct shape?
 
 WHY THIS MATTERS:
     If the shape is wrong (missing task_id, wrong key names), the worker
@@ -12,7 +12,7 @@ WHY THIS MATTERS:
     These tests catch that before it ever reaches the worker.
 
 ARCHITECTURE TESTED:
-    CLIENT → app.py → Redis task_queue
+    CLIENT → app.py → Redis queue:{priority}
 """
 
 import json
@@ -47,6 +47,8 @@ async def test_client(fake_redis_for_app, monkeypatch):
     """
     import app  # import AFTER monkeypatching below
     monkeypatch.setattr(app, "r", fake_redis_for_app)
+    # Monkeypatch get_client_ip to return a known, stable IP for tests
+    monkeypatch.setattr(app, "get_client_ip", lambda req: "127.0.0.1")
 
     # ASGITransport lets httpx talk to FastAPI without a real network/port
     transport = ASGITransport(app=app.app)
@@ -55,18 +57,21 @@ async def test_client(fake_redis_for_app, monkeypatch):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# TEST GROUP 1: Task is enqueued with correct shape
+# TEST GROUP 1: Task is enqueued to the correct priority queue with correct shape
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @pytest.mark.asyncio
-async def test_matrix_task_is_pushed_to_queue(test_client):
+async def test_default_priority_task_pushed_to_queue_default(test_client):
     """
-    SCENARIO: Client calls GET /task/mul?size=5
-    EXPECT:   One task appears in task_queue with correct fields
+    SCENARIO: Client posts a task with no priority specified (defaults to "default")
+    EXPECT:   Task appears in queue:default with correct fields
     """
     client, r = test_client
 
-    response = await client.get("/task/mul?size=5")
+    response = await client.post("/task/enqueue", json={
+        "task_name": "matrix_multiply",
+        "args": [5],
+    })
 
     # 1. HTTP response must be 200 and contain task_id + status
     assert response.status_code == 200
@@ -74,45 +79,70 @@ async def test_matrix_task_is_pushed_to_queue(test_client):
     assert "task_id" in body
     assert body["status"] == "queued"
 
-    # 2. Exactly ONE item must be in the Redis queue
-    queue_length = await r.llen("task_queue")
-    assert queue_length == 1, f"Expected 1 task in queue, got {queue_length}"
+    # 2. Exactly ONE item must be in queue:default
+    queue_length = await r.llen("queue:default")
+    assert queue_length == 1, f"Expected 1 task in queue:default, got {queue_length}"
 
-    # 3. The item must be valid JSON with the right shape
-    raw = await r.lindex("task_queue", 0)
+    # 3. Other priority queues must be empty
+    assert await r.llen("queue:high") == 0
+    assert await r.llen("queue:low") == 0
+
+    # 4. The item must be valid JSON with the right shape
+    raw = await r.lindex("queue:default", 0)
     task = json.loads(raw)
     assert task["task_name"] == "matrix_multiply"
     assert task["args"] == [5]
     assert task["retry_count"] == 0
+    assert task["priority"] == "default"
     assert "task_id" in task
+    assert "client_ip" in task
     assert task["task_id"] == body["task_id"]   # API response ID matches queue ID
 
 
 @pytest.mark.asyncio
-async def test_email_task_is_pushed_to_queue(test_client):
+async def test_high_priority_task_pushed_to_queue_high(test_client):
     """
-    SCENARIO: Client POSTs to /task/send_email
-    EXPECT:   One task in queue with correct email args
+    SCENARIO: Client posts a task with priority="high"
+    EXPECT:   Task appears in queue:high, NOT in queue:default or queue:low
     """
     client, r = test_client
 
-    response = await client.post("/task/send_email", data={
-        "email": "vraj@example.com",
-        "title": "Hello",
-        "body": "Test body"
+    response = await client.post("/task/enqueue", json={
+        "task_name": "matrix_multiply",
+        "args": [5],
+        "priority": "high",
     })
 
     assert response.status_code == 200
-    body = response.json()
-    assert body["status"] == "queued"
 
-    raw = await r.lindex("task_queue", 0)
+    # Must be in queue:high
+    assert await r.llen("queue:high") == 1
+    assert await r.llen("queue:default") == 0
+    assert await r.llen("queue:low") == 0
+
+    raw = await r.lindex("queue:high", 0)
     task = json.loads(raw)
-    assert task["task_name"] == "send_email"
-    assert task["args"][0] == "vraj@example.com"
-    assert task["args"][1] == "Hello"
-    assert task["args"][2] == "Test body"
-    assert task["retry_count"] == 0
+    assert task["priority"] == "high"
+
+
+@pytest.mark.asyncio
+async def test_low_priority_task_pushed_to_queue_low(test_client):
+    """
+    SCENARIO: Client posts a task with priority="low"
+    EXPECT:   Task appears in queue:low
+    """
+    client, r = test_client
+
+    response = await client.post("/task/enqueue", json={
+        "task_name": "matrix_multiply",
+        "args": [5],
+        "priority": "low",
+    })
+
+    assert response.status_code == 200
+    assert await r.llen("queue:low") == 1
+    assert await r.llen("queue:high") == 0
+    assert await r.llen("queue:default") == 0
 
 
 @pytest.mark.asyncio
@@ -126,29 +156,34 @@ async def test_each_task_gets_unique_id(test_client):
     """
     client, r = test_client
 
-    r1 = await client.get("/task/mul?size=3")
-    r2 = await client.get("/task/mul?size=3")
+    r1 = await client.post("/task/enqueue", json={"task_name": "matrix_multiply", "args": [3]})
+    r2 = await client.post("/task/enqueue", json={"task_name": "matrix_multiply", "args": [3]})
 
     id1 = r1.json()["task_id"]
     id2 = r2.json()["task_id"]
 
     assert id1 != id2, "Two tasks were assigned the same ID — UUID collision!"
-    assert await r.llen("task_queue") == 2
+    assert await r.llen("queue:default") == 2
 
 
 @pytest.mark.asyncio
-async def test_matrix_default_size_is_10(test_client):
+async def test_task_payload_includes_client_ip(test_client):
     """
-    SCENARIO: Client calls /task/mul with NO size parameter
-    EXPECT:   args defaults to [10]
+    SCENARIO: Client submits a task
+    EXPECT:   The task JSON in Redis contains a client_ip field
+
+    WHY: Per-IP multi-tenancy depends on every task carrying the sender's IP.
     """
     client, r = test_client
 
-    await client.get("/task/mul")   # no ?size=
+    await client.post("/task/enqueue", json={
+        "task_name": "matrix_multiply",
+        "args": [5],
+    })
 
-    raw = await r.lindex("task_queue", 0)
+    raw = await r.lindex("queue:default", 0)
     task = json.loads(raw)
-    assert task["args"] == [10], f"Default size should be 10, got {task['args']}"
+    assert "client_ip" in task, "Task is missing client_ip — multi-tenancy broken"
 
 
 @pytest.mark.asyncio
@@ -164,3 +199,6 @@ async def test_result_endpoint_returns_empty_for_unknown_id(test_client):
     response = await client.get("/task/nonexistent-uuid-000")
     assert response.status_code == 200
     assert response.json() == {"result": {}}
+"""
+    Test file written.
+"""

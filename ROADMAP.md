@@ -40,6 +40,17 @@ Any authenticated user with an API key should be able to:
 - [ ] **Webhook Signature (HMAC-SHA256)** — Sign every outgoing webhook payload with a secret so the receiving server can verify the request genuinely came from PyTaskQ and not a spoofed attacker.
 - [ ] **Update Frontend** — Add an API Key input field. Store the key in `sessionStorage`. Send it as a `Bearer` token on all requests.
 
+    
+---
+
+## 🚀 Phase 1.5 — Scale to 1,000 Users & Priority Queuing
+*Architectural changes required to handle high traffic and important tasks seamlessly.*
+
+- [x] **Task Priority Queue** — Three Redis Lists (`queue:high`, `queue:default`, `queue:low`) polled in strict priority order via `RPOPLPUSH`.
+- [ ] **Per-Tenant Backpressure** — Limit pending tasks per API Key/IP (e.g., max 50) instead of a rigid global queue limit. Ensures no single user can crash the server.
+- [ ] **Increased Rate Limits** — Move from 10 req/min to a generous 100 req/min, protected by the new per-tenant backpressure limit.
+- [ ] **Horizontal Worker Scaling** — Update `docker-compose.yml` to easily spin up N worker replicas (`deploy: replicas: 5`) to handle massive concurrent load.
+
 ---
 
 ## 🔧 Phase 2 — Observability & Reliability
@@ -54,8 +65,6 @@ Any authenticated user with an API key should be able to:
 ---
 
 ## 💡 Phase 3 — Platform Features
-
-- [ ] **Task Priority Queue** — Use a Redis Sorted Set scored by priority. High-priority tasks (score 1) are consumed before low-priority tasks (score 10).
 - [ ] **Task Chaining** — Allow a task to define a `next_task` in its payload. When Task A completes successfully, automatically enqueue Task B with A's result as input.
 - [ ] **Recurring / Cron Tasks** — Allow tenants to register a task that runs on a schedule (e.g., every 5 minutes) using a cron expression.
 - [ ] **Task Search & History Page** — A dedicated dashboard page showing all tasks for a given API key, filterable by status and date.
@@ -67,19 +76,21 @@ Any authenticated user with an API key should be able to:
 
 | Feature | Notes |
 |---------|-------|
-| Core async task queue (BRPOPLPUSH) | Reliable, at-least-once delivery |
+| Core async task queue (RPOPLPUSH) | Reliable, at-least-once delivery with priority ordering |
+| Priority Queue (3-tier) | queue:high → queue:default → queue:low polling |
+| Per-IP multi-tenant isolation | Metrics, DLQ, and stats scoped by client IP |
 | CPU vs I/O pool dispatch | ProcessPoolExecutor + ThreadPoolExecutor |
 | Exponential backoff retry (3x) | Delays: 2s, 4s, 8s |
-| Dead Letter Queue (DLQ) + full UI | View, replay, purge individual/all |
-| Worker crash recovery on startup | Sweeps own processing queue on boot |
-| Zombie worker sweeper | Recovers tasks from dead workers |
+| Dead Letter Queue (DLQ) + full UI | View, replay, purge individual/all (per-IP) |
+| Worker crash recovery on startup | Sweeps own processing queue on boot → queue:high |
+| Zombie worker sweeper | Recovers tasks from dead workers → queue:high |
 | Heartbeat system | Workers register TTL in active_workers ZSET |
 | Delayed / scheduled tasks | ZADD to delayed_tasks ZSET |
 | Webhook delivery (basic) | fire_webhook via thread pool |
-| Queue backpressure (500 cap) | 429 on /task/enqueue |
+| Queue backpressure (global cap) | 429 on /task/enqueue |
 | Rate limiting (10 req/min per IP) | Redis-based sliding window |
 | Matrix size limit (backend + frontend) | 1000x1000 hard cap |
-| React dashboard | Metrics, dispatch, DLQ management, task lookup |
+| React dashboard (Lucide icons) | Metrics, dispatch, DLQ management, task lookup |
 | Docker Compose deployment | Redis + API + Worker in one command |
 | pytest suite | crash recovery, DLQ, graceful shutdown, handle_task |
 
@@ -107,4 +118,4 @@ At that point the project is architecturally comparable to Inngest or Trigger.de
 
 ---
 
-*Last updated: 2026-09-07*
+*Last updated: 2026-09-15*

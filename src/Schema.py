@@ -1,3 +1,4 @@
+from typing import Literal
 from typing import Any,List,Optional
 from pydantic import BaseModel
 # for incoming taks VALIDATION
@@ -19,4 +20,5 @@ class Taskresult(BaseModel):
 class TaskRequest(BaseModel):
     task_name:str
     args: List[Any]=[]
+    priority:Literal["high","default","low"]="default"
     webhook_url: Optional[str] = None

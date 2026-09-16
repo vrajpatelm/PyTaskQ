@@ -38,8 +38,8 @@ async def retry_scheduler():
         for task_json in ready_tasks:
             removed = await r.zrem("delayed_tasks", task_json)
             if removed:  
-                await r.lpush("task_queue", task_json)
                 task_data = json.loads(task_json)
+                await r.lpush(f"queue:{task_data.get('priority', 'default')}", task_json)
                 client_ip = task_data.get('client_ip', 'unknown')
                 await r.decr(f"stats:delayed:{client_ip}")
                 await r.incr(f"stats:pending:{client_ip}")
@@ -63,7 +63,7 @@ async def zombie_sweeper():
             expired = await r.zrangebyscore("active_workers", "-inf", time.time())
             for worker_id in expired:
                 while True:
-                    result = await r.rpoplpush(f"processing_queue:{worker_id}", "task_queue")
+                    result = await r.rpoplpush(f"processing_queue:{worker_id}", f"queue:high")
                     if not result:
                         break  # No more tasks for this dead worker
                     task_data = json.loads(result)
@@ -102,7 +102,7 @@ async def consumer_task():
     while not shutdown_event.is_set():
         try:
             while True:
-                leftover = await r.rpoplpush(f"processing_queue:{WORKER_ID}", "task_queue")
+                leftover = await r.rpoplpush(f"processing_queue:{WORKER_ID}", "queue:high")
                 if not leftover:
                     break
                 task_data = json.loads(leftover)
@@ -127,9 +127,14 @@ async def consumer_task():
         # Unpack the Redis response first
         try:
             await sem.acquire()  # Wait for a free slot
-            task_json = await r.brpoplpush("task_queue", f"processing_queue:{WORKER_ID}", timeout=2)
-            if task_json is None:
-                sem.release()  # Release the semaphore if no task was fetched
+            task_json = await r.rpoplpush("queue:high", f"processing_queue:{WORKER_ID}")
+            if not task_json:
+                task_json = await r.rpoplpush("queue:default", f"processing_queue:{WORKER_ID}")
+            if not task_json:
+               task_json = await r.rpoplpush("queue:low", f"processing_queue:{WORKER_ID}")
+            if not task_json:
+                await asyncio.sleep(1)
+                sem.release()
                 continue
         except Exception as e:
             sem.release()  # ← CRITICAL: release slot even on connection error
@@ -179,7 +184,7 @@ async def handle_task(task_json, sem, loop, process_pool, thread_pool):
         except Exception as e:
             logger.error(f"Error occurred while validating task JSON: {e}")
             task_id = "Unknown"
-            await r.hset(f"Task id{task_id}", mapping={
+            await r.hset(f"task:{task_id}", mapping={
                 "task_id": task_id,
                 "status": "Failed",
                 "error": f"JSON Validation Error: {str(e)}"
@@ -210,8 +215,8 @@ async def handle_task(task_json, sem, loop, process_pool, thread_pool):
             # Save Success result to Redis
             task_id = tasks.task_id
             task_result = Taskresult(task_id=task_id, status="Success", result=str(result))
-            await r.hset(f"Task id{task_id}", mapping=task_result.model_dump())
-            await r.expire(f"Task id{task_id}", 86400)
+            await r.hset(f"task:{task_id}", mapping=task_result.model_dump())
+            await r.expire(f"task:{task_id}", 86400)
             await r.incr(f"stats:completed:{client_ip}")  # Cumulative: total tasks ever completed
             logger.info(f"Task {task_id} completed successfully.")
             
@@ -228,7 +233,7 @@ async def handle_task(task_json, sem, loop, process_pool, thread_pool):
                logger.error(f"[DLQ] Task {task_id} failed after 3 retries. Moving to dead-letter queue.")
                await r.lpush(f"dlq:{client_ip}", task_json)
                await r.incr(f"stats:dlq:{client_ip}")
-               await r.hset(f"Task_id:{task_id}", mapping={
+               await r.hset(f"task:{task_id}", mapping={
                     "task_id": task_id,
                     "status": "DeadLetter",
                     "error": f"Failed after 3 retries.Last error: {str(e)} "}
@@ -239,7 +244,7 @@ async def handle_task(task_json, sem, loop, process_pool, thread_pool):
                 await r.zadd("delayed_tasks", {json.dumps(tasks.model_dump()): time.time() + delay})
                 await r.incr(f"stats:delayed:{client_ip}")
                 logger.warning(f"[Retry] Task {task_id} failed. Scheduled for retry #{tasks.retry_count} after {delay} seconds.")
-                await r.hset(f"Task_id:{task_id}", mapping={
+                await r.hset(f"task:{task_id}", mapping={
                     "task_id": task_id,
                     "status": "RetryScheduled",
                     "retry_count": tasks.retry_count,

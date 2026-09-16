@@ -66,7 +66,12 @@ def get_client_ip(req: Request) -> str:
     return req.client.host
 
 async def check_backpressure():
-    queue_len = await r.llen("task_queue")
+    queue_len = (
+    await r.llen("queue:high") + 
+    await r.llen("queue:default") + 
+    await r.llen("queue:low")
+        )
+    
     if queue_len >= QUEUE_CAPACITY:
         raise HTTPException(
             status_code=429,
@@ -116,14 +121,15 @@ async def enqueue_task(request:TaskRequest, req: Request):
         "task_id": task_id,
         "retry_count":0,
         "webhook_url": request.webhook_url,
+        "priority":request.priority,
         "client_ip": client_ip
     }
-    await r.lpush("task_queue",json.dumps(tasks))
+    await r.lpush(f"queue:{request.priority}",json.dumps(tasks))    
     await r.incr(f"stats:pending:{client_ip}")
     logger.info(f"Enqueued generic task: {request.task_name} with ID {task_id} from IP {client_ip}")
     return {"task_id": task_id, "status": "queued"}
 
-@app.post("/task/schedule",dependencies=[Depends(rate_limiter)])
+@app.post("/task/schedule",dependencies=[Depends(rate_limiter), Depends(check_backpressure)])
 async def schedule_task(request: TaskRequest, req: Request, delay_seconds: int = 60):
     if request.task_name not in TASKS:
         raise HTTPException(status_code=400, detail="Unknown Task")
@@ -139,7 +145,8 @@ async def schedule_task(request: TaskRequest, req: Request, delay_seconds: int =
         "task_id": task_id,
         "retry_count": 0,
         "webhook_url": request.webhook_url,
-        "client_ip": client_ip
+        "priority":request.priority,
+        "client_ip": client_ip,
     }
     execute_at = time.time() + delay_seconds
     
@@ -152,7 +159,7 @@ async def schedule_task(request: TaskRequest, req: Request, delay_seconds: int =
 
 @app.get("/task/{task_id}")
 async def task_result_disaplay(task_id:str):
-    result = await r.hgetall(f"Task id{task_id}")
+    result = await r.hgetall(f"task:{task_id}")
     return {"result":result}
 
 
@@ -204,7 +211,7 @@ async def replay_task(task_id: str, req: Request):
     
     matched_dict["retry_count"] = 0
     await r.lrem(dlq_key, 1, matched_item)
-    await r.rpush("task_queue", json.dumps(matched_dict))
+    await r.rpush(f"queue:{matched_dict.get('priority', 'default')}", json.dumps(matched_dict))
     await r.incr(f"stats:pending:{client_ip}")
     await r.decr(f"stats:dlq:{client_ip}")
     return {

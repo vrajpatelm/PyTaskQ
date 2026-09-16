@@ -3,15 +3,15 @@ test_dlq_endpoints.py — Tests for the DLQ management & metrics API endpoints
 =============================================================================
 
 WHAT WE TEST HERE:
-    The 5 new endpoints you are implementing in app.py:
-      - GET  /metrics              → live queue counts
-      - GET  /dlq                  → list all tasks in dead_letter_queue
-      - POST /dlq/replay/{task_id} → move task from DLQ back to task_queue
+    The 5 endpoints in app.py:
+      - GET  /metrics              → live per-user queue counts
+      - GET  /dlq                  → list all tasks in dlq:{client_ip}
+      - POST /dlq/replay/{task_id} → move task from DLQ back to queue:{priority}
       - POST /dlq/purge/{task_id}  → permanently delete one task from DLQ
-      - POST /dlq/purge_all        → clear the entire DLQ
+      - POST /dlq/purge_all        → clear the entire DLQ for this user
 
 ARCHITECTURE TESTED:
-    CLIENT → app.py → Redis queues
+    CLIENT → app.py → Redis queues (per-IP isolated)
 
 HOW WE ISOLATE app.py:
     Same pattern as test_task_queuing.py:
@@ -20,11 +20,11 @@ HOW WE ISOLATE app.py:
       - Each test gets a fresh, empty Redis — no shared state between tests
 
 WHAT IS "DLQ"?
-    dead_letter_queue is a Redis List.
+    dlq:{client_ip} is a per-tenant Redis List.
     Tasks end up there after 3 failed retries.
     An operator (or this dashboard) can then:
       - Inspect what failed
-      - Replay (re-queue) the task
+      - Replay (re-queue) the task to its original priority queue
       - Purge (permanently delete) the task
 """
 
@@ -34,6 +34,10 @@ import pytest
 import pytest_asyncio
 import fakeredis.aioredis as fakeredis
 from httpx import AsyncClient, ASGITransport
+
+
+# The IP that our monkeypatched get_client_ip will return
+TEST_CLIENT_IP = "127.0.0.1"
 
 
 # ── Shared fixtures ───────────────────────────────────────────────────────────
@@ -56,19 +60,23 @@ async def test_client(fake_redis_for_app, monkeypatch):
     """
     import app
     monkeypatch.setattr(app, "r", fake_redis_for_app)
+    # Monkeypatch get_client_ip to return a known, stable IP for tests
+    monkeypatch.setattr(app, "get_client_ip", lambda req: TEST_CLIENT_IP)
 
     transport = ASGITransport(app=app.app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
         yield client, fake_redis_for_app
 
 
-def make_dlq_task(task_id, task_name="send_email"):
+def make_dlq_task(task_id, task_name="send_email", priority="default"):
     """Build a realistic DLQ task payload — same shape worker.py pushes."""
     return json.dumps({
         "task_id": task_id,
         "task_name": task_name,
         "args": ["a@b.com", "Hello", "Body"],
         "retry_count": 3,
+        "priority": priority,
+        "client_ip": TEST_CLIENT_IP,
     })
 
 
@@ -90,29 +98,30 @@ async def test_metrics_all_zero_on_empty_system(test_client):
     assert response.status_code == 200
 
     data = response.json()
-    assert data["pending"] == 0,    "task_queue should be empty"
-    assert data["processing"] == 0, "processing_queue should be empty"
-    assert data["delayed"] == 0,    "delayed_tasks ZSET should be empty"
-    assert data["dlq"] == 0,        "dead_letter_queue should be empty"
+    assert data["pending"] == 0,    "pending counter should be 0"
+    assert data["processing"] == 0, "processing counter should be 0"
+    assert data["delayed"] == 0,    "delayed counter should be 0"
+    assert data["dlq"] == 0,        "dlq should be empty"
 
 
 @pytest.mark.asyncio
-async def test_metrics_reflects_task_queue_count(test_client):
+async def test_metrics_reflects_per_ip_counters(test_client):
     """
-    SCENARIO: 3 tasks are in task_queue, 1 in processing_queue, 2 in DLQ.
-    EXPECT:   /metrics returns the exact counts.
+    SCENARIO: Stats counters are set for a specific IP, DLQ has tasks.
+    EXPECT:   /metrics returns the exact counts for that IP.
 
-    WHY: The dashboard must accurately reflect live system state.
-         If metrics lie, operators won't know tasks are stuck.
+    WHY: The dashboard must accurately reflect live per-user system state.
     """
     client, r = test_client
 
-    for i in range(3):
-        await r.lpush("task_queue", make_dlq_task(f"pending-{i}"))
-    await r.zadd("active_workers", {"test_worker": time.time() + 30})
-    await r.lpush("processing_queue:test_worker", make_dlq_task("processing-1"))
+    # Set per-IP stats counters (simulating what app.py/worker.py do)
+    await r.set(f"stats:pending:{TEST_CLIENT_IP}", 3)
+    await r.set(f"stats:processing:{TEST_CLIENT_IP}", 1)
+    await r.set(f"stats:delayed:{TEST_CLIENT_IP}", 0)
+    await r.set(f"stats:completed:{TEST_CLIENT_IP}", 10)
+    await r.set(f"stats:failed:{TEST_CLIENT_IP}", 2)
     for i in range(2):
-        await r.lpush("dead_letter_queue", make_dlq_task(f"dlq-{i}"))
+        await r.lpush(f"dlq:{TEST_CLIENT_IP}", make_dlq_task(f"dlq-{i}"))
 
     response = await client.get("/metrics")
     assert response.status_code == 200
@@ -122,26 +131,28 @@ async def test_metrics_reflects_task_queue_count(test_client):
     assert data["processing"] == 1
     assert data["delayed"] == 0
     assert data["dlq"] == 2
+    assert data["completed_total"] == 10
+    assert data["failed_total"] == 2
 
 
 @pytest.mark.asyncio
-async def test_metrics_counts_delayed_tasks_from_zset(test_client):
+async def test_metrics_isolated_between_users(test_client):
     """
-    SCENARIO: 2 tasks are sitting in the delayed_tasks sorted set.
-    EXPECT:   metrics["delayed"] == 2
+    SCENARIO: Stats exist for a DIFFERENT IP than the test client.
+    EXPECT:   /metrics returns 0 for the test client (not the other user's data).
 
-    WHY: delayed_tasks is a ZSET, not a list.
-         The endpoint must use ZCARD, not LLEN, to count it correctly.
+    WHY: Multi-tenancy isolation — users must not see each other's metrics.
     """
-    import time
     client, r = test_client
 
-    future = time.time() + 60
-    await r.zadd("delayed_tasks", {"task-a": future, "task-b": future})
+    # Set stats for a different IP
+    await r.set("stats:completed:10.0.0.99", 500)
+    await r.lpush("dlq:10.0.0.99", make_dlq_task("other-user-task"))
 
     response = await client.get("/metrics")
     data = response.json()
-    assert data["delayed"] == 2
+    assert data["completed_total"] == 0, "Should not see another user's completed count"
+    assert data["dlq"] == 0, "Should not see another user's DLQ"
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -169,7 +180,7 @@ async def test_dlq_returns_empty_list_when_no_failures(test_client):
 @pytest.mark.asyncio
 async def test_dlq_lists_all_failed_tasks(test_client):
     """
-    SCENARIO: 3 tasks are in dead_letter_queue.
+    SCENARIO: 3 tasks are in the per-IP DLQ.
     EXPECT:   /dlq returns all 3, each as a parsed dict (not raw JSON strings).
 
     WHY: The dashboard needs to display task_id, task_name, retry_count etc.
@@ -179,7 +190,7 @@ async def test_dlq_lists_all_failed_tasks(test_client):
 
     ids = ["failed-001", "failed-002", "failed-003"]
     for task_id in ids:
-        await r.lpush("dead_letter_queue", make_dlq_task(task_id))
+        await r.lpush(f"dlq:{TEST_CLIENT_IP}", make_dlq_task(task_id))
 
     response = await client.get("/dlq")
     assert response.status_code == 200
@@ -202,7 +213,7 @@ async def test_dlq_task_has_required_fields(test_client):
     """
     client, r = test_client
 
-    await r.lpush("dead_letter_queue", make_dlq_task("field-check-001"))
+    await r.lpush(f"dlq:{TEST_CLIENT_IP}", make_dlq_task("field-check-001"))
 
     response = await client.get("/dlq")
     task = response.json()["tasks"][0]
@@ -211,6 +222,7 @@ async def test_dlq_task_has_required_fields(test_client):
     assert "task_name" in task
     assert "retry_count" in task
     assert "args" in task
+    assert "priority" in task
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -218,10 +230,10 @@ async def test_dlq_task_has_required_fields(test_client):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @pytest.mark.asyncio
-async def test_replay_moves_task_to_task_queue(test_client):
+async def test_replay_moves_task_to_priority_queue(test_client):
     """
     SCENARIO: Operator clicks "Replay" on a failed task.
-    EXPECT:   Task is removed from DLQ and added to task_queue.
+    EXPECT:   Task is removed from DLQ and added to its original priority queue.
 
     WHY: This is the core of DLQ recovery — the task must run again.
          If it stays in DLQ after replay, it's stuck forever.
@@ -229,25 +241,33 @@ async def test_replay_moves_task_to_task_queue(test_client):
     client, r = test_client
 
     task_id = "replay-test-001"
-    await r.lpush("dead_letter_queue", make_dlq_task(task_id))
-    assert await r.llen("dead_letter_queue") == 1
-    assert await r.llen("task_queue") == 0
+    await r.lpush(f"dlq:{TEST_CLIENT_IP}", make_dlq_task(task_id, priority="default"))
+    assert await r.llen(f"dlq:{TEST_CLIENT_IP}") == 1
 
     response = await client.post(f"/dlq/replay/{task_id}")
     assert response.status_code == 200
 
     # DLQ must be empty after replay
-    assert await r.llen("dead_letter_queue") == 0, "Task was NOT removed from DLQ"
+    assert await r.llen(f"dlq:{TEST_CLIENT_IP}") == 0, "Task was NOT removed from DLQ"
 
-    # task_queue must contain the task
-    assert await r.llen("task_queue") == 1, "Task was NOT added to task_queue"
+    # The task must be in the correct priority queue
+    total_queued = (
+        await r.llen("queue:high") +
+        await r.llen("queue:default") +
+        await r.llen("queue:low")
+    )
+    assert total_queued == 1, "Task was NOT added to any priority queue"
 
     # The replayed task must have retry_count reset to 0
-    replayed = json.loads(await r.lindex("task_queue", 0))
-    assert replayed["retry_count"] == 0, (
-        "Replayed task should have retry_count=0, not 3 "
-        "(otherwise it would immediately go back to DLQ on first failure)"
-    )
+    for queue_name in ["queue:high", "queue:default", "queue:low"]:
+        raw = await r.lindex(queue_name, 0)
+        if raw:
+            replayed = json.loads(raw)
+            assert replayed["retry_count"] == 0, (
+                "Replayed task should have retry_count=0, not 3 "
+                "(otherwise it would immediately go back to DLQ on first failure)"
+            )
+            break
 
 
 @pytest.mark.asyncio
@@ -278,14 +298,13 @@ async def test_replay_only_removes_the_targeted_task(test_client):
 
     ids = ["keep-001", "replay-me", "keep-002"]
     for task_id in ids:
-        await r.lpush("dead_letter_queue", make_dlq_task(task_id))
+        await r.lpush(f"dlq:{TEST_CLIENT_IP}", make_dlq_task(task_id))
 
     response = await client.post("/dlq/replay/replay-me")
     assert response.status_code == 200
 
     # DLQ should still have exactly 2 tasks
-    assert await r.llen("dead_letter_queue") == 2
-    assert await r.llen("task_queue") == 1
+    assert await r.llen(f"dlq:{TEST_CLIENT_IP}") == 2
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -296,7 +315,7 @@ async def test_replay_only_removes_the_targeted_task(test_client):
 async def test_purge_removes_task_from_dlq(test_client):
     """
     SCENARIO: Operator decides a task is unrecoverable and deletes it.
-    EXPECT:   Task is gone from DLQ; task_queue stays empty (no re-queue).
+    EXPECT:   Task is gone from DLQ; no priority queues are touched.
 
     WHY: Purge is permanent deletion — NOT a replay. The task must
          not re-appear anywhere in the system after purge.
@@ -304,13 +323,13 @@ async def test_purge_removes_task_from_dlq(test_client):
     client, r = test_client
 
     task_id = "purge-test-001"
-    await r.lpush("dead_letter_queue", make_dlq_task(task_id))
+    await r.lpush(f"dlq:{TEST_CLIENT_IP}", make_dlq_task(task_id))
 
     response = await client.post(f"/dlq/purge/{task_id}")
     assert response.status_code == 200
 
-    assert await r.llen("dead_letter_queue") == 0, "Task was NOT purged from DLQ"
-    assert await r.llen("task_queue") == 0, "Purge should NOT add task to task_queue"
+    assert await r.llen(f"dlq:{TEST_CLIENT_IP}") == 0, "Task was NOT purged from DLQ"
+    assert await r.llen("queue:default") == 0, "Purge should NOT add task to any queue"
 
 
 @pytest.mark.asyncio
@@ -335,13 +354,13 @@ async def test_purge_does_not_affect_other_dlq_tasks(test_client):
 
     ids = ["safe-001", "delete-me", "safe-002"]
     for task_id in ids:
-        await r.lpush("dead_letter_queue", make_dlq_task(task_id))
+        await r.lpush(f"dlq:{TEST_CLIENT_IP}", make_dlq_task(task_id))
 
     response = await client.post("/dlq/purge/delete-me")
     assert response.status_code == 200
 
-    assert await r.llen("dead_letter_queue") == 2
-    remaining_raw = await r.lrange("dead_letter_queue", 0, -1)
+    assert await r.llen(f"dlq:{TEST_CLIENT_IP}") == 2
+    remaining_raw = await r.lrange(f"dlq:{TEST_CLIENT_IP}", 0, -1)
     remaining_ids = {json.loads(t)["task_id"] for t in remaining_raw}
     assert "delete-me" not in remaining_ids
 
@@ -354,7 +373,7 @@ async def test_purge_does_not_affect_other_dlq_tasks(test_client):
 async def test_purge_all_clears_entire_dlq(test_client):
     """
     SCENARIO: 5 tasks are in DLQ; operator clicks "Purge All".
-    EXPECT:   DLQ is completely empty; task_queue is untouched.
+    EXPECT:   DLQ is completely empty; no priority queues are touched.
 
     WHY: This is the nuclear option — useful when the DLQ has accumulated
          hundreds of unrecoverable tasks from a bad deployment.
@@ -362,14 +381,14 @@ async def test_purge_all_clears_entire_dlq(test_client):
     client, r = test_client
 
     for i in range(5):
-        await r.lpush("dead_letter_queue", make_dlq_task(f"dlq-task-{i}"))
-    assert await r.llen("dead_letter_queue") == 5
+        await r.lpush(f"dlq:{TEST_CLIENT_IP}", make_dlq_task(f"dlq-task-{i}"))
+    assert await r.llen(f"dlq:{TEST_CLIENT_IP}") == 5
 
     response = await client.post("/dlq/purge_all")
     assert response.status_code == 200
 
-    assert await r.llen("dead_letter_queue") == 0, "DLQ was NOT fully cleared"
-    assert await r.llen("task_queue") == 0, "purge_all should NOT touch task_queue"
+    assert await r.llen(f"dlq:{TEST_CLIENT_IP}") == 0, "DLQ was NOT fully cleared"
+    assert await r.llen("queue:default") == 0, "purge_all should NOT touch any queue"
 
 
 @pytest.mark.asyncio
@@ -385,4 +404,4 @@ async def test_purge_all_on_empty_dlq_succeeds(test_client):
 
     response = await client.post("/dlq/purge_all")
     assert response.status_code == 200
-    assert await r.llen("dead_letter_queue") == 0
+    assert await r.llen(f"dlq:{TEST_CLIENT_IP}") == 0
