@@ -18,23 +18,23 @@ Any authenticated user with an API key should be able to:
 
 ## 🔴 Critical Bugs (Fix Before Adding Features)
 
-| # | Bug | File | Impact |
-|---|-----|------|--------|
-| 1 | **Redis key format is inconsistent** — keys are stored as `Task id{uuid}` (with a space, no separator). One typo anywhere = silent data loss with no error. | `worker.py:196`, `app.py:115` | Silent data loss on task lookup |
-| 2 | **`matrix_multiply` uses O(n³) pure Python loops** — At size 1000 (the new limit), this can run for several minutes and starve the entire CPU process pool for all other users. | `task_registery.py:9-18` | Full process pool starvation |
-| 3 | **`/task/schedule` has no backpressure check** — the 500-task queue cap can be bypassed by using the schedule endpoint instead of enqueue. | `app.py:92` | Queue cap bypass |
+| # | Bug | File | Impact | Status |
+|---|-----|------|--------|--------|
+| 1 | ~~**Redis key format is inconsistent**~~ | `worker.py`, `app.py` | ~~Silent data loss on task lookup~~ | ✅ Fixed — all paths use `task:{task_id}` |
+| 2 | **`matrix_multiply` uses O(n³) pure Python loops** — At size 1000 (the new limit), this can run for several minutes and starve the entire CPU process pool for all other users. | `task_registery.py:9-18` | Full process pool starvation | ✅ Fixed — uses `np.dot()` |
+| 3 | ~~**`/task/schedule` has no backpressure check**~~ | `app.py:132` | ~~Queue cap bypass~~ | ✅ Fixed — `check_backpressure` added |
 | 4 | **Frontend matrix validation has a typo** — checks `"matrix_multiplication"` but the actual task name is `"matrix_multiply"`. Frontend guard never fires. | `App.jsx:70` | Frontend limit is non-functional |
 | 5 | **`status_box` CSS class type is `"Error"` (capitalized)** — the component expects lowercase `"error"`. Red error styling never renders. | `App.jsx:71` | UI feedback broken |
-| 6 | **`ARCHITECTURE.md` documents stale API routes** — still shows `GET /task/mul?size=N` and Form Data routes that no longer exist. | `ARCHITECTURE.md:27` | Misleading documentation |
+| 6 | ~~**`ARCHITECTURE.md` documents stale API routes**~~ — still shows `GET /task/mul?size=N` and Form Data routes that no longer exist. | `ARCHITECTURE.md:27` | ~~Misleading documentation~~ | ✅ Fixed — docs updated |
 
 ---
 
 ## 🚀 Phase 1 — Foundation: Webhook Model (Multi-Tenant)
 *This is the current strategic priority. Do these in order.*
 
-- [ ] **API Key Authentication** — FastAPI `HTTPBearer` dependency, keys stored in a Redis Set (`api_keys`). All write endpoints protected.
-- [ ] **Admin Key Management Endpoints** — `POST /admin/keys/create` and `DELETE /admin/keys/revoke`, protected by a master key from `.env`.
-- [ ] **Per-Tenant Task Namespacing** — Decode the API key on every request and attach the owner identity to the task payload (`owner_id`). Ensures one tenant cannot see another's tasks.
+- [x] **API Key Authentication** — FastAPI `HTTPBearer` dependency, keys stored in a Redis Set (`api_keys`). All write endpoints protected.
+- [x] **Admin Key Management Endpoints** — `POST /admin/keys/create` and `DELETE /admin/keys/revoke`, protected by a master key from `.env`.
+- [x] **Per-Tenant Task Namespacing** — Decode the API key on every request and attach the owner identity to the task payload (`owner_id`). Ensures one tenant cannot see another's tasks.
 - [ ] **Webhook Registration Endpoint** — `POST /webhooks/register` — allows a tenant to register a persistent default webhook URL tied to their API key instead of passing it on every request.
 - [ ] **Formalize Webhook Delivery in Worker** — The `fire_webhook` call currently runs with no retry. Treat webhook delivery as its own retry-able operation. If the destination server is down, back off and retry 3 times before logging failure.
 - [ ] **Webhook Signature (HMAC-SHA256)** — Sign every outgoing webhook payload with a secret so the receiving server can verify the request genuinely came from PyTaskQ and not a spoofed attacker.
@@ -59,8 +59,8 @@ Any authenticated user with an API key should be able to:
 - [ ] **Task Timeout** — Kill any task running longer than a configurable N seconds. Prevents a single bad task from holding a worker slot forever.
 - [ ] **Richer `/metrics` Endpoint** — Add: tasks completed per minute (throughput), average execution time, worker count + IDs, error rate.
 - [ ] **Live Task Tracking in Dashboard** — After dispatch, automatically track the returned `task_id` in a "Recent Submissions" panel that polls its status live.
-- [ ] **Fix Redis Key Format** — Migrate to `task:{task_id}` everywhere. Update both `worker.py` and `app.py`.
-- [ ] **Replace matrix_multiply with NumPy** — Drop the O(n³) loops. Use `np.dot()`.
+- [x] **Fix Redis Key Format** — Migrated to `task:{task_id}` everywhere. Both `worker.py` and `app.py` updated.
+- [x] **Replace matrix_multiply with NumPy** — Uses `np.dot()` instead of O(n³) loops.
 
 ---
 

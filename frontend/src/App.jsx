@@ -5,6 +5,11 @@ import { Send, Search, AlertOctagon, Inbox, Activity, Clock, AlertTriangle, Chec
 const API_URL = import.meta.env.DEV ? 'http://localhost:8000' : '';
 
 function App() {
+  const [apiKey, setApiKey] = useState(sessionStorage.getItem('apiKey') || '');
+  const [isAuthed, setIsAuthed] = useState(false);
+  const [showKey, setShowKey] = useState(false);
+  const [authError, setAuthError] = useState(null);
+
   const [metrics, setMetrics] = useState({
     pending: 0, processing: 0, delayed: 0, dlq: 0, completed_total: 0, failed_total: 0
   });
@@ -32,10 +37,19 @@ function App() {
   useEffect(() => {
     const fetchMetrics = async () => {
       try {
-        const resMetrics = await fetch(`${API_URL}/metrics`);
+        if (!apiKey) { setIsAuthed(false); setAuthError(null); return; }
+        const headers = { 'Authorization': `Bearer ${apiKey}` };
+        const resMetrics = await fetch(`${API_URL}/metrics`, { headers });
+        if (resMetrics.status === 401) { 
+            setIsAuthed(false); 
+            setAuthError("Unauthorized: The API Key is invalid or has been revoked."); 
+            return; 
+        }
+        setIsAuthed(true);
+        setAuthError(null);
         setMetrics(await resMetrics.json());
         
-        const resDlq = await fetch(`${API_URL}/dlq`);
+        const resDlq = await fetch(`${API_URL}/dlq`, { headers });
         const dlqData = await resDlq.json();
         setDlqTasks(dlqData.tasks || []);
       } catch (error) {
@@ -46,7 +60,7 @@ function App() {
     fetchMetrics();
     const interval = setInterval(fetchMetrics, 750); // Increased from 2000ms to catch fast task completions
     return () => clearInterval(interval);
-  }, []);
+  }, [apiKey]);
 
   const handleEnqueue = async (e) => {
     e.preventDefault();
@@ -77,7 +91,7 @@ function App() {
     try {
       const response = await fetch(endpoint, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` },
         body: JSON.stringify({
           task_name: taskName,
           args: parsedArgs,
@@ -113,22 +127,69 @@ function App() {
 
   const handleReplay = async (taskId) => {
     try {
-      await fetch(`${API_URL}/dlq/replay/${taskId}`, { method: 'POST' });
+      await fetch(`${API_URL}/dlq/replay/${taskId}`, { method: 'POST', headers: { 'Authorization': `Bearer ${apiKey}` } });
     } catch (err) { console.error(err); }
   };
 
   const handlePurge = async (taskId) => {
     try {
-      await fetch(`${API_URL}/dlq/purge/${taskId}`, { method: 'POST' });
+      await fetch(`${API_URL}/dlq/purge/${taskId}`, { method: 'POST', headers: { 'Authorization': `Bearer ${apiKey}` } });
     } catch (err) { console.error(err); }
   };
+
+
+  if (!isAuthed) {
+    return (
+      <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', minHeight: '100vh', padding: '2rem' }}>
+        <div className="card" style={{ maxWidth: '500px', width: '100%', textAlign: 'center' }}>
+          <h2 style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '0.5rem' }}><AlertOctagon size={28} color="var(--accent-color)" /> Welcome to PyTaskQ</h2>
+          <p style={{ color: 'var(--text-secondary)', marginBottom: '2rem' }}>Enter your API Key to access your tenant dashboard.</p>
+          {authError && (
+            <div style={{ backgroundColor: 'var(--danger-color)', color: 'white', padding: '0.75rem', borderRadius: '6px', marginBottom: '1rem', fontSize: '0.875rem' }}>
+              <AlertTriangle size={16} style={{ verticalAlign: 'middle', marginRight: '0.5rem' }}/> 
+              {authError}
+            </div>
+          )}
+          <div style={{ display: 'flex', gap: '0.5rem', marginBottom: '1rem' }}>
+            <input 
+              type={showKey ? "text" : "password"} 
+              value={apiKey} 
+              onChange={(e) => {
+                const val = e.target.value.trim();
+                setApiKey(val);
+                sessionStorage.setItem('apiKey', val);
+                if(val) setAuthError(null); // clear error when they type
+              }} 
+              placeholder="Paste sk_... key here" 
+              style={{ flex: 1, padding: '0.75rem', borderRadius: '6px', border: '1px solid var(--border-color)', fontSize: '1rem', boxSizing: 'border-box' }}
+            />
+            <button 
+              onClick={() => setShowKey(!showKey)} 
+              className="btn btn-secondary" 
+              style={{ padding: '0 1rem' }}
+              title="Toggle visibility"
+            >
+              {showKey ? "Hide" : "Show"}
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div>
       <header className="header">
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+          <div>
         <h1>PyTaskQ Dashboard</h1>
         <p>Monitor your distributed worker queues and API health.</p>
+        </div>
+          <button onClick={() => { setApiKey(''); sessionStorage.removeItem('apiKey'); setIsAuthed(false); }} className="btn btn-secondary" style={{ padding: '0.5rem 1rem' }}>Logout</button>
+        </div>
       </header>
+
+
 
       {/* METRICS ROW */}
       <div className="metrics-grid">
@@ -270,7 +331,7 @@ function App() {
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1.5rem' }}>
               <h2 style={{ color: 'var(--danger-color)', margin: 0, display: 'flex', alignItems: 'center', gap: '0.5rem' }}><AlertOctagon size={24} /> Dead Letter Queue</h2>
               {dlqTasks.length > 0 && (
-                <button onClick={() => fetch(`${API_URL}/dlq/purge_all`, { method: 'POST' })} className="btn btn-danger" style={{ padding: '0.5rem 1rem', fontSize: '0.875rem' }}>
+                <button onClick={() => fetch(`${API_URL}/dlq/purge_all`, { method: 'POST', headers: { 'Authorization': `Bearer ${apiKey}` } })} className="btn btn-danger" style={{ padding: '0.5rem 1rem', fontSize: '0.875rem' }}>
                   Purge All
                 </button>
               )}

@@ -9,7 +9,8 @@ class Taskloader(BaseModel):
     retry_count:int = 0 
     task_type:str = "io"  # Legacy field — execution type is now looked up from the registry
     webhook_url: Optional[str] = None
-    client_ip: str = "unknown"
+    tenant_id: str = "unknown"  # Used for isolating stats, dlq, and rate limits
+    client_ip: str = "unknown"  # Kept for logging/debugging only
     
 # for VALIDATION of result of task 
 class Taskresult(BaseModel):

@@ -6,8 +6,9 @@ A Python async task queue built with FastAPI and Redis. Submit tasks via HTTP, w
 
 ## What it does
 
-- Accepts tasks over a REST API (email sending, matrix multiplication)
-- Workers pick up tasks from a Redis queue and execute them
+- Accepts tasks over a REST API (matrix multiplication, CSV report generation, image resizing, URL health checks)
+- Three-tier priority queue (`high`, `default`, `low`) with strict priority ordering
+- Workers pick up tasks from Redis and execute them
 - CPU-bound tasks run in a `ProcessPoolExecutor`, I/O-bound in a `ThreadPoolExecutor`
 - Failed tasks are retried up to 3 times with exponential backoff, then moved to a Dead Letter Queue
 - Tasks are not lost if a worker crashes — recovered automatically on restart
@@ -75,14 +76,16 @@ docker compose up
 
 | Method | Route | Description |
 |--------|-------|-------------|
-| `GET` | `/task/mul?size=50` | Queue a matrix multiply (CPU task) |
-| `POST` | `/task/send_email` | Queue an email (I/O task) |
+| `POST` | `/task/enqueue` | Enqueue a task (supports priority: high/default/low) |
+| `POST` | `/task/schedule` | Schedule a task with a delay |
 | `GET` | `/task/{task_id}` | Check task status / result |
 | `GET` | `/metrics` | Queue depth metrics |
 | `GET` | `/dlq` | View failed tasks |
 | `POST` | `/dlq/replay/{task_id}` | Re-queue a failed task |
 | `POST` | `/dlq/purge/{task_id}` | Delete a failed task |
 | `POST` | `/dlq/purge_all` | Clear the entire DLQ |
+
+**Available tasks**: `matrix_multiply`, `url_health_check`, `generate_csv_report`, `resize_image`
 
 Full API reference: [API.md](API.md)
 

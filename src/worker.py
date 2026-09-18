@@ -40,9 +40,9 @@ async def retry_scheduler():
             if removed:  
                 task_data = json.loads(task_json)
                 await r.lpush(f"queue:{task_data.get('priority', 'default')}", task_json)
-                client_ip = task_data.get('client_ip', 'unknown')
-                await r.decr(f"stats:delayed:{client_ip}")
-                await r.incr(f"stats:pending:{client_ip}")
+                tenant_id = task_data.get('tenant_id', 'unknown')
+                await r.decr(f"stats:delayed:{tenant_id}")
+                await r.incr(f"stats:pending:{tenant_id}")
                 logger.info(f"[Retry Scheduler] Re-queued task {task_data.get('task_id')} "
                       f"(retry #{task_data.get('retry_count')})")
         
@@ -67,9 +67,9 @@ async def zombie_sweeper():
                     if not result:
                         break  # No more tasks for this dead worker
                     task_data = json.loads(result)
-                    client_ip = task_data.get('client_ip', 'unknown')
-                    await r.incr(f"stats:pending:{client_ip}")
-                    await r.decr(f"stats:processing:{client_ip}")
+                    tenant_id = task_data.get('tenant_id', 'unknown')
+                    await r.incr(f"stats:pending:{tenant_id}")
+                    await r.decr(f"stats:processing:{tenant_id}")
                 # NOW remove the dead worker from the registry
                 await r.zrem("active_workers", worker_id)
                 logger.info(f"[Sweeper] Recovered tasks from dead worker: {worker_id}")
@@ -106,9 +106,9 @@ async def consumer_task():
                 if not leftover:
                     break
                 task_data = json.loads(leftover)
-                client_ip = task_data.get('client_ip', 'unknown')
-                await r.incr(f"stats:pending:{client_ip}")
-                await r.decr(f"stats:processing:{client_ip}")
+                tenant_id = task_data.get('tenant_id', 'unknown')
+                await r.incr(f"stats:pending:{tenant_id}")
+                await r.decr(f"stats:processing:{tenant_id}")
                 logger.info(f"Recovered crashed task on startup: {leftover}")
             break  # Recovery succeeded — exit the retry loop and continue
         except Exception as e:
@@ -178,8 +178,8 @@ async def handle_task(task_json, sem, loop, process_pool, thread_pool):
         try:
             tasks = Taskloader.model_validate_json(task_json)
             task_id = tasks.task_id
-            client_ip = getattr(tasks, 'client_ip', 'unknown')
-            await r.decr(f"stats:pending:{client_ip}")
+            tenant_id = getattr(tasks, 'tenant_id', 'unknown')
+            await r.decr(f"stats:pending:{tenant_id}")
 
         except Exception as e:
             logger.error(f"Error occurred while validating task JSON: {e}")
@@ -201,7 +201,7 @@ async def handle_task(task_json, sem, loop, process_pool, thread_pool):
             task_type = entry["type"]
             
             logger.info(f"Executing task {task_id} ({tasks.task_name})")
-            await r.incr(f"stats:processing:{client_ip}")  # Atomic counter: task is now actively executing
+            await r.incr(f"stats:processing:{tenant_id}")  # Atomic counter: task is now actively executing
             incr_done = True  # Mark that we INCRed so finally block will DECR
 
             if task_type == "cpu":
@@ -217,7 +217,7 @@ async def handle_task(task_json, sem, loop, process_pool, thread_pool):
             task_result = Taskresult(task_id=task_id, status="Success", result=str(result))
             await r.hset(f"task:{task_id}", mapping=task_result.model_dump())
             await r.expire(f"task:{task_id}", 86400)
-            await r.incr(f"stats:completed:{client_ip}")  # Cumulative: total tasks ever completed
+            await r.incr(f"stats:completed:{tenant_id}")  # Cumulative: total tasks ever completed
             logger.info(f"Task {task_id} completed successfully.")
             
             # --- WEBHOOK FEATURE ---
@@ -228,11 +228,11 @@ async def handle_task(task_json, sem, loop, process_pool, thread_pool):
             
         except Exception as e:
             logger.error(f"Error occurred while executing task: {e}")
-            await r.incr(f"stats:failed:{client_ip}")   # Cumulative: total tasks ever failed/retried
+            await r.incr(f"stats:failed:{tenant_id}")   # Cumulative: total tasks ever failed/retried
             if getattr(tasks, 'retry_count', 0) >= 3:
                logger.error(f"[DLQ] Task {task_id} failed after 3 retries. Moving to dead-letter queue.")
-               await r.lpush(f"dlq:{client_ip}", task_json)
-               await r.incr(f"stats:dlq:{client_ip}")
+               await r.lpush(f"dlq:{tenant_id}", task_json)
+               await r.incr(f"stats:dlq:{tenant_id}")
                await r.hset(f"task:{task_id}", mapping={
                     "task_id": task_id,
                     "status": "DeadLetter",
@@ -242,7 +242,7 @@ async def handle_task(task_json, sem, loop, process_pool, thread_pool):
                 tasks.retry_count += 1
                 delay = 2 ** tasks.retry_count  # Exponential backoff
                 await r.zadd("delayed_tasks", {json.dumps(tasks.model_dump()): time.time() + delay})
-                await r.incr(f"stats:delayed:{client_ip}")
+                await r.incr(f"stats:delayed:{tenant_id}")
                 logger.warning(f"[Retry] Task {task_id} failed. Scheduled for retry #{tasks.retry_count} after {delay} seconds.")
                 await r.hset(f"task:{task_id}", mapping={
                     "task_id": task_id,
@@ -254,7 +254,7 @@ async def handle_task(task_json, sem, loop, process_pool, thread_pool):
     finally:
         await r.lrem(f"processing_queue:{WORKER_ID}", count=1, value=task_json)
         if incr_done:  # Only DECR if we actually INCRed — prevents counter going negative
-            await r.decr(f"stats:processing:{client_ip}")
+            await r.decr(f"stats:processing:{tenant_id}")
         sem.release()
 
 #Start the event loop
