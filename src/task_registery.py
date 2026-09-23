@@ -7,7 +7,11 @@ import csv
 import random
 import io
 import time
-import urllib
+import urllib.request
+import hashlib
+import hmac
+import json
+import urllib.error
 from PIL import Image
 from dotenv import load_dotenv
 
@@ -122,6 +126,24 @@ def url_health_check(url):
     
     
 
+
+def _deliver_webhook(url: str, payload: dict, secret: str):
+    payload_bytes = json.dumps(payload).encode('utf-8')
+    signature = hmac.new(secret.encode('utf-8'), payload_bytes, hashlib.sha256).hexdigest()
+    
+    req = urllib.request.Request(url, method="POST")
+    req.add_header('Content-Type', 'application/json')
+    req.add_header('X-PyTaskQ-Signature', f"sha256={signature}")
+    req.add_header('User-Agent', 'PyTaskQ-Webhook/1.0')
+    
+    try:
+        with urllib.request.urlopen(req, data=payload_bytes, timeout=10) as response:
+            return {"status": "delivered", "code": response.status}
+    except urllib.error.HTTPError as e:
+        raise Exception(f"Webhook delivery failed with HTTP {e.code}")
+    except Exception as e:
+        raise Exception(f"Webhook delivery failed: {e}")
+
 TASKS = {
     # Dynamic dispatch to handle multiple tasks
     # Each entry defines the handler function AND its execution type.
@@ -130,5 +152,6 @@ TASKS = {
     "matrix_multiply": {"handler": matrix_multiply, "type": "cpu"},
     "url_health_check":{"handler":url_health_check,"type":"io"},
     "generate_csv_report":{"handler":generate_csv_report , "type":"cpu"},
-    "resize_image": {"handler": resize_image, "type": "cpu"}
+    "resize_image": {"handler": resize_image, "type": "cpu"},
+    "_deliver_webhook": {"handler": _deliver_webhook, "type": "io"}
 }

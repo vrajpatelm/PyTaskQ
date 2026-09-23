@@ -22,4 +22,6 @@ class TaskRequest(BaseModel):
     task_name:str
     args: List[Any]=[]
     priority:Literal["high","default","low"]="default"
-    webhook_url: Optional[str] = None
+
+class WebhookRegistrationRequest(BaseModel):
+    url: str

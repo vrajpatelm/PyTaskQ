@@ -1,7 +1,7 @@
 from fastapi import Depends, Security
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
-from src.Schema import TaskRequest
+from src.Schema import TaskRequest, WebhookRegistrationRequest
 from fastapi import FastAPI, Request, Form, HTTPException
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -222,6 +222,13 @@ async def list_api_keys():
         result.append({"api_key": k, **data})
     return {"api_keys": result}
 
+
+@app.post("/webhooks/register", tags=["webhooks"])
+async def register_webhook(req: WebhookRegistrationRequest, tenant_id: str = Depends(authenticate)):
+    secret = secrets.token_hex(32)
+    await r.hset(f"webhook:{tenant_id}", mapping={"url": req.url, "secret": secret})
+    return {"status": "registered", "url": req.url, "secret": secret}
+
 @app.get("/health", tags=["ops"])
 async def health_check():
     """Used by Docker health checks and load balancers to verify the service is alive."""
@@ -238,6 +245,10 @@ def homepage():
 
 @app.post("/task/enqueue",dependencies=[Depends(check_backpressure)])
 async def enqueue_task(request:TaskRequest, req: Request, tenant_id: str = Depends(rate_limiter)):
+    body_json = await req.json()
+    if "webhook_url" in body_json:
+        raise HTTPException(status_code=400, detail="You cannot pass webhook_url on the fly. Please register it via /webhooks/register.")
+        
     if request.task_name not in TASKS:
         raise HTTPException(status_code=400,
                             detail=f"Unknown Task {request.task_name}, Available Task: {list(TASKS.keys())}"
@@ -257,7 +268,7 @@ async def enqueue_task(request:TaskRequest, req: Request, tenant_id: str = Depen
         "args":request.args,
         "task_id": task_id,
         "retry_count":0,
-        "webhook_url": request.webhook_url,
+        "webhook_url": await r.hget(f"webhook:{tenant_id}", "url"),
         "priority":request.priority,
         "tenant_id": tenant_id,
         "client_ip": client_ip
@@ -272,6 +283,10 @@ async def enqueue_task(request:TaskRequest, req: Request, tenant_id: str = Depen
 
 @app.post("/task/schedule",dependencies=[Depends(check_backpressure)])
 async def schedule_task(request: TaskRequest, req: Request, delay_seconds: int = 60, tenant_id: str = Depends(rate_limiter)):
+    body_json = await req.json()
+    if "webhook_url" in body_json:
+        raise HTTPException(status_code=400, detail="You cannot pass webhook_url on the fly. Please register it via /webhooks/register.")
+
     if request.task_name not in TASKS:
         raise HTTPException(status_code=400, detail="Unknown Task")
         
@@ -290,7 +305,7 @@ async def schedule_task(request: TaskRequest, req: Request, delay_seconds: int =
         "args": request.args,
         "task_id": task_id,
         "retry_count": 0,
-        "webhook_url": request.webhook_url,
+        "webhook_url": await r.hget(f"webhook:{tenant_id}", "url"),
         "priority":request.priority,
         "tenant_id": tenant_id,
         "client_ip": client_ip,
@@ -313,7 +328,7 @@ async def task_result_disaplay(task_id:str):
 
 
 @app.get("/metrics")
-async def metrics(tenant_id: str = Depends(authenticate)):
+async def metrics(req: Request, tenant_id: str = Depends(authenticate)):
     pending = int(await r.get(f"stats:pending:{tenant_id}") or 0)
     processing_raw = await r.get(f"stats:processing:{tenant_id}")
     processing = max(0, int(processing_raw or 0))
@@ -324,6 +339,16 @@ async def metrics(tenant_id: str = Depends(authenticate)):
     completed = int(await r.get(f"stats:completed:{tenant_id}") or 0)
     failed = int(await r.get(f"stats:failed:{tenant_id}") or 0)
 
+    # Queue depth per priority
+    queue_high = await r.llen("queue:high")
+    queue_default = await r.llen("queue:default")
+    queue_low = await r.llen("queue:low")
+    total_queue = queue_high + queue_default + queue_low
+
+    # Rate limit usage for this tenant in the current minute
+    current_minute = int(time.time() / 60)
+    rate_used = int(await r.get(f"rate_limit:{tenant_id}:{current_minute}") or 0)
+
     return {
         "pending": pending,
         "processing": processing,
@@ -331,8 +356,22 @@ async def metrics(tenant_id: str = Depends(authenticate)):
         "dlq": dlq,
         "completed_total": completed,
         "failed_total": failed,
+        "queue_high": queue_high,
+        "queue_default": queue_default,
+        "queue_low": queue_low,
+        "queue_total": total_queue,
+        "queue_capacity": QUEUE_CAPACITY,
+        "rate_limit_used": rate_used,
+        "rate_limit_max": 100,
     }
 
+
+@app.get("/webhooks/info", tags=["webhooks"])
+async def webhook_info(tenant_id: str = Depends(authenticate)):
+    data = await r.hgetall(f"webhook:{tenant_id}")
+    if not data:
+        return {"registered": False}
+    return {"registered": True, "url": data.get("url"), "secret": data.get("secret")}
 
 @app.get("/dlq")
 async def get_dlq(tenant_id: str = Depends(authenticate)):

@@ -160,17 +160,7 @@ async def consumer_task():
     process_pool.shutdown(wait=True)
     await r.aclose()
 
-# Helper function to send webhook in a thread to not block the event loop
-def fire_webhook(url, result_payload):
-    try:
-        req = urllib.request.Request(url, method="POST")
-        req.add_header('Content-Type', 'application/json')
-        data = json.dumps(result_payload).encode('utf-8')
-        with urllib.request.urlopen(req, data=data, timeout=5) as response:
-            logger.info(f"[Webhook] Sent result to {url} (Status: {response.status})")
-    except Exception as e:
-        logger.error(f"[Webhook] Failed to send to {url}: {e}")
-        
+
 async def handle_task(task_json, sem, loop, process_pool, thread_pool):
     incr_done = False  # Guard: only DECR stats:processing if we actually INCRed it
     try:  # <--- Outer try block starts here
@@ -221,10 +211,27 @@ async def handle_task(task_json, sem, loop, process_pool, thread_pool):
             logger.info(f"Task {task_id} completed successfully.")
             
             # --- WEBHOOK FEATURE ---
-            if getattr(tasks, 'webhook_url', None):
+            if getattr(tasks, 'webhook_url', None) and tasks.task_name != "_deliver_webhook":
                 payload = {"task_id": task_id, "status": "Success", "result": str(result)}
-                # Run webhook request in thread pool so it doesn't block async loop
-                loop.run_in_executor(thread_pool, fire_webhook, tasks.webhook_url, payload)
+                webhook_secret = await r.hget(f"webhook:{tenant_id}", "secret")
+                
+                if webhook_secret:
+                    webhook_task_id = str(uuid.uuid4())
+                    webhook_task_json = json.dumps({
+                        "task_name": "_deliver_webhook",
+                        "args": [tasks.webhook_url, payload, webhook_secret],
+                        "task_id": webhook_task_id,
+                        "retry_count": 0,
+                        "webhook_url": None, # don't webhook a webhook!
+                        "priority": "high",
+                        "tenant_id": tenant_id,
+                        "client_ip": getattr(tasks, 'client_ip', 'unknown')
+                    })
+                    await r.lpush("queue:high", webhook_task_json)
+                    await r.incr(f"stats:pending:{tenant_id}")
+                    logger.info(f"Enqueued _deliver_webhook task {webhook_task_id} for original task {task_id}")
+                else:
+                    logger.warning(f"Task {task_id} has webhook_url but no secret found for tenant {tenant_id}")
             
         except Exception as e:
             logger.error(f"Error occurred while executing task: {e}")
