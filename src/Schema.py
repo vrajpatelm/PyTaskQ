@@ -25,6 +25,8 @@ class TaskRequest(BaseModel):
     task_name:str
     args: List[Any]=[]
     priority:Literal["high","default","low"]="default"
+    webhook_url: Optional[str] = None      # Rejected at API level — must use /webhooks/register
+    idempotency_key: Optional[str] = None  # Client-supplied dedup key (alternative to header)
 
 class WebhookRegistrationRequest(BaseModel):
     url: str
