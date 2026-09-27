@@ -176,7 +176,8 @@ async def check_idempotency(req: Request, body: TaskRequest, tenant_id: str) -> 
         HTTPException(409) — if duplicate detected (Layer 2, or Layer 1 in-flight)
     """
     # ── Layer 1: Explicit Idempotency Key ─────────────────────────────────
-    idempotency_key = req.headers.get("idempotency-key")
+    # Accept key from HTTP header OR from the JSON body field (body.idempotency_key)
+    idempotency_key = req.headers.get("idempotency-key") or body.idempotency_key
     if idempotency_key:
         redis_key = f"idempotency:{tenant_id}:{idempotency_key}"
         claimed = await r.set(redis_key, "pending", nx=True, ex=IDEMPOTENCY_TTL)
