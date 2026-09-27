@@ -220,8 +220,7 @@ async def store_idempotency_response(req: Request, response_data: dict, tenant_i
 
 @app.post("/task/enqueue", dependencies=[Depends(check_backpressure)])
 async def enqueue_task(request: TaskRequest, req: Request, tenant_id: str = Depends(rate_limiter)):
-    body_json = await req.json()
-    if "webhook_url" in body_json:
+    if request.webhook_url is not None:
         raise HTTPException(
             status_code=400,
             detail="You cannot pass webhook_url on the fly. Please register it via /webhooks/register.",
@@ -290,8 +289,7 @@ async def schedule_task(
     delay_seconds: int = 60,
     tenant_id: str = Depends(rate_limiter),
 ):
-    body_json = await req.json()
-    if "webhook_url" in body_json:
+    if request.webhook_url is not None:
         raise HTTPException(
             status_code=400,
             detail="You cannot pass webhook_url on the fly. Please register it via /webhooks/register.",
