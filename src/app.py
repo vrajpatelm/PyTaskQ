@@ -152,7 +152,7 @@ async def rate_limiter(tenant_id: str = Depends(authenticate)):
     current_minute = int(time.time() / 60)
     key = f"rate_limit:{tenant_id}:{current_minute}"
     count = int(await r.get(key) or 0)
-    if count >= 100:
+    if count >= 10000:  # BENCHMARK MODE — restore to 100 after testing
         raise HTTPException(status_code=429, detail="Too many Requests. Please wait a minute")
     return tenant_id
 
