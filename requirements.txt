@@ -80,3 +80,4 @@ yagmail==0.15.293
 opentelemetry-api
 opentelemetry-sdk
 opentelemetry-exporter-otlp
+Pillow==10.0.1

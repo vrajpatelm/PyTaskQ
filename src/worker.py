@@ -299,44 +299,44 @@ async def handle_task(task_json, sem, loop, process_pool, thread_pool):
                             logger.warning(f"Task {task_id} has webhook_url but no secret found for tenant {tenant_id}")
                 
             except Exception as e:
-            logger.error(f"Error occurred while executing task: {e}")
-            # Record the error on the OTel span so it shows as a red error in Jaeger
-            span.set_status(trace.StatusCode.ERROR, str(e))
-            span.record_exception(e)
-            await r.incr(f"stats:failed:{tenant_id}")   # Cumulative: total tasks ever failed/retried
-            if getattr(tasks, 'retry_count', 0) >= 3:
-               logger.error(f"[DLQ] Task {task_id} failed after 3 retries. Moving to dead-letter queue.")
-               span.set_attribute("task.status", "DeadLetter")
-               await r.lpush(f"dlq:{tenant_id}", task_json)
-               await r.incr(f"stats:dlq:{tenant_id}")
-               await r.hset(f"task:{task_id}", mapping={
-                    "task_id": task_id,
-                    "status": "DeadLetter",
-                    "error": f"Failed after 3 retries.Last error: {str(e)} "}
-                )
-            else:
-                tasks.retry_count += 1
+                logger.error(f"Error occurred while executing task: {e}")
+                # Record the error on the OTel span so it shows as a red error in Jaeger
+                span.set_status(trace.StatusCode.ERROR, str(e))
+                span.record_exception(e)
+                await r.incr(f"stats:failed:{tenant_id}")   # Cumulative: total tasks ever failed/retried
+                if getattr(tasks, 'retry_count', 0) >= 3:
+                   logger.error(f"[DLQ] Task {task_id} failed after 3 retries. Moving to dead-letter queue.")
+                   span.set_attribute("task.status", "DeadLetter")
+                   await r.lpush(f"dlq:{tenant_id}", task_json)
+                   await r.incr(f"stats:dlq:{tenant_id}")
+                   await r.hset(f"task:{task_id}", mapping={
+                        "task_id": task_id,
+                        "status": "DeadLetter",
+                        "error": f"Failed after 3 retries.Last error: {str(e)} "}
+                    )
+                else:
+                    tasks.retry_count += 1
 
-                # ── Decorrelated Jitter (AWS recommended) ───────────────────
-                BASE      = 1.0
-                MAX_DELAY = 30.0
-                prev      = getattr(tasks, 'prev_delay', BASE)
-                delay     = min(MAX_DELAY, random.uniform(BASE, prev * 3))
-                tasks.prev_delay = delay   # save so NEXT retry can use it
+                    # ── Decorrelated Jitter (AWS recommended) ───────────────────
+                    BASE      = 1.0
+                    MAX_DELAY = 30.0
+                    prev      = getattr(tasks, 'prev_delay', BASE)
+                    delay     = min(MAX_DELAY, random.uniform(BASE, prev * 3))
+                    tasks.prev_delay = delay   # save so NEXT retry can use it
 
-                await r.zadd("delayed_tasks", {json.dumps(tasks.model_dump()): time.time() + delay})
-                await r.incr(f"stats:delayed:{tenant_id}")
-                logger.warning(
-                    f"[Retry] Task {task_id} failed. "
-                    f"Retry #{tasks.retry_count} in {delay:.2f}s "
-                    f"(decorrelated jitter, prev={prev:.2f}s)"
-                )
-                await r.hset(f"task:{task_id}", mapping={
-                    "task_id": task_id,
-                    "status": "RetryScheduled",
-                    "retry_count": tasks.retry_count,
-                    "error": f"Error: {str(e)}. Scheduled for retry in {delay:.2f} seconds."
-                })
+                    await r.zadd("delayed_tasks", {json.dumps(tasks.model_dump()): time.time() + delay})
+                    await r.incr(f"stats:delayed:{tenant_id}")
+                    logger.warning(
+                        f"[Retry] Task {task_id} failed. "
+                        f"Retry #{tasks.retry_count} in {delay:.2f}s "
+                        f"(decorrelated jitter, prev={prev:.2f}s)"
+                    )
+                    await r.hset(f"task:{task_id}", mapping={
+                        "task_id": task_id,
+                        "status": "RetryScheduled",
+                        "retry_count": tasks.retry_count,
+                        "error": f"Error: {str(e)}. Scheduled for retry in {delay:.2f} seconds."
+                    })
             
     finally:
         await r.lrem(f"processing_queue:{WORKER_ID}", count=1, value=task_json)
