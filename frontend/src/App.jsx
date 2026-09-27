@@ -78,7 +78,7 @@ function App() {
 
     const WS_URL = import.meta.env.DEV
       ? `ws://localhost:8000/ws/dashboard?key=${apiKey}`
-      : `wss://${window.location.host}/ws/dashboard?key=${apiKey}`;
+      : `${window.location.protocol === 'https:' ? 'wss:' : 'ws:'}//${window.location.host}/ws/dashboard?key=${apiKey}`;
 
     let ws;
     let reconnectTimer;
