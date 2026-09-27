@@ -69,42 +69,86 @@ function App() {
   const [lookupResult, setLookupResult] = useState(null);
   const [dlqTasks, setDlqTasks] = useState([]);
 
+  // ── WebSocket: real-time dashboard ──────────────────────────────────────
+  // Instead of polling every 1s (3 HTTP requests/tick), we open ONE persistent
+  // WebSocket connection. The server pushes metrics + DLQ + task statuses every
+  // second. The client sends back the list of task IDs it wants tracked.
   useEffect(() => {
-    const fetchAll = async () => {
-      try {
-        if (!apiKey) { setIsAuthed(false); setAuthError(null); return; }
-        const headers = { 'Authorization': `Bearer ${apiKey}` };
-        const resMetrics = await fetch(`${API_URL}/metrics`, { headers });
-        if (resMetrics.status === 401) {
-          setIsAuthed(false);
-          setAuthError("Unauthorized: The API Key is invalid or has been revoked.");
-          return;
-        }
+    if (!apiKey) { setIsAuthed(false); setAuthError(null); return; }
+
+    const WS_URL = import.meta.env.DEV
+      ? `ws://localhost:8000/ws/dashboard?key=${apiKey}`
+      : `wss://${window.location.host}/ws/dashboard?key=${apiKey}`;
+
+    let ws;
+    let reconnectTimer;
+    let alive = true; // set to false on cleanup to stop reconnecting
+
+    const connect = () => {
+      ws = new WebSocket(WS_URL);
+
+      ws.onopen = () => {
         setIsAuthed(true);
         setAuthError(null);
-        setMetrics(await resMetrics.json());
-        const resDlq = await fetch(`${API_URL}/dlq`, { headers });
-        setDlqTasks((await resDlq.json()).tasks || []);
-        const current = recentTasksRef.current;
-        if (current.length > 0) {
-          const updated = await Promise.all(
-            current.map(async (t) => {
-              if (['Success', 'Failed', 'DeadLetter'].includes(t.status)) return t;
-              try {
-                const res = await fetch(`${API_URL}/task/${t.task_id}`);
-                const data = await res.json();
-                return { ...t, status: data.result?.status || t.status };
-              } catch { return t; }
-            })
-          );
-          setRecentTasks(updated);
+        // Tell the server which task IDs we want status updates for
+        const ids = recentTasksRef.current
+          .filter(t => !['Success', 'Failed', 'DeadLetter'].includes(t.status))
+          .map(t => t.task_id);
+        if (ids.length > 0) ws.send(JSON.stringify({ track: ids }));
+      };
+
+      ws.onmessage = (event) => {
+        const data = JSON.parse(event.data);
+
+        // Update metrics
+        if (data.metrics) setMetrics(data.metrics);
+
+        // Update DLQ list
+        if (data.dlq) setDlqTasks(data.dlq);
+
+        // Update recent task statuses from server-pushed map
+        if (data.task_statuses && Object.keys(data.task_statuses).length > 0) {
+          setRecentTasks(prev => prev.map(t => ({
+            ...t,
+            status: data.task_statuses[t.task_id] || t.status,
+          })));
         }
-      } catch (err) { console.error("Fetch error:", err); }
+
+        // Keep server informed of which tasks to track
+        const pending = recentTasksRef.current
+          .filter(t => !['Success', 'Failed', 'DeadLetter'].includes(t.status))
+          .map(t => t.task_id);
+        if (ws.readyState === WebSocket.OPEN && pending.length > 0) {
+          ws.send(JSON.stringify({ track: pending }));
+        }
+      };
+
+      ws.onerror = () => {
+        setIsAuthed(false);
+        setAuthError('WebSocket error — check your API key or server connection.');
+      };
+
+      ws.onclose = (e) => {
+        if (e.code === 4001) {
+          // Server rejected the key — don't reconnect
+          setIsAuthed(false);
+          setAuthError('Unauthorized: The API Key is invalid or has been revoked.');
+          return;
+        }
+        // Any other close (network drop, server restart) → reconnect after 3s
+        if (alive) reconnectTimer = setTimeout(connect, 3000);
+      };
     };
-    fetchAll();
-    const interval = setInterval(fetchAll, 1000);
-    return () => clearInterval(interval);
+
+    connect();
+
+    return () => {
+      alive = false;
+      clearTimeout(reconnectTimer);
+      if (ws) ws.close();
+    };
   }, [apiKey]);
+
 
   useEffect(() => {
     if (!isAuthed) return;

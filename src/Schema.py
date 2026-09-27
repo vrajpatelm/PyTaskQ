@@ -11,6 +11,9 @@ class Taskloader(BaseModel):
     webhook_url: Optional[str] = None
     tenant_id: str = "unknown"  # Used for isolating stats, dlq, and rate limits
     client_ip: str = "unknown"  # Kept for logging/debugging only
+    fence_token:int=0
+    prev_delay: float = 1.0   # Decorrelated jitter: stores the last actual delay used for THIS task
+    trace_carrier: dict = {}  # OpenTelemetry W3C traceparent — carries trace context across Redis queue
     
 # for VALIDATION of result of task 
 class Taskresult(BaseModel):

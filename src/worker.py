@@ -11,6 +11,9 @@ import signal
 import os
 import urllib.request
 import logging
+import random
+from opentelemetry import trace
+from src.tracing import init_tracer, extract_trace_context, inject_trace_context
 
 # Configure structured logging
 logging.basicConfig(
@@ -27,6 +30,24 @@ WORKER_ID=str(uuid.uuid4())
 r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
 shutdown_event = asyncio.Event()
 active_tasks = set()
+
+# ── OpenTelemetry: Initialize tracer for worker spans ────────────────────────
+# Shows up as "pytaskq-worker" in Jaeger, separate from "pytaskq-api".
+tracer = init_tracer("pytaskq-worker")
+
+#Fencing Token 
+# It checks if this worker's fence token is still the valid one before saving.
+# If another worker has since claimed the task, we discard our stale result.
+FENCE_SCRIPT = """
+local current = redis.call('get', KEYS[1])
+if current == false or current == ARGV[1] then
+    redis.call('hset', KEYS[2], 'task_id', ARGV[2], 'status', ARGV[3], 'result', ARGV[4])
+    redis.call('expire', KEYS[2], 86400)
+    return 1
+else
+    return 0
+end
+"""
 
 #Background scheduler that moves delayed tasks back into task_queue 
 # when their time comes
@@ -63,10 +84,15 @@ async def zombie_sweeper():
             expired = await r.zrangebyscore("active_workers", "-inf", time.time())
             for worker_id in expired:
                 while True:
-                    result = await r.rpoplpush(f"processing_queue:{worker_id}", f"queue:high")
-                    if not result:
+                    task = await r.rpop(f"processing_queue:{worker_id}")
+                    if not task:
                         break  # No more tasks for this dead worker
-                    task_data = json.loads(result)
+                    task_data = json.loads(task)
+                    task_data["fence_token"] += 1
+                    task_id = task_data.get("task_id")
+                    # Part B: write the NEW token to Redis so old workers know they are stale
+                    await r.set(f"fence:{task_id}", task_data["fence_token"], ex=86400)
+                    await r.lpush("queue:high", json.dumps(task_data))
                     tenant_id = task_data.get('tenant_id', 'unknown')
                     await r.incr(f"stats:pending:{tenant_id}")
                     await r.decr(f"stats:processing:{tenant_id}")
@@ -159,6 +185,12 @@ async def consumer_task():
     thread_pool.shutdown(wait=True)
     process_pool.shutdown(wait=True)
     await r.aclose()
+    
+    # ── OpenTelemetry: Flush remaining spans before exiting ────────────
+    # Ensures no traces are lost if the worker is killed/restarted.
+    provider = trace.get_tracer_provider()
+    if hasattr(provider, "force_flush"):
+        provider.force_flush()
 
 
 async def handle_task(task_json, sem, loop, process_pool, thread_pool):
@@ -168,6 +200,7 @@ async def handle_task(task_json, sem, loop, process_pool, thread_pool):
         try:
             tasks = Taskloader.model_validate_json(task_json)
             task_id = tasks.task_id
+            my_token = tasks.fence_token  # remember the token we were given
             tenant_id = getattr(tasks, 'tenant_id', 'unknown')
             await r.decr(f"stats:pending:{tenant_id}")
 
@@ -182,62 +215,98 @@ async def handle_task(task_json, sem, loop, process_pool, thread_pool):
             return  
 
         # 2. Execution
-        # NOTE: TASKS lookup is INSIDE the try block.
-        # If task_name is unknown, KeyError is caught here
-        # and goes through the normal retry → DLQ pipeline.
-        try:
-            entry = TASKS[tasks.task_name]   # KeyError caught below if unknown
-            func = entry["handler"]
-            task_type = entry["type"]
-            
-            logger.info(f"Executing task {task_id} ({tasks.task_name})")
-            await r.incr(f"stats:processing:{tenant_id}")  # Atomic counter: task is now actively executing
-            incr_done = True  # Mark that we INCRed so finally block will DECR
+        # ── OpenTelemetry: Extract parent trace from task payload ─────
+        parent_ctx = extract_trace_context(getattr(tasks, 'trace_carrier', {}))
+        with tracer.start_as_current_span(
+            "execute_task",
+            context=parent_ctx,
+            attributes={
+                "task.id": task_id,
+                "task.name": tasks.task_name,
+                "task.retry_count": tasks.retry_count,
+                "worker.id": WORKER_ID,
+                "tenant.id": tenant_id,
+            },
+        ) as span:
+            try:
+                entry = TASKS[tasks.task_name]   # KeyError caught below if unknown
+                func = entry["handler"]
+                task_type = entry["type"]
+                
+                logger.info(f"Executing task {task_id} ({tasks.task_name})")
+                await r.incr(f"stats:processing:{tenant_id}")  # Atomic counter: task is now actively executing
+                incr_done = True  # Mark that we INCRed so finally block will DECR
 
-            if task_type == "cpu":
-                # Run in a process to use another CPU core without GIL blocking
-                result = await loop.run_in_executor(process_pool, func, *tasks.args)
-            else:
-                # Run in a thread for low-overhead I/O tasks
-                result = await loop.run_in_executor(thread_pool, func, *tasks.args)
+                if task_type == "cpu":
+                    # Run in a process to use another CPU core without GIL blocking
+                    result = await loop.run_in_executor(process_pool, func, *tasks.args)
+                else:
+                    # Run in a thread for low-overhead I/O tasks
+                    result = await loop.run_in_executor(thread_pool, func, *tasks.args)
 
                 
-            # Save Success result to Redis
-            task_id = tasks.task_id
-            task_result = Taskresult(task_id=task_id, status="Success", result=str(result))
-            await r.hset(f"task:{task_id}", mapping=task_result.model_dump())
-            await r.expire(f"task:{task_id}", 86400)
-            await r.incr(f"stats:completed:{tenant_id}")  # Cumulative: total tasks ever completed
-            logger.info(f"Task {task_id} completed successfully.")
+            # Save Success result to Redis — atomically via Lua fencing check
+                saved = await r.eval(
+                    FENCE_SCRIPT,
+                    2,                        # number of KEYS passed
+                    f"fence:{task_id}",       # KEYS[1] — the token we check against
+                    f"task:{task_id}",        # KEYS[2] — the hash we write result into
+                    str(my_token),            # ARGV[1] — our claimed token
+                    task_id,                  # ARGV[2] — hset field: task_id
+                    "Success",               # ARGV[3] — hset field: status
+                    str(result)              # ARGV[4] — hset field: result
+                )
+                if saved:
+                    await r.expire(f"task:{task_id}", 86400)
+                    await r.incr(f"stats:completed:{tenant_id}")
+                    span.set_attribute("task.status", "Success")
+                    logger.info(f"Task {task_id} completed and saved ✅")
+                else:
+                    span.set_attribute("task.status", "Discarded")
+                    span.set_attribute("task.discard_reason", "fence_token_stale")
+                    logger.warning(
+                        f"Task {task_id} result DISCARDED — fence token stale "
+                        f"(my_token={my_token}). Task was re-assigned to another worker."
+                    )
             
             # --- WEBHOOK FEATURE ---
-            if getattr(tasks, 'webhook_url', None) and tasks.task_name != "_deliver_webhook":
-                payload = {"task_id": task_id, "status": "Success", "result": str(result)}
-                webhook_secret = await r.hget(f"webhook:{tenant_id}", "secret")
+            # Only fire webhook if our result was actually saved (not discarded by fencing check)
+                if saved and getattr(tasks, 'webhook_url', None) and tasks.task_name != "_deliver_webhook":
+                    with tracer.start_as_current_span(
+                        "enqueue_webhook_delivery",
+                        attributes={"task.id": task_id, "webhook.url": tasks.webhook_url},
+                    ):
+                        payload = {"task_id": task_id, "status": "Success", "result": str(result)}
+                        webhook_secret = await r.hget(f"webhook:{tenant_id}", "secret")
+                        
+                        if webhook_secret:
+                            webhook_task_id = str(uuid.uuid4())
+                            webhook_task_json = json.dumps({
+                                "task_name": "_deliver_webhook",
+                                "args": [tasks.webhook_url, payload, webhook_secret],
+                                "task_id": webhook_task_id,
+                                "retry_count": 0,
+                                "webhook_url": None, # don't webhook a webhook!
+                                "priority": "high",
+                                "tenant_id": tenant_id,
+                                "client_ip": getattr(tasks, 'client_ip', 'unknown'),
+                                "trace_carrier": inject_trace_context(),
+                            })
+                            await r.lpush("queue:high", webhook_task_json)
+                            await r.incr(f"stats:pending:{tenant_id}")
+                            logger.info(f"Enqueued _deliver_webhook task {webhook_task_id} for original task {task_id}")
+                        else:
+                            logger.warning(f"Task {task_id} has webhook_url but no secret found for tenant {tenant_id}")
                 
-                if webhook_secret:
-                    webhook_task_id = str(uuid.uuid4())
-                    webhook_task_json = json.dumps({
-                        "task_name": "_deliver_webhook",
-                        "args": [tasks.webhook_url, payload, webhook_secret],
-                        "task_id": webhook_task_id,
-                        "retry_count": 0,
-                        "webhook_url": None, # don't webhook a webhook!
-                        "priority": "high",
-                        "tenant_id": tenant_id,
-                        "client_ip": getattr(tasks, 'client_ip', 'unknown')
-                    })
-                    await r.lpush("queue:high", webhook_task_json)
-                    await r.incr(f"stats:pending:{tenant_id}")
-                    logger.info(f"Enqueued _deliver_webhook task {webhook_task_id} for original task {task_id}")
-                else:
-                    logger.warning(f"Task {task_id} has webhook_url but no secret found for tenant {tenant_id}")
-            
-        except Exception as e:
+            except Exception as e:
             logger.error(f"Error occurred while executing task: {e}")
+            # Record the error on the OTel span so it shows as a red error in Jaeger
+            span.set_status(trace.StatusCode.ERROR, str(e))
+            span.record_exception(e)
             await r.incr(f"stats:failed:{tenant_id}")   # Cumulative: total tasks ever failed/retried
             if getattr(tasks, 'retry_count', 0) >= 3:
                logger.error(f"[DLQ] Task {task_id} failed after 3 retries. Moving to dead-letter queue.")
+               span.set_attribute("task.status", "DeadLetter")
                await r.lpush(f"dlq:{tenant_id}", task_json)
                await r.incr(f"stats:dlq:{tenant_id}")
                await r.hset(f"task:{task_id}", mapping={
@@ -247,15 +316,26 @@ async def handle_task(task_json, sem, loop, process_pool, thread_pool):
                 )
             else:
                 tasks.retry_count += 1
-                delay = 2 ** tasks.retry_count  # Exponential backoff
+
+                # ── Decorrelated Jitter (AWS recommended) ───────────────────
+                BASE      = 1.0
+                MAX_DELAY = 30.0
+                prev      = getattr(tasks, 'prev_delay', BASE)
+                delay     = min(MAX_DELAY, random.uniform(BASE, prev * 3))
+                tasks.prev_delay = delay   # save so NEXT retry can use it
+
                 await r.zadd("delayed_tasks", {json.dumps(tasks.model_dump()): time.time() + delay})
                 await r.incr(f"stats:delayed:{tenant_id}")
-                logger.warning(f"[Retry] Task {task_id} failed. Scheduled for retry #{tasks.retry_count} after {delay} seconds.")
+                logger.warning(
+                    f"[Retry] Task {task_id} failed. "
+                    f"Retry #{tasks.retry_count} in {delay:.2f}s "
+                    f"(decorrelated jitter, prev={prev:.2f}s)"
+                )
                 await r.hset(f"task:{task_id}", mapping={
                     "task_id": task_id,
                     "status": "RetryScheduled",
                     "retry_count": tasks.retry_count,
-                    "error": f"Error: {str(e)}. Scheduled for retry in {delay} seconds."
+                    "error": f"Error: {str(e)}. Scheduled for retry in {delay:.2f} seconds."
                 })
             
     finally:

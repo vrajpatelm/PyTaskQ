@@ -22,6 +22,16 @@ services:
         max-size: "10m"
         max-file: "3"
 
+  jaeger:
+    image: jaegertracing/all-in-one:latest
+    ports:
+      - "16686:16686" # Web UI
+      - "4317:4317"   # OTLP gRPC receiver
+    environment:
+      - SPAN_STORAGE_TYPE=memory
+      - MEMORY_MAX_TRACES=5000 # Keep only last 5000 traces, limits RAM usage
+    restart: unless-stopped
+
   web:
     build:
       context: .
@@ -34,6 +44,7 @@ services:
       - REDIS_HOST=redis
       - REDIS_PORT=6379
       - PYTHONUNBUFFERED=1
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4317
     # Reason: `depends_on` by default only waits for the container to START,
     # not for Redis to be READY to accept connections. `condition: service_healthy`
     # uses our health check above to wait until Redis responds to PING.
@@ -64,6 +75,7 @@ services:
       - REDIS_HOST=redis
       - REDIS_PORT=6379
       - PYTHONUNBUFFERED=1
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4317
     depends_on:
       redis:
         condition: service_healthy
