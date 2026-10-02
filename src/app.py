@@ -46,6 +46,11 @@ QUEUE_CAPACITY = int(os.getenv("QUEUE_CAPACITY", 500))
 ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*").split(",")
 MASTER_KEY = os.getenv("MASTER_KEY", "")
 
+# Single source of truth for the per-tenant rate limit. The enforcer
+# (rate_limiter) and the reporter (/metrics) both read THIS value so the
+# dashboard can never disagree with what is actually enforced.
+RATE_LIMIT_PER_MINUTE = int(os.getenv("RATE_LIMIT_PER_MINUTE", "100"))
+
 # ── Idempotency Configuration ────────────────────────────────────────────────
 # Layer 1: Client sends an Idempotency-Key header -> cached 24h
 # Layer 2: No header -> content-hash blocks identical requests for 5 seconds
@@ -137,7 +142,9 @@ async def authenticate(credentials: HTTPAuthorizationCredentials = Security(api_
 def require_master_key(credentials: HTTPAuthorizationCredentials = Security(api_key_header)):
     if not MASTER_KEY:
         raise HTTPException(status_code=500, detail="MASTER_KEY not configured on server")
-    if credentials.credentials != MASTER_KEY:
+    # Constant-time comparison — a plain != leaks the key length/prefix
+    # character-by-character through response timing.
+    if not secrets.compare_digest(credentials.credentials, MASTER_KEY):
         raise HTTPException(status_code=403, detail="Invalid Master Key")
     return "admin"
 
@@ -152,7 +159,7 @@ async def rate_limiter(tenant_id: str = Depends(authenticate)):
     current_minute = int(time.time() / 60)
     key = f"rate_limit:{tenant_id}:{current_minute}"
     count = int(await r.get(key) or 0)
-    if count >= 10000:  # BENCHMARK MODE — restore to 100 after testing
+    if count >= RATE_LIMIT_PER_MINUTE:
         raise HTTPException(status_code=429, detail="Too many Requests. Please wait a minute")
     return tenant_id
 
@@ -215,9 +222,9 @@ async def store_idempotency_response(req: Request, response_data: dict, tenant_i
         await r.set(redis_key, json.dumps(response_data), ex=IDEMPOTENCY_TTL)
 
 
-# ==============================================================================
+
 # 3. CORE TASK APIS (/task/enqueue, /task/schedule, /task/{id})
-# ==============================================================================
+
 
 @app.post("/task/enqueue", dependencies=[Depends(check_backpressure)])
 async def enqueue_task(request: TaskRequest, req: Request, tenant_id: str = Depends(rate_limiter)):
@@ -235,7 +242,7 @@ async def enqueue_task(request: TaskRequest, req: Request, tenant_id: str = Depe
     if request.task_name == "matrix_multiply" and int(request.args[0]) > 1000:
         raise HTTPException(status_code=429, detail="Matrix Size Cannot Exceed 1000")
 
-    # ── Idempotency check ─────────────────────────────────────────────────
+    # Idempotency check 
     cached = await check_idempotency(req, request, tenant_id)
     if cached:
         return cached
@@ -302,7 +309,7 @@ async def schedule_task(
     if request.task_name == "matrix_multiply" and int(request.args[0]) > 1000:
         raise HTTPException(status_code=429, detail="Matrix Size Cannot Exceed 1000")
 
-    # ── Idempotency check ─────────────────────────────────────────────────
+    # Idempotency check 
     cached = await check_idempotency(req, request, tenant_id)
     if cached:
         return cached
@@ -354,14 +361,17 @@ async def task_result_display(task_id: str, tenant_id: str = Depends(authenticat
     result = await r.hgetall(f"task:{task_id}")
     if not result:
         raise HTTPException(status_code=404, detail="Task not found")
-    if result.get("tenant_id") and result.get("tenant_id") != tenant_id:
+    # Tenant isolation: an explicit mismatch is 403; a MISSING tenant_id is
+    # treated as another tenant's data (fail closed) rather than readable-by-all.
+    stored_tenant = result.get("tenant_id")
+    if stored_tenant != tenant_id:
         raise HTTPException(status_code=403, detail="Access denied")
     return {"result": result}
 
 
-# ==============================================================================
+
 # 4. REAL-TIME DASHBOARD & WEBSOCKET
-# ==============================================================================
+
 
 async def _notify_tenant(tenant_id: str, event_type: str) -> None:
     """Publish an event to the tenant's Redis Pub/Sub channel."""
@@ -397,7 +407,7 @@ async def _get_dashboard_data(tenant_id: str) -> dict:
             "queue_total": queue_high + queue_default + queue_low,
             "queue_capacity": QUEUE_CAPACITY,
             "rate_limit_used": rate_used,
-            "rate_limit_max": 100,
+            "rate_limit_max": RATE_LIMIT_PER_MINUTE,
             "worker_count": worker_count,
         },
         "dlq": dlq_tasks,

@@ -33,6 +33,8 @@ import pytest_asyncio
 import fakeredis.aioredis as fakeredis
 from unittest.mock import AsyncMock, patch, MagicMock
 
+from conftest import TEST_TENANT_ID  # noqa: F401  (conftest is on pytest's rootdir path)
+
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -44,6 +46,7 @@ def make_task_json(task_name="send_email", retry_count=0, task_id="test-001"):
         "args": ["a@b.com", "Hi", "Body"] if task_name == "send_email" else [3],
         "retry_count": retry_count,
         "priority": "default",
+        "tenant_id": TEST_TENANT_ID,
         "client_ip": "127.0.0.1",
     })
 
@@ -91,8 +94,8 @@ async def test_invalid_json_is_logged_as_failed(r, sem, thread_pool):
     assert result["status"] == "Failed"
     assert "JSON Validation Error" in result["error"]
 
-    # Must NOT be in DLQ (bad JSON is not a retryable error)
-    dlq_length = await r.llen("dlq:127.0.0.1")
+    # Must NOT be in any DLQ (bad JSON is not a retryable error)
+    dlq_length = await r.llen(f"dlq:{TEST_TENANT_ID}")
     assert dlq_length == 0
 
     # Must be removed from processing_queue
@@ -161,23 +164,29 @@ async def test_first_failure_schedules_retry(r, sem, thread_pool):
     assert result["retry_count"] == "1"
 
     # 4. NOT in DLQ
-    assert await r.llen("dlq:127.0.0.1") == 0
+    assert await r.llen(f"dlq:{TEST_TENANT_ID}") == 0
 
 
 @pytest.mark.asyncio
-async def test_exponential_backoff_delay(r, sem, thread_pool):
+async def test_retry_uses_decorrelated_jitter_delay(r, sem, thread_pool):
     """
-    SCENARIO: Task fails at retry_count=0, 1, 2
-    EXPECT:   Delays are 2s, 4s, 8s respectively (2^retry_count)
+    SCENARIO: Task fails with retry_count=0, 1, 2
+    EXPECT:   Delay uses decorrelated jitter (AWS recipe):
+                  delay = min(MAX_DELAY, uniform(BASE, prev * 3))
+              with BASE=1.0 and prev starting at BASE. So the bound for the
+              first attempt is uniform(1, 3) → range (1s, 3s), not 2^retry_count.
 
-    WHY: Exponential backoff prevents hammering a struggling service.
+    WHY: Plain exponential backoff synchronizes retries (thundering herd).
+         Jitter spreads them out. prev_delay travels in the task payload
+         so consecutive retries keep widening the window.
     """
     import worker
     import time
     loop = asyncio.get_running_loop()
     failing_executor = AsyncMock(side_effect=Exception("Service down"))
 
-    for retry_count, expected_delay in [(0, 2), (1, 4), (2, 8)]:
+    # max delay = uniform(BASE, prev*3): first retry prev=BASE → (1, 3)
+    for retry_count, max_delay in [(0, 3.0), (1, 9.0), (2, 27.0)]:
         await r.flushall()  # Clean slate for each sub-test
         task_json = make_task_json(retry_count=retry_count, task_id="backoff-test")
         await r.lpush(f"processing_queue:{worker.WORKER_ID}", task_json)
@@ -193,9 +202,15 @@ async def test_exponential_backoff_delay(r, sem, thread_pool):
         scheduled_at = entries[0][1]  # score = unix timestamp
 
         actual_delay = scheduled_at - before
-        assert expected_delay - 0.5 <= actual_delay <= expected_delay + 0.5, (
-            f"retry_count={retry_count}: expected ~{expected_delay}s delay, got {actual_delay:.2f}s"
+        assert 1.0 <= actual_delay <= max_delay, (
+            f"retry_count={retry_count}: expected ~uniform(1, {max_delay})s delay, "
+            f"got {actual_delay:.2f}s"
         )
+
+        # prev_delay must be persisted on the stored payload for the NEXT retry
+        stored = json.loads(entries[0][0])
+        assert stored["prev_delay"] == pytest.approx(actual_delay, abs=0.01)
+        assert stored["retry_count"] == retry_count + 1
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -227,11 +242,11 @@ async def test_task_goes_to_dlq_after_3_retries(r, sem, thread_pool):
             await worker.handle_task(task_json, sem, loop, thread_pool, thread_pool)
 
     # 1. Must be in DLQ
-    dlq_length = await r.llen("dlq:127.0.0.1")
+    dlq_length = await r.llen(f"dlq:{TEST_TENANT_ID}")
     assert dlq_length == 1, f"Expected task in DLQ, got {dlq_length} items"
 
     # 2. DLQ item must be the original task JSON
-    dlq_item = await r.lindex("dlq:127.0.0.1", 0)
+    dlq_item = await r.lindex(f"dlq:{TEST_TENANT_ID}", 0)
     assert json.loads(dlq_item)["task_id"] == "dlq-test-001"
 
     # 3. Status must be DeadLetter
@@ -264,12 +279,158 @@ async def test_dlq_preserves_full_task_data(r, sem, thread_pool):
         with patch.object(loop, "run_in_executor", failing_executor):
             await worker.handle_task(task_json, sem, loop, thread_pool, thread_pool)
 
-    raw = await r.lindex("dlq:127.0.0.1", 0)
+    raw = await r.lindex(f"dlq:{TEST_TENANT_ID}", 0)
     preserved = json.loads(raw)
 
     assert preserved["task_id"] == "dlq-data-test"
     assert preserved["task_name"] == "send_email"
     assert preserved["retry_count"] == 3
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TEST GROUP 5: Task timeout
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@pytest.mark.asyncio
+async def test_hung_task_times_out_and_frees_slot(r, sem, thread_pool):
+    """
+    SCENARIO: A task's handler hangs forever (e.g., socket with no timeout)
+    EXPECT:
+        - wait_for aborts after TASK_TIMEOUT → TaskTimeoutError path
+        - fence:{task_id} is INCREMENTED (orphaned handler's late result
+          will fail the fence check)
+        - task scheduled for retry (timeout is retryable, not fatal)
+        - semaphore released (no slot leak → no worker deadlock)
+
+    WHY: This is the anti-deadlock guarantee. Without it, 10 hung tasks
+         permanently consume every worker slot.
+    """
+    import worker
+    loop = asyncio.get_running_loop()
+    task_json = make_task_json(task_id="timeout-test-001")
+    await r.lpush(f"processing_queue:{worker.WORKER_ID}", task_json)
+
+    async def hang_forever(executor, fn, *args):
+        return await asyncio.sleep(3600)  # simulates a wedged handler
+
+    slots_before = sem._value
+    with patch.object(worker, "TASK_TIMEOUT", 0.05), patch.object(worker, "r", r), \
+         patch.object(loop, "run_in_executor", side_effect=hang_forever):
+        await worker.handle_task(task_json, sem, loop, thread_pool, thread_pool)
+
+    # 1. Fence token bumped → orphaned executor cannot save late result
+    fence = await r.get("fence:timeout-test-001")
+    assert fence == "1", f"Expected fence token bumped to 1, got {fence!r}"
+
+    # 2. Status recorded as retry-scheduled with timeout error text
+    result = await r.hgetall("task:timeout-test-001")
+    assert result["status"] == "RetryScheduled"
+    assert "exceeded" in result["error"]
+
+    # 3. Task re-queued with retry_count=1
+    entries = await r.zrange("delayed_tasks", 0, -1)
+    assert len(entries) == 1
+    assert json.loads(entries[0])["retry_count"] == 1
+
+    # 4. Semaphore released — the deadlock guarantee
+    assert sem._value == slots_before + 1, "Timed-out task leaked a semaphore slot!"
+
+
+@pytest.mark.asyncio
+async def test_task_completing_within_timeout_succeeds(r, sem, thread_pool):
+    """
+    SCENARIO: Task finishes well within TASK_TIMEOUT
+    EXPECT:   Normal Success path — timeout machinery is transparent.
+    """
+    import worker
+    loop = asyncio.get_running_loop()
+    task_json = make_task_json(task_id="timeout-fast-001")
+    await r.lpush(f"processing_queue:{worker.WORKER_ID}", task_json)
+
+    success_executor = AsyncMock(return_value={"result": "fast"})
+
+    with patch.object(worker, "TASK_TIMEOUT", 5.0), patch.object(worker, "r", r), \
+         patch.object(loop, "run_in_executor", success_executor):
+        await worker.handle_task(task_json, sem, loop, thread_pool, thread_pool)
+
+    result = await r.hgetall("task:timeout-fast-001")
+    assert result["status"] == "Success"
+    fence = await r.get("fence:timeout-fast-001")
+    assert fence is None, "Fence must NOT be bumped on a successful run"
+
+
+@pytest.mark.asyncio
+async def test_late_result_of_timed_out_task_is_discarded(r, sem, thread_pool):
+    """
+    SCENARIO: The FULL orphan story — task times out, then the abandoned
+              executor finally finishes and tries to save its result.
+    EXPECT:   The Lua fence script REJECTS the late write (token was bumped
+              on timeout), so the task hash keeps its RetryScheduled state.
+
+    WHY: wait_for cannot kill threads/processes. The fence check is what
+         turns an unkillable orphan into a harmless no-op.
+    """
+    import worker
+    loop = asyncio.get_running_loop()
+    task_json = make_task_json(task_id="orphan-test-001")
+    await r.lpush(f"processing_queue:{worker.WORKER_ID}", task_json)
+
+    async def hang_then_return(executor, fn, *args):
+        await asyncio.sleep(0.2)   # longer than the patched timeout
+        return {"result": "LATE ORPHANED RESULT"}
+
+    with patch.object(worker, "TASK_TIMEOUT", 0.05), patch.object(worker, "r", r), \
+         patch.object(loop, "run_in_executor", side_effect=hang_then_return):
+        await worker.handle_task(task_json, sem, loop, thread_pool, thread_pool)
+
+    fence_now = int(await r.get("fence:orphan-test-001"))  # bumped by timeout path
+
+    # NOW the orphaned handler finishes and attempts the exact same save the
+    # real worker would do — same fence script, same ORIGINAL token (the
+    # executor captured tasks.fence_token before the bump).
+    saved = await r.eval(
+        worker.FENCE_SCRIPT,
+        2,
+        "fence:orphan-test-001",
+        "task:orphan-test-001",
+        str(fence_now - 1),          # the stale token the orphan still holds
+        "orphan-test-001",
+        "Success",
+        str({"result": "LATE ORPHANED RESULT"}),
+        TEST_TENANT_ID,
+    )
+    assert saved == 0, "Fence script ACCEPTED a late result from a timed-out task!"
+
+    # Task hash still shows the retry state, not the orphan's fake Success
+    result = await r.hgetall("task:orphan-test-001")
+    assert result["status"] == "RetryScheduled"
+    assert "LATE ORPHANED RESULT" not in str(result)
+
+
+@pytest.mark.asyncio
+async def test_timeout_disabled_runs_unbounded(r, sem, thread_pool):
+    """
+    SCENARIO: TASK_TIMEOUT=0 (operator explicitly disabled the limit)
+    EXPECT:   wait_for is bypassed; task runs to completion however long.
+
+    WHY: Escaped hatch for legitimately long tasks — must be an explicit,
+         documented opt-out, not an accident.
+    """
+    import worker
+    loop = asyncio.get_running_loop()
+    task_json = make_task_json(task_id="no-timeout-001")
+    await r.lpush(f"processing_queue:{worker.WORKER_ID}", task_json)
+
+    async def slow_but_finishes(executor, fn, *args):
+        await asyncio.sleep(0.1)
+        return {"result": "eventually done"}
+
+    with patch.object(worker, "TASK_TIMEOUT", 0), patch.object(worker, "r", r), \
+         patch.object(loop, "run_in_executor", side_effect=slow_but_finishes):
+        await worker.handle_task(task_json, sem, loop, thread_pool, thread_pool)
+
+    result = await r.hgetall("task:no-timeout-001")
+    assert result["status"] == "Success"
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -313,7 +474,10 @@ async def test_successful_task_saves_result(r, sem, thread_pool):
 
     # 4. No retry or DLQ entries
     assert await r.zcard("delayed_tasks") == 0
-    assert await r.llen("dlq:127.0.0.1") == 0
+    assert await r.llen(f"dlq:{TEST_TENANT_ID}") == 0
+
+    # 5. Result hash carries the tenant so GET /task/{id} can enforce isolation
+    assert result.get("tenant_id") == TEST_TENANT_ID
 
 
 @pytest.mark.asyncio

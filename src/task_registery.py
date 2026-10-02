@@ -8,15 +8,66 @@ import random
 import io
 import time
 import urllib.request
+import urllib.parse
+import urllib.error
+import socket
+import ipaddress
 import hashlib
 import hmac
 import json
-import urllib.error
 from PIL import Image
 from dotenv import load_dotenv
 
 
 load_dotenv()
+
+
+# ── SSRF guard ────────────────────────────────────────────────────────────────
+# Task handlers fetch user-supplied URLs. Without a guard a tenant could make
+# workers request internal services (localhost, 169.254.169.254 cloud
+# metadata, RFC1918 ranges, etc.). We resolve the hostname and reject any
+# URL whose DNS points at a non-public address, and re-validate every
+# redirect hop so http://public.host/ can't bounce us behind the firewall.
+
+class UnsafeURL(Exception):
+    """Raised when a user-supplied URL targets a non-public address."""
+
+
+def _assert_safe_url(url: str) -> None:
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        raise UnsafeURL(f"Only http/https URLs are allowed, got: {parsed.scheme!r}")
+    host = parsed.hostname
+    if not host:
+        raise UnsafeURL("URL has no hostname")
+    if host in ("localhost",) or host.endswith((".localhost", ".local", ".internal")):
+        raise UnsafeURL(f"Access to internal host {host!r} is not allowed")
+    try:
+        addr_infos = socket.getaddrinfo(host, None)
+    except socket.gaierror:
+        raise UnsafeURL(f"Cannot resolve host: {host}")
+    for info in addr_infos:
+        ip = ipaddress.ip_address(info[4][0])
+        if (
+            ip.is_private
+            or ip.is_loopback
+            or ip.is_link_local      # 169.254.0.0/16 — cloud metadata lives here
+            or ip.is_reserved
+            or ip.is_multicast
+            or ip.is_unspecified
+        ):
+            raise UnsafeURL(f"Access to non-public address {ip} is not allowed")
+
+
+class _SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Re-validates every redirect target before following it."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        _assert_safe_url(newurl)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+_SAFE_OPENER = urllib.request.build_opener(_SafeRedirectHandler())
 
 
 def matrix_multiply(size: int):
@@ -82,29 +133,29 @@ def resize_image(image_url: str, width: int, height: int):
     try:
         start_time = time.time()
         
-        # 1. Ensure the output directory exists
-        os.makedirs("thumbnails", exist_ok=True)
+        # 1. SSRF guard: reject URLs that resolve to private/internal addresses
+        _assert_safe_url(image_url)
         
-        # 2. Define where we will save the file locally
-        filename = f"thumbnails/{time.time_ns()}.jpg"
+        # 2. Download the image into memory (capped) instead of straight to disk
+        request = urllib.request.Request(image_url, headers={"User-Agent": "PyTaskQ-Worker/1.0"})
+        with _SAFE_OPENER.open(request, timeout=10) as resp:
+            image_bytes = resp.read(10 * 1024 * 1024)  # hard cap: 10 MB
         
-        # 3. Download the image and save it temporarily
-        urllib.request.urlretrieve(image_url, filename)
-        
-        # 4. Open, resize, and save the image using Pillow
-        with Image.open(filename) as img:
+        # 3. Open, resize, and encode the image using Pillow
+        with Image.open(io.BytesIO(image_bytes)) as img:
             # Convert to RGB in case it's a PNG with transparency
             if img.mode in ("RGBA", "P"):
                 img = img.convert("RGB")
             
             resized = img.resize((width, height))
-            resized.save(filename, format="JPEG", quality=85)
+            buffer = io.BytesIO()
+            resized.save(buffer, format="JPEG", quality=85)
         
         end_time = time.time()
         
         return {
             "status": "success",
-            "saved_path": filename,
+            "bytes_processed": len(image_bytes),
             "original_url": image_url,
             "dimensions": f"{width}x{height}",
             "time_taken_ms": round((end_time - start_time) * 1000)
@@ -116,8 +167,11 @@ def resize_image(image_url: str, width: int, height: int):
     
 def url_health_check(url):
     try:
+        # SSRF guard: reject URLs that resolve to private/internal addresses
+        _assert_safe_url(url)
         time1=time.time()
-        resp = urllib.request.urlopen(url,timeout=10) 
+        resp = _SAFE_OPENER.open(url, timeout=10)
+        resp.read(1024)  # drain a little so the socket closes cleanly
         time2 = time.time()
         diff = time2-time1
         return {"url": url, "status_code": resp.status, "response_time_ms": round(diff * 1000)}

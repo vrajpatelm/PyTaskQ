@@ -35,6 +35,8 @@ import pytest_asyncio
 import fakeredis.aioredis as fakeredis
 from httpx import AsyncClient, ASGITransport
 
+from conftest import AUTH_HEADERS, TEST_API_KEY, TEST_TENANT_ID
+
 
 # The IP that our monkeypatched get_client_ip will return
 TEST_CLIENT_IP = "127.0.0.1"
@@ -63,6 +65,12 @@ async def test_client(fake_redis_for_app, monkeypatch):
     # Monkeypatch get_client_ip to return a known, stable IP for tests
     monkeypatch.setattr(app, "get_client_ip", lambda req: TEST_CLIENT_IP)
 
+    # Seed a real API key so app.authenticate's Redis lookup works
+    await fake_redis_for_app.hset(f"api_key:{TEST_API_KEY}", mapping={
+        "tenant_id": TEST_TENANT_ID,
+        "label": "test-suite",
+    })
+
     transport = ASGITransport(app=app.app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
         yield client, fake_redis_for_app
@@ -76,6 +84,7 @@ def make_dlq_task(task_id, task_name="send_email", priority="default"):
         "args": ["a@b.com", "Hello", "Body"],
         "retry_count": 3,
         "priority": priority,
+        "tenant_id": TEST_TENANT_ID,
         "client_ip": TEST_CLIENT_IP,
     })
 
@@ -94,7 +103,7 @@ async def test_metrics_all_zero_on_empty_system(test_client):
     """
     client, r = test_client
 
-    response = await client.get("/metrics")
+    response = await client.get("/metrics", headers=AUTH_HEADERS)
     assert response.status_code == 200
 
     data = response.json()
@@ -115,15 +124,15 @@ async def test_metrics_reflects_per_ip_counters(test_client):
     client, r = test_client
 
     # Set per-IP stats counters (simulating what app.py/worker.py do)
-    await r.set(f"stats:pending:{TEST_CLIENT_IP}", 3)
-    await r.set(f"stats:processing:{TEST_CLIENT_IP}", 1)
-    await r.set(f"stats:delayed:{TEST_CLIENT_IP}", 0)
-    await r.set(f"stats:completed:{TEST_CLIENT_IP}", 10)
-    await r.set(f"stats:failed:{TEST_CLIENT_IP}", 2)
+    await r.set(f"stats:pending:{TEST_TENANT_ID}", 3)
+    await r.set(f"stats:processing:{TEST_TENANT_ID}", 1)
+    await r.set(f"stats:delayed:{TEST_TENANT_ID}", 0)
+    await r.set(f"stats:completed:{TEST_TENANT_ID}", 10)
+    await r.set(f"stats:failed:{TEST_TENANT_ID}", 2)
     for i in range(2):
-        await r.lpush(f"dlq:{TEST_CLIENT_IP}", make_dlq_task(f"dlq-{i}"))
+        await r.lpush(f"dlq:{TEST_TENANT_ID}", make_dlq_task(f"dlq-{i}"))
 
-    response = await client.get("/metrics")
+    response = await client.get("/metrics", headers=AUTH_HEADERS)
     assert response.status_code == 200
 
     data = response.json()
@@ -146,10 +155,10 @@ async def test_metrics_isolated_between_users(test_client):
     client, r = test_client
 
     # Set stats for a different IP
-    await r.set("stats:completed:10.0.0.99", 500)
-    await r.lpush("dlq:10.0.0.99", make_dlq_task("other-user-task"))
+    await r.set("stats:completed:t_other_tenant", 500)
+    await r.lpush("dlq:t_other_tenant", make_dlq_task("other-user-task"))
 
-    response = await client.get("/metrics")
+    response = await client.get("/metrics", headers=AUTH_HEADERS)
     data = response.json()
     assert data["completed_total"] == 0, "Should not see another user's completed count"
     assert data["dlq"] == 0, "Should not see another user's DLQ"
@@ -169,7 +178,7 @@ async def test_dlq_returns_empty_list_when_no_failures(test_client):
     """
     client, r = test_client
 
-    response = await client.get("/dlq")
+    response = await client.get("/dlq", headers=AUTH_HEADERS)
     assert response.status_code == 200
 
     data = response.json()
@@ -190,9 +199,9 @@ async def test_dlq_lists_all_failed_tasks(test_client):
 
     ids = ["failed-001", "failed-002", "failed-003"]
     for task_id in ids:
-        await r.lpush(f"dlq:{TEST_CLIENT_IP}", make_dlq_task(task_id))
+        await r.lpush(f"dlq:{TEST_TENANT_ID}", make_dlq_task(task_id))
 
-    response = await client.get("/dlq")
+    response = await client.get("/dlq", headers=AUTH_HEADERS)
     assert response.status_code == 200
 
     data = response.json()
@@ -213,9 +222,9 @@ async def test_dlq_task_has_required_fields(test_client):
     """
     client, r = test_client
 
-    await r.lpush(f"dlq:{TEST_CLIENT_IP}", make_dlq_task("field-check-001"))
+    await r.lpush(f"dlq:{TEST_TENANT_ID}", make_dlq_task("field-check-001"))
 
-    response = await client.get("/dlq")
+    response = await client.get("/dlq", headers=AUTH_HEADERS)
     task = response.json()["tasks"][0]
 
     assert "task_id" in task
@@ -241,14 +250,14 @@ async def test_replay_moves_task_to_priority_queue(test_client):
     client, r = test_client
 
     task_id = "replay-test-001"
-    await r.lpush(f"dlq:{TEST_CLIENT_IP}", make_dlq_task(task_id, priority="default"))
-    assert await r.llen(f"dlq:{TEST_CLIENT_IP}") == 1
+    await r.lpush(f"dlq:{TEST_TENANT_ID}", make_dlq_task(task_id, priority="default"))
+    assert await r.llen(f"dlq:{TEST_TENANT_ID}") == 1
 
-    response = await client.post(f"/dlq/replay/{task_id}")
+    response = await client.post(f"/dlq/replay/{task_id}", headers=AUTH_HEADERS)
     assert response.status_code == 200
 
     # DLQ must be empty after replay
-    assert await r.llen(f"dlq:{TEST_CLIENT_IP}") == 0, "Task was NOT removed from DLQ"
+    assert await r.llen(f"dlq:{TEST_TENANT_ID}") == 0, "Task was NOT removed from DLQ"
 
     # The task must be in the correct priority queue
     total_queued = (
@@ -281,7 +290,7 @@ async def test_replay_nonexistent_task_returns_404(test_client):
     """
     client, r = test_client
 
-    response = await client.post("/dlq/replay/nonexistent-task-xyz")
+    response = await client.post(f"/dlq/replay/nonexistent-task-xyz", headers=AUTH_HEADERS)
     assert response.status_code == 404
 
 
@@ -298,13 +307,13 @@ async def test_replay_only_removes_the_targeted_task(test_client):
 
     ids = ["keep-001", "replay-me", "keep-002"]
     for task_id in ids:
-        await r.lpush(f"dlq:{TEST_CLIENT_IP}", make_dlq_task(task_id))
+        await r.lpush(f"dlq:{TEST_TENANT_ID}", make_dlq_task(task_id))
 
-    response = await client.post("/dlq/replay/replay-me")
+    response = await client.post(f"/dlq/replay/replay-me", headers=AUTH_HEADERS)
     assert response.status_code == 200
 
     # DLQ should still have exactly 2 tasks
-    assert await r.llen(f"dlq:{TEST_CLIENT_IP}") == 2
+    assert await r.llen(f"dlq:{TEST_TENANT_ID}") == 2
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -323,12 +332,12 @@ async def test_purge_removes_task_from_dlq(test_client):
     client, r = test_client
 
     task_id = "purge-test-001"
-    await r.lpush(f"dlq:{TEST_CLIENT_IP}", make_dlq_task(task_id))
+    await r.lpush(f"dlq:{TEST_TENANT_ID}", make_dlq_task(task_id))
 
-    response = await client.post(f"/dlq/purge/{task_id}")
+    response = await client.post(f"/dlq/purge/{task_id}", headers=AUTH_HEADERS)
     assert response.status_code == 200
 
-    assert await r.llen(f"dlq:{TEST_CLIENT_IP}") == 0, "Task was NOT purged from DLQ"
+    assert await r.llen(f"dlq:{TEST_TENANT_ID}") == 0, "Task was NOT purged from DLQ"
     assert await r.llen("queue:default") == 0, "Purge should NOT add task to any queue"
 
 
@@ -340,7 +349,7 @@ async def test_purge_nonexistent_task_returns_404(test_client):
     """
     client, r = test_client
 
-    response = await client.post("/dlq/purge/ghost-task-xyz")
+    response = await client.post("/dlq/purge/ghost-task-xyz", headers=AUTH_HEADERS)
     assert response.status_code == 404
 
 
@@ -354,13 +363,13 @@ async def test_purge_does_not_affect_other_dlq_tasks(test_client):
 
     ids = ["safe-001", "delete-me", "safe-002"]
     for task_id in ids:
-        await r.lpush(f"dlq:{TEST_CLIENT_IP}", make_dlq_task(task_id))
+        await r.lpush(f"dlq:{TEST_TENANT_ID}", make_dlq_task(task_id))
 
-    response = await client.post("/dlq/purge/delete-me")
+    response = await client.post("/dlq/purge/delete-me", headers=AUTH_HEADERS)
     assert response.status_code == 200
 
-    assert await r.llen(f"dlq:{TEST_CLIENT_IP}") == 2
-    remaining_raw = await r.lrange(f"dlq:{TEST_CLIENT_IP}", 0, -1)
+    assert await r.llen(f"dlq:{TEST_TENANT_ID}") == 2
+    remaining_raw = await r.lrange(f"dlq:{TEST_TENANT_ID}", 0, -1)
     remaining_ids = {json.loads(t)["task_id"] for t in remaining_raw}
     assert "delete-me" not in remaining_ids
 
@@ -381,13 +390,13 @@ async def test_purge_all_clears_entire_dlq(test_client):
     client, r = test_client
 
     for i in range(5):
-        await r.lpush(f"dlq:{TEST_CLIENT_IP}", make_dlq_task(f"dlq-task-{i}"))
-    assert await r.llen(f"dlq:{TEST_CLIENT_IP}") == 5
+        await r.lpush(f"dlq:{TEST_TENANT_ID}", make_dlq_task(f"dlq-task-{i}"))
+    assert await r.llen(f"dlq:{TEST_TENANT_ID}") == 5
 
-    response = await client.post("/dlq/purge_all")
+    response = await client.post("/dlq/purge_all", headers=AUTH_HEADERS)
     assert response.status_code == 200
 
-    assert await r.llen(f"dlq:{TEST_CLIENT_IP}") == 0, "DLQ was NOT fully cleared"
+    assert await r.llen(f"dlq:{TEST_TENANT_ID}") == 0, "DLQ was NOT fully cleared"
     assert await r.llen("queue:default") == 0, "purge_all should NOT touch any queue"
 
 
@@ -402,6 +411,6 @@ async def test_purge_all_on_empty_dlq_succeeds(test_client):
     """
     client, r = test_client
 
-    response = await client.post("/dlq/purge_all")
+    response = await client.post("/dlq/purge_all", headers=AUTH_HEADERS)
     assert response.status_code == 200
-    assert await r.llen(f"dlq:{TEST_CLIENT_IP}") == 0
+    assert await r.llen(f"dlq:{TEST_TENANT_ID}") == 0

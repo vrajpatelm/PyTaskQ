@@ -32,6 +32,14 @@ import pytest_asyncio
 import fakeredis.aioredis as fakeredis
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
 
+# ── Test constants ────────────────────────────────────────────────────────────
+# Tenant id used across all test payloads. The API authenticates via the
+# `Authorization: Bearer <api_key>` header — api_key "test-key" is the
+# placeholder the API test-suites monkeypatch authenticate() with.
+TEST_TENANT_ID = "tenant-test"
+TEST_API_KEY = "test-key"
+AUTH_HEADERS = {"Authorization": f"Bearer {TEST_API_KEY}"}
+
 
 # ── Module-level mocking — runs before test collection ────────────────────────
 # We inject fake modules into sys.modules so that when worker.py does

@@ -21,7 +21,7 @@ cssutils==2.15.0
 dnspython==2.8.0
 email-validator==2.3.0
 encutils==1.0.0
-fakeredis==2.36.2
+fakeredis[lua]==2.36.2
 fastapi==0.136.1
 fastapi-cli==0.0.24
 fastapi-cloud-cli==0.17.1

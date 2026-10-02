@@ -21,6 +21,8 @@ import pytest_asyncio
 import fakeredis.aioredis as fakeredis
 from httpx import AsyncClient, ASGITransport
 
+from conftest import AUTH_HEADERS, TEST_API_KEY, TEST_TENANT_ID
+
 
 # ── We need to patch app.py's Redis BEFORE importing app ──────────────────────
 # app.py creates `r = redis.Redis(...)` at import time. We must swap that
@@ -47,8 +49,13 @@ async def test_client(fake_redis_for_app, monkeypatch):
     """
     import app  # import AFTER monkeypatching below
     monkeypatch.setattr(app, "r", fake_redis_for_app)
-    # Monkeypatch get_client_ip to return a known, stable IP for tests
-    monkeypatch.setattr(app, "get_client_ip", lambda req: "127.0.0.1")
+
+    # Seed a real API key so app.authenticate's Redis lookup works against
+    # fakeredis — tests exercise the actual auth dependency, not a stub.
+    await fake_redis_for_app.hset(f"api_key:{TEST_API_KEY}", mapping={
+        "tenant_id": TEST_TENANT_ID,
+        "label": "test-suite",
+    })
 
     # ASGITransport lets httpx talk to FastAPI without a real network/port
     transport = ASGITransport(app=app.app)
@@ -61,6 +68,42 @@ async def test_client(fake_redis_for_app, monkeypatch):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @pytest.mark.asyncio
+async def test_request_without_api_key_is_rejected(test_client):
+    """
+    SCENARIO: Anonymous client posts a task (no Authorization header)
+    EXPECT:   Rejected with 401/403 — the queue is never touched.
+
+    WHY: Unauthenticated submissions would let anyone enqueue work
+         and bypass per-tenant rate limits.
+    """
+    client, r = test_client
+
+    response = await client.post("/task/enqueue", json={
+        "task_name": "matrix_multiply",
+        "args": [5],
+    })
+    assert response.status_code in (401, 403)
+    assert await r.llen("queue:default") == 0
+
+
+@pytest.mark.asyncio
+async def test_request_with_invalid_api_key_is_rejected(test_client):
+    """
+    SCENARIO: Client presents a key that does not exist in Redis
+    EXPECT:   401 Unauthorized.
+    """
+    client, r = test_client
+
+    response = await client.post(
+        "/task/enqueue",
+        json={"task_name": "matrix_multiply", "args": [5]},
+        headers={"Authorization": "Bearer sk_definitely_not_a_real_key"},
+    )
+    assert response.status_code == 401
+    assert await r.llen("queue:default") == 0
+
+
+@pytest.mark.asyncio
 async def test_default_priority_task_pushed_to_queue_default(test_client):
     """
     SCENARIO: Client posts a task with no priority specified (defaults to "default")
@@ -71,7 +114,7 @@ async def test_default_priority_task_pushed_to_queue_default(test_client):
     response = await client.post("/task/enqueue", json={
         "task_name": "matrix_multiply",
         "args": [5],
-    })
+    }, headers=AUTH_HEADERS)
 
     # 1. HTTP response must be 200 and contain task_id + status
     assert response.status_code == 200
@@ -94,6 +137,7 @@ async def test_default_priority_task_pushed_to_queue_default(test_client):
     assert task["args"] == [5]
     assert task["retry_count"] == 0
     assert task["priority"] == "default"
+    assert task["tenant_id"] == TEST_TENANT_ID, "Task must carry its tenant for isolation"
     assert "task_id" in task
     assert "client_ip" in task
     assert task["task_id"] == body["task_id"]   # API response ID matches queue ID
@@ -111,7 +155,7 @@ async def test_high_priority_task_pushed_to_queue_high(test_client):
         "task_name": "matrix_multiply",
         "args": [5],
         "priority": "high",
-    })
+    }, headers=AUTH_HEADERS)
 
     assert response.status_code == 200
 
@@ -137,7 +181,7 @@ async def test_low_priority_task_pushed_to_queue_low(test_client):
         "task_name": "matrix_multiply",
         "args": [5],
         "priority": "low",
-    })
+    }, headers=AUTH_HEADERS)
 
     assert response.status_code == 200
     assert await r.llen("queue:low") == 1
@@ -156,14 +200,37 @@ async def test_each_task_gets_unique_id(test_client):
     """
     client, r = test_client
 
-    r1 = await client.post("/task/enqueue", json={"task_name": "matrix_multiply", "args": [3]})
-    r2 = await client.post("/task/enqueue", json={"task_name": "matrix_multiply", "args": [3]})
+    # Different args → different Layer-2 content hash, so dedup won't interfere
+    r1 = await client.post("/task/enqueue", json={"task_name": "matrix_multiply", "args": [3]}, headers=AUTH_HEADERS)
+    r2 = await client.post("/task/enqueue", json={"task_name": "matrix_multiply", "args": [4]}, headers=AUTH_HEADERS)
 
     id1 = r1.json()["task_id"]
     id2 = r2.json()["task_id"]
 
     assert id1 != id2, "Two tasks were assigned the same ID — UUID collision!"
     assert await r.llen("queue:default") == 2
+
+
+@pytest.mark.asyncio
+async def test_identical_resubmit_within_window_is_rejected(test_client):
+    """
+    SCENARIO: The SAME task_name + args + tenant is submitted twice quickly
+              with no Idempotency-Key header
+    EXPECT:   First request enqueues; second gets 409 from the Layer-2
+              content-hash safety net.
+
+    WHY: Double-clicks and auto-retries must not silently create duplicate
+         work when the client forgot to send an idempotency key.
+    """
+    client, r = test_client
+
+    payload = {"task_name": "matrix_multiply", "args": [7]}
+    first = await client.post("/task/enqueue", json=payload, headers=AUTH_HEADERS)
+    assert first.status_code == 200
+
+    second = await client.post("/task/enqueue", json=payload, headers=AUTH_HEADERS)
+    assert second.status_code == 409
+    assert await r.llen("queue:default") == 1  # duplicate did NOT enqueue
 
 
 @pytest.mark.asyncio
@@ -179,7 +246,7 @@ async def test_task_payload_includes_client_ip(test_client):
     await client.post("/task/enqueue", json={
         "task_name": "matrix_multiply",
         "args": [5],
-    })
+    }, headers=AUTH_HEADERS)
 
     raw = await r.lindex("queue:default", 0)
     task = json.loads(raw)
@@ -190,15 +257,47 @@ async def test_task_payload_includes_client_ip(test_client):
 async def test_result_endpoint_returns_empty_for_unknown_id(test_client):
     """
     SCENARIO: Client polls /task/{id} for a task that doesn't exist yet
-    EXPECT:   Returns empty result dict, not an error
+    EXPECT:   404 with a clean error, not a 500.
 
-    WHY: Client might poll before worker finishes. Should get {} not 500.
+    WHY: Client might poll before the worker finishes; the API must
+         distinguish "not yet" from "server error".
     """
     client, r = test_client
 
-    response = await client.get("/task/nonexistent-uuid-000")
-    assert response.status_code == 200
-    assert response.json() == {"result": {}}
+    response = await client.get("/task/nonexistent-uuid-000", headers=AUTH_HEADERS)
+    assert response.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_result_endpoint_enforces_tenant_isolation(test_client):
+    """
+    SCENARIO: A task hash exists in Redis but was stored by ANOTHER tenant
+              (or has no tenant_id at all — legacy/poisoned data).
+    EXPECT:   403 — one tenant must never read another tenant's results.
+
+    WHY: Task IDs are UUIDs, but security cannot depend on them being
+         unguessable. Fail closed on any tenant mismatch.
+    """
+    client, r = test_client
+
+    # Another tenant's task result sitting in Redis
+    await r.hset("task:foreign-task-001", mapping={
+        "task_id": "foreign-task-001",
+        "status": "Success",
+        "tenant_id": "t_someone_else",
+        "result": "secret output",
+    })
+    # A legacy/poisoned hash with NO tenant field
+    await r.hset("task:no-tenant-task", mapping={
+        "task_id": "no-tenant-task",
+        "status": "Success",
+        "result": "orphan output",
+    })
+
+    resp_foreign = await client.get("/task/foreign-task-001", headers=AUTH_HEADERS)
+    assert resp_foreign.status_code == 403
+    resp_orphan = await client.get("/task/no-tenant-task", headers=AUTH_HEADERS)
+    assert resp_orphan.status_code == 403
 """
     Test file written.
 """

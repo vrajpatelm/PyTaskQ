@@ -1,7 +1,7 @@
 from typing import Literal
 from typing import Any,List,Optional
 from pydantic import BaseModel
-# for incoming taks VALIDATION
+
 class Taskloader(BaseModel):
     task_id:str
     task_name:str

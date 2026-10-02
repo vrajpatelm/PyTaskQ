@@ -2,34 +2,44 @@
 PyTaskQ Benchmark Locustfile
 ============================
 Purpose: Measure RAW API throughput and latency.
-- Rate limit is raised to 10,000 req/min in app.py for this test.
-- Uses unique UUIDs to avoid 409 dedup hits.
-- Focuses on the enqueue endpoint (lightweight Redis write) — the core operation.
+
+All configuration comes from environment variables (loaded from .env):
+
+    LOADTEST_HOST    — target base URL       (default: http://localhost:8000)
+    LOADTEST_API_KEY — a valid tenant API key (default: dummy, expect 401s)
+
+For benchmarking, raise the rate limit in .env (NOT in source):
+    RATE_LIMIT_PER_MINUTE=10000
 
 Run steps:
-  1. Push raised rate limit to server + docker-compose up --build -d
-  2. python -m locust -f tests/load/benchmark.py
+  1. Set env vars in .env, then start the stack:  docker-compose up --build -d
+  2. python -m locust -f tests/load/benchmark.py --host=$LOADTEST_HOST
   3. Open http://localhost:8089
   4. Run 4 separate tests: 10, 50, 100, 200 users (2 min each)
   5. Record p50, p99, RPS, error% for each
 """
 
+import os
 import uuid
-import random
-from locust import HttpUser, task, between
 
-API_KEY = "Bearer sk_YbA3K_xlKr3LZVIUx28pt7XV70aEcenO"
-HOST    = "http://130.210.43.191:8000"
+from dotenv import load_dotenv
+from locust import HttpUser, between, task
+
+load_dotenv()
+
+# ── Configuration (env-driven, nothing hardcoded) ─────────────────────────────
+LOADTEST_HOST = os.getenv("LOADTEST_HOST", "http://localhost:8000")
+LOADTEST_API_KEY = os.getenv("LOADTEST_API_KEY", "sk_set_LOADTEST_API_KEY_in_env")
 
 
 class BenchmarkUser(HttpUser):
-    host     = HOST
+    host = LOADTEST_HOST
     wait_time = between(0.05, 0.2)
 
     def on_start(self):
         self.headers = {
             "Content-Type": "application/json",
-            "Authorization": API_KEY,
+            "Authorization": f"Bearer {LOADTEST_API_KEY}",
         }
 
     @task(8)

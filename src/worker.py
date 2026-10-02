@@ -26,6 +26,14 @@ logger = logging.getLogger("worker")
 REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
 REDIS_PORT = int(os.getenv("REDIS_PORT", 6379))
 WORKER_ID=str(uuid.uuid4())
+
+# Hard wall-clock limit for any single task execution. Without it, one hung
+# handler (no socket timeout, infinite loop) holds a semaphore slot forever
+# and 10 wedged tasks deadlock the whole worker. 0 disables the limit.
+TASK_TIMEOUT = float(os.getenv("TASK_TIMEOUT", "300"))  # seconds (default: 5 min)
+
+class TaskTimeoutError(Exception):
+    """Raised when a task exceeds TASK_TIMEOUT. Treated as a retryable failure."""
     
 r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
 shutdown_event = asyncio.Event()
@@ -41,7 +49,7 @@ tracer = init_tracer("pytaskq-worker")
 FENCE_SCRIPT = """
 local current = redis.call('get', KEYS[1])
 if current == false or current == ARGV[1] then
-    redis.call('hset', KEYS[2], 'task_id', ARGV[2], 'status', ARGV[3], 'result', ARGV[4])
+    redis.call('hset', KEYS[2], 'task_id', ARGV[2], 'status', ARGV[3], 'result', ARGV[4], 'tenant_id', ARGV[5])
     redis.call('expire', KEYS[2], 86400)
     return 1
 else
@@ -195,7 +203,7 @@ async def consumer_task():
 
 async def handle_task(task_json, sem, loop, process_pool, thread_pool):
     incr_done = False  # Guard: only DECR stats:processing if we actually INCRed it
-    try:  # <--- Outer try block starts here
+    try:  
         # 1. Validation
         try:
             tasks = Taskloader.model_validate_json(task_json)
@@ -239,10 +247,26 @@ async def handle_task(task_json, sem, loop, process_pool, thread_pool):
 
                 if task_type == "cpu":
                     # Run in a process to use another CPU core without GIL blocking
-                    result = await loop.run_in_executor(process_pool, func, *tasks.args)
+                    exec_future = loop.run_in_executor(process_pool, func, *tasks.args)
                 else:
                     # Run in a thread for low-overhead I/O tasks
-                    result = await loop.run_in_executor(thread_pool, func, *tasks.args)
+                    exec_future = loop.run_in_executor(thread_pool, func, *tasks.args)
+
+                if TASK_TIMEOUT > 0:
+                    try:
+                        result = await asyncio.wait_for(exec_future, timeout=TASK_TIMEOUT)
+                    except asyncio.TimeoutError:
+                        # The executor worker is STILL RUNNING the handler — wait_for
+                        # cannot kill a thread/process. Invalidate our fence token so
+                        # whenever the orphaned handler eventually finishes, its result
+                        # write fails the fence check and is discarded.
+                        await r.incr(f"fence:{task_id}")
+                        raise TaskTimeoutError(
+                            f"Task exceeded {TASK_TIMEOUT}s limit (execution abandoned; "
+                            f"late result will be discarded by fence check)"
+                        ) from None
+                else:
+                    result = await exec_future  # no timeout configured
 
                 
             # Save Success result to Redis — atomically via Lua fencing check
@@ -254,13 +278,14 @@ async def handle_task(task_json, sem, loop, process_pool, thread_pool):
                     str(my_token),            # ARGV[1] — our claimed token
                     task_id,                  # ARGV[2] — hset field: task_id
                     "Success",               # ARGV[3] — hset field: status
-                    str(result)              # ARGV[4] — hset field: result
+                    str(result),              # ARGV[4] — hset field: result
+                    tenant_id                 # ARGV[5] — hset field: tenant_id (isolation)
                 )
                 if saved:
                     await r.expire(f"task:{task_id}", 86400)
                     await r.incr(f"stats:completed:{tenant_id}")
                     span.set_attribute("task.status", "Success")
-                    logger.info(f"Task {task_id} completed and saved ✅")
+                    logger.info(f"Task {task_id} completed and saved ")
                 else:
                     span.set_attribute("task.status", "Discarded")
                     span.set_attribute("task.discard_reason", "fence_token_stale")
@@ -312,12 +337,13 @@ async def handle_task(task_json, sem, loop, process_pool, thread_pool):
                    await r.hset(f"task:{task_id}", mapping={
                         "task_id": task_id,
                         "status": "DeadLetter",
+                        "tenant_id": tenant_id,
                         "error": f"Failed after 3 retries.Last error: {str(e)} "}
                     )
                 else:
                     tasks.retry_count += 1
 
-                    # ── Decorrelated Jitter (AWS recommended) ───────────────────
+                    # Decorrelated Jitter
                     BASE      = 1.0
                     MAX_DELAY = 30.0
                     prev      = getattr(tasks, 'prev_delay', BASE)
@@ -334,6 +360,7 @@ async def handle_task(task_json, sem, loop, process_pool, thread_pool):
                     await r.hset(f"task:{task_id}", mapping={
                         "task_id": task_id,
                         "status": "RetryScheduled",
+                        "tenant_id": tenant_id,
                         "retry_count": tasks.retry_count,
                         "error": f"Error: {str(e)}. Scheduled for retry in {delay:.2f} seconds."
                     })

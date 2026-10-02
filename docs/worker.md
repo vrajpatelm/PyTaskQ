@@ -1,1 +1,0 @@
--- here the CPU bound task (Mtrix_multiplcation) and I/O Bound Task (send_email) is seprated and for thread and Process(which have ther own GLI for hevy tasks )

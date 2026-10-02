@@ -33,4 +33,7 @@ desktop.ini
 *.swp
 .agents
 
+
+# Redis dump / benchmark artifacts
+dump.rdb
 result.json
