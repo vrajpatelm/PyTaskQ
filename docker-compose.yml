@@ -21,6 +21,11 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
+    deploy:
+      resources:
+        limits:
+          cpus: "0.4"      # Redis is fast; cap at 0.4 cores
+          memory: 512M
 
   jaeger:
     image: jaegertracing/all-in-one:latest
@@ -31,6 +36,11 @@ services:
       - SPAN_STORAGE_TYPE=memory
       - MEMORY_MAX_TRACES=5000 # Keep only last 5000 traces, limits RAM usage
     restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "0.1"      # Jaeger is observability-only; minimal CPU
+          memory: 256M
 
   web:
     build:
@@ -58,6 +68,11 @@ services:
       retries: 3
       start_period: 10s
     restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "0.9"      # Web API gets nearly 1 full core for handling requests
+          memory: 512M
     logging:
       driver: "json-file"
       options:
@@ -82,6 +97,11 @@ services:
     # Reason: If the worker crashes (OOM from a bad task, unhandled exception, etc.)
     # it will automatically restart instead of silently dying.
     restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "0.8"      # Worker gets 0.8 cores for task execution
+          memory: 768M     # Extra RAM for CPU-heavy tasks like matrix_multiply
     logging:
       driver: "json-file"
       options:

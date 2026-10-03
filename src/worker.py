@@ -32,6 +32,16 @@ WORKER_ID=str(uuid.uuid4())
 # and 10 wedged tasks deadlock the whole worker. 0 disables the limit.
 TASK_TIMEOUT = float(os.getenv("TASK_TIMEOUT", "300"))  # seconds (default: 5 min)
 
+# How many CPU cores to RESERVE for the web server and OS.
+# On a shared box (web + worker together): set to 1 (default)
+# On a DEDICATED worker machine:            set to 0
+# Override via environment variable in docker-compose.yml
+_TOTAL_CORES   = os.cpu_count() or 1
+_RESERVED_CORES = int(os.getenv("WORKER_RESERVED_CORES", "1"))
+CPU_WORKERS    = max(1, _TOTAL_CORES - _RESERVED_CORES)
+IO_WORKERS     = max(4, _TOTAL_CORES * 4)   # Threads: cheap, scale more aggressively
+CONCURRENCY    = CPU_WORKERS + IO_WORKERS    # Total semaphore slots
+
 class TaskTimeoutError(Exception):
     """Raised when a task exceeds TASK_TIMEOUT. Treated as a retryable failure."""
     
@@ -113,10 +123,18 @@ async def zombie_sweeper():
         await asyncio.sleep(15)
 
 async def consumer_task():
-    process_pool = ProcessPoolExecutor(max_workers=4)
-    thread_pool = ThreadPoolExecutor(max_workers=10)
+    # Dynamically computed at startup based on os.cpu_count() and WORKER_RESERVED_CORES env var.
+    # Shared box (web+worker together): CPU_WORKERS = max(1, cores - 1)
+    # Dedicated worker machine:          CPU_WORKERS = max(1, cores - 0) = all cores
+    logger.info(
+        f"[Pool] Detected {_TOTAL_CORES} CPU cores. "
+        f"Reserved={_RESERVED_CORES}, CPU workers={CPU_WORKERS}, "
+        f"IO threads={IO_WORKERS}, Semaphore={CONCURRENCY}"
+    )
+    process_pool = ProcessPoolExecutor(max_workers=CPU_WORKERS)
+    thread_pool  = ThreadPoolExecutor(max_workers=IO_WORKERS)
     loop = asyncio.get_running_loop()
-    sem = asyncio.Semaphore(10)  # Limit concurrent tasks to 10
+    sem  = asyncio.Semaphore(CONCURRENCY)
     # for tasks that were being processed when the worker crashed, move them back to the main queue for reprocessing
     def _signal_handler():
         logger.info("Shutdown signal received. Cleaning up...")
