@@ -52,9 +52,15 @@ MASTER_KEY = os.getenv("MASTER_KEY", "")
 RATE_LIMIT_PER_MINUTE = int(os.getenv("RATE_LIMIT_PER_MINUTE", "100"))
 
 # ── Idempotency Configuration ────────────────────────────────────────────────
-# Layer 1: Client sends an Idempotency-Key header -> cached 24h
-# Layer 2: No header -> content-hash blocks identical requests for 5 seconds
+# Layer 1: Client sends an Idempotency-Key (header or body) -> cached 24h
+# Layer 2: No key -> content-hash blocks identical requests for 5 seconds
+#
+# PENDING_TTL applies while a request is in flight (claimed, not yet
+# finalized). It only needs to cover the gap between claim and enqueue; if the
+# process crashes in that gap, the tombstone expires and the client's next
+# retry is accepted as fresh instead of being locked out for a full day.
 IDEMPOTENCY_TTL = int(os.getenv("IDEMPOTENCY_TTL", 86400))
+IDEMPOTENCY_PENDING_TTL = int(os.getenv("IDEMPOTENCY_PENDING_TTL", 30))
 DEDUP_TTL = int(os.getenv("DEDUP_TTL", 5))
 
 # ── App & Redis Initialization ───────────────────────────────────────────────
@@ -173,6 +179,11 @@ async def _incr_rate_limit(tenant_id: str) -> None:
         await r.expire(key, 60)
 
 
+def _resolve_idempotency_key(req: Request, body: TaskRequest) -> str | None:
+    """Single source of truth for the key: HTTP header OR body.idempotency_key."""
+    return req.headers.get("idempotency-key") or body.idempotency_key
+
+
 async def check_idempotency(req: Request, body: TaskRequest, tenant_id: str) -> JSONResponse | None:
     """
     Check if this request is a duplicate.
@@ -184,10 +195,14 @@ async def check_idempotency(req: Request, body: TaskRequest, tenant_id: str) -> 
     """
     # ── Layer 1: Explicit Idempotency Key ─────────────────────────────────
     # Accept key from HTTP header OR from the JSON body field (body.idempotency_key)
-    idempotency_key = req.headers.get("idempotency-key") or body.idempotency_key
+    idempotency_key = _resolve_idempotency_key(req, body)
     if idempotency_key:
         redis_key = f"idempotency:{tenant_id}:{idempotency_key}"
-        claimed = await r.set(redis_key, "pending", nx=True, ex=IDEMPOTENCY_TTL)
+        # Claim with a SHORT TTL (pending state). NX + expiry gives us free
+        # reclaim: if we crash before finalizing, the claim lapses and the
+        # client's next retry is treated as fresh instead of seeing a
+        # permanent 409.
+        claimed = await r.set(redis_key, "pending", nx=True, ex=IDEMPOTENCY_PENDING_TTL)
         if claimed:
             return None  # Fresh request
 
@@ -195,9 +210,12 @@ async def check_idempotency(req: Request, body: TaskRequest, tenant_id: str) -> 
         if cached and cached != "pending":
             return JSONResponse(content=json.loads(cached))
 
+        # In-flight duplicate: the original request is still being processed.
+        # This clears by itself when the pending claim expires.
         raise HTTPException(
             status_code=409,
             detail="A request with this Idempotency-Key is already being processed.",
+            headers={"Retry-After": str(IDEMPOTENCY_PENDING_TTL)},
         )
 
     # ── Layer 2: Content-Hash Safety Net ──────────────────────────────────
@@ -214,9 +232,14 @@ async def check_idempotency(req: Request, body: TaskRequest, tenant_id: str) -> 
     return None  # Fresh request
 
 
-async def store_idempotency_response(req: Request, response_data: dict, tenant_id: str):
-    """After a successful enqueue, cache the response under the idempotency key."""
-    idempotency_key = req.headers.get("idempotency-key")
+async def store_idempotency_response(idempotency_key: str | None, response_data: dict, tenant_id: str):
+    """Finalize a claimed idempotency key with the cached response.
+
+    Takes the *resolved* key (header or body) — reading only the header here
+    meant body-supplied keys were never finalized and stayed "pending" until
+    their TTL lapsed. Overwriting also resets the key's TTL to the full
+    IDEMPOTENCY_TTL.
+    """
     if idempotency_key:
         redis_key = f"idempotency:{tenant_id}:{idempotency_key}"
         await r.set(redis_key, json.dumps(response_data), ex=IDEMPOTENCY_TTL)
@@ -286,7 +309,7 @@ async def enqueue_task(request: TaskRequest, req: Request, tenant_id: str = Depe
         logger.info(f"Enqueued task: {request.task_name} ID={task_id}")
 
     response = {"task_id": task_id, "status": "queued"}
-    await store_idempotency_response(req, response, tenant_id)
+    await store_idempotency_response(_resolve_idempotency_key(req, request), response, tenant_id)
     return response
 
 
@@ -352,7 +375,7 @@ async def schedule_task(
         logger.info(f"Scheduled task {request.task_name} ID={task_id} in {delay_seconds}s")
 
     response = {"task_id": task_id, "status": "scheduled", "execute_in_seconds": delay_seconds}
-    await store_idempotency_response(req, response, tenant_id)
+    await store_idempotency_response(_resolve_idempotency_key(req, request), response, tenant_id)
     return response
 
 
@@ -533,6 +556,17 @@ async def replay_task(task_id: str, tenant_id: str = Depends(authenticate)):
         raise HTTPException(status_code=404, detail="Task for particular id is not found")
 
     matched_dict["retry_count"] = 0
+
+    # Re-sync the fence token with Redis. The timeout path in worker.py
+    # increments fence:{task_id} WITHOUT updating the DLQ payload, so a
+    # replayed task would run with a stale token and its result write would
+    # be silently discarded by FENCE_SCRIPT (status stays DeadLetter).
+    # Aligning the payload with the current value keeps the fence valid for
+    # this replay while still rejecting any older, orphaned execution.
+    current_fence = await r.get(f"fence:{task_id}")
+    if current_fence is not None:
+        matched_dict["fence_token"] = int(current_fence)
+
     await r.lrem(dlq_key, 1, matched_item)
     await r.rpush(f"queue:{matched_dict.get('priority', 'default')}", json.dumps(matched_dict))
     await r.incr(f"stats:pending:{tenant_id}")

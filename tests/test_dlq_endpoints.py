@@ -414,3 +414,65 @@ async def test_purge_all_on_empty_dlq_succeeds(test_client):
     response = await client.post("/dlq/purge_all", headers=AUTH_HEADERS)
     assert response.status_code == 200
     assert await r.llen(f"dlq:{TEST_TENANT_ID}") == 0
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TEST GROUP 6:  Fence-token re-sync on replay
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@pytest.mark.asyncio
+async def test_replay_resyncs_stale_fence_token(test_client):
+    """
+    SCENARIO: The task died on the worker's timeout path, which bumped
+              fence:{task_id} in Redis WITHOUT updating the DLQ payload.
+    EXPECT:   The replayed payload carries the CURRENT fence token, so the
+              worker's FENCE_SCRIPT accepts its result.
+
+    WHY: A stale token makes replay a silent no-op: the task executes, the
+         result write fails the fence check and is discarded, and the status
+         stays DeadLetter with no error anywhere.
+    """
+    client, r = test_client
+
+    task_id = "fence-replay-001"
+    payload = json.loads(make_dlq_task(task_id))
+    payload["fence_token"] = 1          # token the task was originally given
+    await r.lpush(f"dlq:{TEST_TENANT_ID}", json.dumps(payload))
+    await r.set(f"fence:{task_id}", 2)  # timeout path bumped Redis to 2
+
+    response = await client.post(f"/dlq/replay/{task_id}", headers=AUTH_HEADERS)
+    assert response.status_code == 200
+
+    raw = await r.lindex("queue:default", 0)
+    assert raw is not None, "replayed task was not pushed to queue:default"
+    replayed = json.loads(raw)
+    assert replayed["fence_token"] == 2, (
+        "Replayed task kept a stale fence token — its result would be "
+        "discarded by FENCE_SCRIPT and the replay would be a silent no-op"
+    )
+    assert replayed["retry_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_replay_without_fence_key_is_unchanged(test_client):
+    """
+    SCENARIO: No fence:{task_id} key exists in Redis (it expired or was never
+              written — e.g. the task failed on a normal exception path).
+    EXPECT:   Replay still works and does not invent a token; FENCE_SCRIPT's
+              "current == false" branch accepts the write.
+
+    WHY: The re-sync must not break replays that were already fine.
+    """
+    client, r = test_client
+
+    task_id = "fence-replay-002"
+    payload = json.loads(make_dlq_task(task_id))
+    payload["fence_token"] = 0
+    await r.lpush(f"dlq:{TEST_TENANT_ID}", json.dumps(payload))
+
+    response = await client.post(f"/dlq/replay/{task_id}", headers=AUTH_HEADERS)
+    assert response.status_code == 200
+
+    raw = await r.lindex("queue:default", 0)
+    replayed = json.loads(raw)
+    assert replayed["fence_token"] == 0

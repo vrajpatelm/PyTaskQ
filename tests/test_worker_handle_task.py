@@ -207,9 +207,12 @@ async def test_retry_uses_decorrelated_jitter_delay(r, sem, thread_pool):
             f"got {actual_delay:.2f}s"
         )
 
-        # prev_delay must be persisted on the stored payload for the NEXT retry
+        # prev_delay must be persisted on the stored payload for the NEXT retry.
+        # Tolerance is 50ms, not 10ms: time.time() on Windows has ~15.6ms
+        # granularity, so the two wall-clock reads can legitimately differ by
+        # up to two ticks. 10ms made this test flake intermittently.
         stored = json.loads(entries[0][0])
-        assert stored["prev_delay"] == pytest.approx(actual_delay, abs=0.01)
+        assert stored["prev_delay"] == pytest.approx(actual_delay, abs=0.05)
         assert stored["retry_count"] == retry_count + 1
 
 

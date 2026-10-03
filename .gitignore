@@ -37,3 +37,5 @@ desktop.ini
 # Redis dump / benchmark artifacts
 dump.rdb
 result.json
+# Bottleneck-capture run output (tests/load/server_bottleneck_capture.sh)
+tests/load/reports/

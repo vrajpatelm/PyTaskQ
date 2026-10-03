@@ -261,6 +261,9 @@ async def handle_task(task_json, sem, loop, process_pool, thread_pool):
                         # whenever the orphaned handler eventually finishes, its result
                         # write fails the fence check and is discarded.
                         await r.incr(f"fence:{task_id}")
+                        # Bound this key's lifetime like the sweeper does —
+                        # without a TTL one fence key leaks per timed-out task.
+                        await r.expire(f"fence:{task_id}", 86400)
                         raise TaskTimeoutError(
                             f"Task exceeded {TASK_TIMEOUT}s limit (execution abandoned; "
                             f"late result will be discarded by fence check)"

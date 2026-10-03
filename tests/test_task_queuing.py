@@ -298,6 +298,109 @@ async def test_result_endpoint_enforces_tenant_isolation(test_client):
     assert resp_foreign.status_code == 403
     resp_orphan = await client.get("/task/no-tenant-task", headers=AUTH_HEADERS)
     assert resp_orphan.status_code == 403
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TEST GROUP 7: Idempotency-key lifecycle (header AND body keys)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@pytest.mark.asyncio
+async def test_body_idempotency_key_response_is_cached(test_client):
+    """
+    SCENARIO: Client sends the idempotency key in the BODY (not the header),
+              then retries the identical request.
+    EXPECT:   The retry returns the cached first response (same task_id) —
+              a 200, NOT a 409.
+
+    WHY: store_idempotency_response used to read ONLY the header, so
+         body-supplied keys were never finalized: the claim stayed "pending"
+         and every retry was 409 until the TTL lapsed a day later.
+    """
+    client, r = test_client
+
+    payload = {
+        "task_name": "matrix_multiply",
+        "args": [11],
+        "idempotency_key": "body-key-001",
+    }
+    first = await client.post("/task/enqueue", json=payload, headers=AUTH_HEADERS)
+    assert first.status_code == 200
+
+    second = await client.post("/task/enqueue", json=payload, headers=AUTH_HEADERS)
+    assert second.status_code == 200, (
+        "body-key retry was not finalized — client is stuck seeing 409"
+    )
+    assert second.json()["task_id"] == first.json()["task_id"]
+    assert await r.llen("queue:default") == 1, "retry must NOT enqueue a second task"
+
+
+@pytest.mark.asyncio
+async def test_header_idempotency_key_response_is_cached(test_client):
+    """
+    SCENARIO: Same as above, but the key arrives in the Idempotency-Key header.
+    EXPECT:   Retry returns the cached response; only one task is enqueued.
+
+    WHY: Guards the header path against regressions while the body path was fixed.
+    """
+    client, r = test_client
+
+    payload = {"task_name": "matrix_multiply", "args": [12]}
+    headers = {**AUTH_HEADERS, "Idempotency-Key": "header-key-001"}
+
+    first = await client.post("/task/enqueue", json=payload, headers=headers)
+    assert first.status_code == 200
+
+    second = await client.post("/task/enqueue", json=payload, headers=headers)
+    assert second.status_code == 200
+    assert second.json()["task_id"] == first.json()["task_id"]
+    assert await r.llen("queue:default") == 1
+
+
+@pytest.mark.asyncio
+async def test_stale_pending_claim_is_short_lived_and_reclaimable(test_client, monkeypatch):
+    """
+    SCENARIO: The process dies between claiming the key and finalizing it, so
+              the claim is left as "pending" in Redis.
+    EXPECT:   1) the pending claim has a SHORT ttl (not the full 24h response ttl)
+              2) an immediate retry gets 409 + Retry-After
+              3) once the claim lapses, the next retry is accepted as fresh.
+
+    WHY: A long-lived pending tombstone turns a crash into a permanent 409
+         for that key. Short TTL + NX gives free reclaim.
+    """
+    import app
+    client, r = test_client
+
+    # Simulate "crash before finalize": the claim is made but never completed.
+    async def never_finalized(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(app, "store_idempotency_response", never_finalized)
+
+    payload = {
+        "task_name": "matrix_multiply",
+        "args": [13],
+        "idempotency_key": "crash-key-001",
+    }
+    first = await client.post("/task/enqueue", json=payload, headers=AUTH_HEADERS)
+    assert first.status_code == 200
+
+    key = f"idempotency:{TEST_TENANT_ID}:crash-key-001"
+    assert await r.get(key) == "pending"
+    ttl = await r.ttl(key)
+    assert 0 < ttl <= app.IDEMPOTENCY_PENDING_TTL, (
+        f"pending claim ttl is {ttl}s — must be short, not the response TTL"
+    )
+
+    # While still pending, a duplicate is rejected with a Retry-After hint.
+    second = await client.post("/task/enqueue", json=payload, headers=AUTH_HEADERS)
+    assert second.status_code == 409
+    assert second.headers.get("retry-after") == str(app.IDEMPOTENCY_PENDING_TTL)
+
+    # The claim lapses (TTL expiry) → the same key can be claimed again.
+    await r.delete(key)
+    third = await client.post("/task/enqueue", json=payload, headers=AUTH_HEADERS)
+    assert third.status_code == 200, "lapsed claim must be reclaimable, not a dead end"
 """
     Test file written.
 """
