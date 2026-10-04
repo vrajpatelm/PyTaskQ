@@ -32,14 +32,12 @@ WORKER_ID=str(uuid.uuid4())
 # and 10 wedged tasks deadlock the whole worker. 0 disables the limit.
 TASK_TIMEOUT = float(os.getenv("TASK_TIMEOUT", "300"))  # seconds (default: 5 min)
 
-# How many CPU cores to RESERVE for the web server and OS.
-# On a shared box (web + worker together): set to 1 (default)
-# On a DEDICATED worker machine:            set to 0
+
 # Override via environment variable in docker-compose.yml
 _TOTAL_CORES   = os.cpu_count() or 1
 _RESERVED_CORES = int(os.getenv("WORKER_RESERVED_CORES", "1"))
 CPU_WORKERS    = max(1, _TOTAL_CORES - _RESERVED_CORES)
-IO_WORKERS     = max(4, _TOTAL_CORES * 4)   # Threads: cheap, scale more aggressively
+IO_WORKERS     = max(4, _TOTAL_CORES * 4)   
 CONCURRENCY    = CPU_WORKERS + IO_WORKERS    # Total semaphore slots
 
 class TaskTimeoutError(Exception):

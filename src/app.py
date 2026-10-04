@@ -303,13 +303,24 @@ async def enqueue_task(request: TaskRequest, req: Request, tenant_id: str = Depe
             "client_ip": client_ip,
             "trace_carrier": trace_carrier,
         }
-        await r.lpush(f"queue:{request.priority}", json.dumps(tasks))
-        await r.incr(f"stats:pending:{tenant_id}")
+        
+        response = {"task_id": task_id, "status": "queued"}
+        idem_key = _resolve_idempotency_key(req, request)
+        redis_idem_key = f"idempotency:{tenant_id}:{idem_key}" if idem_key else None
+
+        # ── Atomicity Guarantee (MULTI/EXEC) ─────────────────────────────────
+        # Use a transaction pipeline so either ALL of this happens, or NONE of it.
+        # This prevents the queue and the stats from getting out of sync if the server crashes.
+        async with r.pipeline(transaction=True) as pipe:
+            pipe.lpush(f"queue:{request.priority}", json.dumps(tasks))
+            pipe.incr(f"stats:pending:{tenant_id}")
+            if redis_idem_key:
+                pipe.set(redis_idem_key, json.dumps(response), ex=IDEMPOTENCY_TTL)
+            await pipe.execute()
+
         await _notify_tenant(tenant_id, "task_enqueued")
         logger.info(f"Enqueued task: {request.task_name} ID={task_id}")
 
-    response = {"task_id": task_id, "status": "queued"}
-    await store_idempotency_response(_resolve_idempotency_key(req, request), response, tenant_id)
     return response
 
 
@@ -369,13 +380,21 @@ async def schedule_task(
         }
         execute_at = time.time() + delay_seconds
 
-        await r.zadd("delayed_tasks", {json.dumps(tasks): execute_at})
-        await r.incr(f"stats:delayed:{tenant_id}")
+        response = {"task_id": task_id, "status": "scheduled", "execute_in_seconds": delay_seconds}
+        idem_key = _resolve_idempotency_key(req, request)
+        redis_idem_key = f"idempotency:{tenant_id}:{idem_key}" if idem_key else None
+
+        # ── Atomicity Guarantee (MULTI/EXEC) ─────────────────────────────────
+        async with r.pipeline(transaction=True) as pipe:
+            pipe.zadd("delayed_tasks", {json.dumps(tasks): execute_at})
+            pipe.incr(f"stats:delayed:{tenant_id}")
+            if redis_idem_key:
+                pipe.set(redis_idem_key, json.dumps(response), ex=IDEMPOTENCY_TTL)
+            await pipe.execute()
+
         await _notify_tenant(tenant_id, "task_scheduled")
         logger.info(f"Scheduled task {request.task_name} ID={task_id} in {delay_seconds}s")
 
-    response = {"task_id": task_id, "status": "scheduled", "execute_in_seconds": delay_seconds}
-    await store_idempotency_response(_resolve_idempotency_key(req, request), response, tenant_id)
     return response
 
 
