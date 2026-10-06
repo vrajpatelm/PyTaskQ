@@ -63,6 +63,17 @@ else
 end
 """
 
+REQUEUE_SCRIPT = """
+local removed = redis.call('ZREM', KEYS[1], ARGV[1])
+if removed > 0 then
+    redis.call('LPUSH', KEYS[2], ARGV[1])
+    redis.call('DECR', KEYS[3])
+    redis.call('INCR', KEYS[4])
+    return 1
+end
+return 0
+"""
+
 # ── Leader Election ────────────────────────────────────────────────────────── 
 # If the leader crashes, the lock expires in 20s and another worker takes over.
 
@@ -100,19 +111,26 @@ async def retry_scheduler():
             if i > 0 and i % 100 == 0:
                 await redis_client.r.expire("pytaskq:leader_lock", 20)
                 
-            removed = await redis_client.r.zrem("delayed_tasks", task_json)
-            if removed:  
+            try:
                 task_data = json.loads(task_json)
                 tenant_id = task_data.get('tenant_id', 'unknown')
+                priority = task_data.get('priority', 'default')
                 
-                # Atomic re-queue
-                async with redis_client.r.pipeline(transaction=True) as pipe:
-                    pipe.lpush(f"queue:{task_data.get('priority', 'default')}", task_json)
-                    pipe.decr(f"stats:delayed:{tenant_id}")
-                    pipe.incr(f"stats:pending:{tenant_id}")
-                    await pipe.execute()
-                logger.info(f"[Retry Scheduler] Re-queued task {task_data.get('task_id')} "
-                      f"(retry #{task_data.get('retry_count')})")
+                requeued = await redis_client.r.eval(
+                    REQUEUE_SCRIPT,
+                    4,
+                    "delayed_tasks",
+                    f"queue:{priority}",
+                    f"stats:delayed:{tenant_id}",
+                    f"stats:pending:{tenant_id}",
+                    task_json
+                )
+                
+                if requeued:
+                    logger.info(f"[Retry Scheduler] Re-queued task {task_data.get('task_id')} "
+                          f"(retry #{task_data.get('retry_count')})")
+            except Exception as e:
+                logger.error(f"[Retry Scheduler] Error processing task: {e}")
         
         await asyncio.sleep(1)  
 
@@ -136,10 +154,12 @@ async def zombie_sweeper():
             for worker_id in expired:
                 tasks_recovered = 0
                 while True:
-                    task = await redis_client.r.rpop(f"processing_queue:{worker_id}")
-                    if not task:
+                    # Read the last element without removing it (safe because worker is dead)
+                    tasks = await redis_client.r.lrange(f"processing_queue:{worker_id}", -1, -1)
+                    if not tasks:
                         break  # No more tasks for this dead worker
                     
+                    task = tasks[0]
                     # If this dead worker had a massive backlog, renew lock every 100 tasks
                     if tasks_recovered > 0 and tasks_recovered % 100 == 0:
                         await redis_client.r.expire("pytaskq:leader_lock", 20)
@@ -150,8 +170,9 @@ async def zombie_sweeper():
                     # Part B: write the NEW token to Redis so old workers know they are stale
                     tenant_id = task_data.get('tenant_id', 'unknown')
                     
-                    # Atomic recovery
+                    # Atomic recovery: remove original task string and push updated one
                     async with redis_client.r.pipeline(transaction=True) as pipe:
+                        pipe.lrem(f"processing_queue:{worker_id}", count=1, value=task)
                         pipe.set(f"fence:{task_id}", task_data["fence_token"], ex=86400)
                         pipe.lpush("queue:high", json.dumps(task_data))
                         pipe.incr(f"stats:pending:{tenant_id}")
@@ -440,13 +461,17 @@ async def handle_task(task_json, sem, loop, process_pool, thread_pool):
                         await pipe.execute()
             
     finally:
-        # Atomic cleanup
-        async with redis_client.r.pipeline(transaction=True) as pipe:
-            pipe.lrem(f"processing_queue:{WORKER_ID}", count=1, value=task_json)
-            if incr_done:  # Only DECR if we actually INCRed
-                pipe.decr(f"stats:processing:{tenant_id}")
-            await pipe.execute()
-        sem.release()
+        try:
+            # Atomic cleanup
+            async with redis_client.r.pipeline(transaction=True) as pipe:
+                pipe.lrem(f"processing_queue:{WORKER_ID}", count=1, value=task_json)
+                if incr_done:  # Only DECR if we actually INCRed
+                    pipe.decr(f"stats:processing:{tenant_id}")
+                await pipe.execute()
+        except Exception as e:
+            logger.error(f"[Cleanup] Redis error during cleanup: {e}")
+        finally:
+            sem.release()
 
 #Start the event loop
 if __name__ == "__main__":

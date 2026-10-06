@@ -37,6 +37,9 @@ app.add_exception_handler(RedisConnectionError, redis_connection_error_handler)
 
 @app.on_event("shutdown")
 async def shutdown_event():
+    from src.core import redis_client
+    await redis_client.r.aclose()
+    
     from opentelemetry import trace
     provider = trace.get_tracer_provider()
     if hasattr(provider, "force_flush"):
