@@ -60,10 +60,12 @@ async def test_client(fake_redis_for_app, monkeypatch):
 
     monkeypatch replaces app.r at test time and auto-restores it afterwards.
     """
-    import app
-    monkeypatch.setattr(app, "r", fake_redis_for_app)
+    import main as app
+    import src.core.redis_client
+    monkeypatch.setattr(src.core.redis_client, "r", fake_redis_for_app)
     # Monkeypatch get_client_ip to return a known, stable IP for tests
-    monkeypatch.setattr(app, "get_client_ip", lambda req: TEST_CLIENT_IP)
+    import src.core.dependencies
+    monkeypatch.setattr(src.core.dependencies, "get_client_ip", lambda req: TEST_CLIENT_IP)
 
     # Seed a real API key so app.authenticate's Redis lookup works
     await fake_redis_for_app.hset(f"api_key:{TEST_API_KEY}", mapping={

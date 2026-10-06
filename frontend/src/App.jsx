@@ -1,20 +1,20 @@
 import { useState, useEffect, useRef } from 'react'
-import { Send, Search, AlertOctagon, Inbox, Activity, Clock, AlertTriangle, CheckCircle, XCircle, RotateCcw, Trash2, Zap, BarChart2, Copy, Eye, EyeOff } from 'lucide-react'
+import { Send, Search, AlertOctagon, Inbox, Activity, Clock, AlertTriangle, CheckCircle, XCircle, RotateCcw, Trash2, Zap, BarChart2, Copy, Eye, EyeOff, Moon, Sun } from 'lucide-react'
 
 const API_URL = import.meta.env.DEV ? 'http://localhost:8000' : '';
 
 const STATUS_COLORS = {
-  Success:        { bg: '#ecfdf5', color: '#065f46', border: '#34d399' },
-  Failed:         { bg: '#fef2f2', color: '#991b1b', border: '#f87171' },
-  DeadLetter:     { bg: '#fef2f2', color: '#991b1b', border: '#f87171' },
-  RetryScheduled: { bg: '#fffbeb', color: '#92400e', border: '#fbbf24' },
-  Processing:     { bg: '#eff6ff', color: '#1e40af', border: '#60a5fa' },
-  Pending:        { bg: '#f5f3ff', color: '#4c1d95', border: '#a78bfa' },
-  queued:         { bg: '#f5f3ff', color: '#4c1d95', border: '#a78bfa' },
+  Success:        { bg: 'var(--status-success-bg)', color: 'var(--status-success-text)', border: 'var(--status-success-border)' },
+  Failed:         { bg: 'var(--status-failed-bg)', color: 'var(--status-failed-text)', border: 'var(--status-failed-border)' },
+  DeadLetter:     { bg: 'var(--status-failed-bg)', color: 'var(--status-failed-text)', border: 'var(--status-failed-border)' },
+  RetryScheduled: { bg: 'var(--status-warning-bg)', color: 'var(--status-warning-text)', border: 'var(--status-warning-border)' },
+  Processing:     { bg: 'var(--status-processing-bg)', color: 'var(--status-processing-text)', border: 'var(--status-processing-border)' },
+  Pending:        { bg: 'var(--status-pending-bg)', color: 'var(--status-pending-text)', border: 'var(--status-pending-border)' },
+  queued:         { bg: 'var(--status-pending-bg)', color: 'var(--status-pending-text)', border: 'var(--status-pending-border)' },
 };
 
 function StatusBadge({ status }) {
-  const s = STATUS_COLORS[status] || { bg: '#f8fafc', color: '#475569', border: '#e2e8f0' };
+  const s = STATUS_COLORS[status] || { bg: 'var(--status-default-bg)', color: 'var(--status-default-text)', border: 'var(--status-default-border)' };
   return (
     <span style={{
       padding: '0.2rem 0.6rem', borderRadius: '999px', fontSize: '0.75rem',
@@ -35,7 +35,13 @@ function CopyButton({ text }) {
 }
 
 function App() {
+  const [theme, setTheme] = useState(localStorage.getItem('theme') || 'light');
   const [apiKey, setApiKey] = useState(sessionStorage.getItem('apiKey') || '');
+  
+  useEffect(() => {
+    document.documentElement.setAttribute('data-theme', theme);
+    localStorage.setItem('theme', theme);
+  }, [theme]);
   const [isAuthed, setIsAuthed] = useState(false);
   const [showKey, setShowKey] = useState(false);
   const [authError, setAuthError] = useState(null);
@@ -68,6 +74,7 @@ function App() {
   const [lookupId, setLookupId] = useState('');
   const [lookupResult, setLookupResult] = useState(null);
   const [dlqTasks, setDlqTasks] = useState([]);
+  const [workers, setWorkers] = useState([]);
 
   // ── WebSocket: real-time dashboard ──────────────────────────────────────
   // Instead of polling every 1s (3 HTTP requests/tick), we open ONE persistent
@@ -154,7 +161,15 @@ function App() {
     if (!isAuthed) return;
     fetch(`${API_URL}/webhooks/info`, { headers: { 'Authorization': `Bearer ${apiKey}` } })
       .then(r => r.json()).then(setWebhookInfo).catch(() => {});
-  }, [isAuthed]);
+      
+    const fetchWorkers = () => {
+      fetch(`${API_URL}/system/workers`, { headers: { 'Authorization': `Bearer ${apiKey}` } })
+        .then(r => r.json()).then(data => setWorkers(data.workers || [])).catch(() => {});
+    };
+    fetchWorkers();
+    const iv = setInterval(fetchWorkers, 5000);
+    return () => clearInterval(iv);
+  }, [isAuthed, apiKey]);
 
   const handleEnqueue = async (e) => {
     e.preventDefault();
@@ -224,6 +239,11 @@ function App() {
     catch (err) { console.error(err); }
   };
 
+  const handleRetryAll = async () => {
+    try { await fetch(`${API_URL}/dlq/retry_all`, { method: 'POST', headers: { 'Authorization': `Bearer ${apiKey}` } }); }
+    catch (err) { console.error(err); }
+  };
+
   if (!isAuthed) {
     return (
       <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', minHeight: '100vh', padding: '2rem' }}>
@@ -232,7 +252,7 @@ function App() {
           <h2 style={{ margin: '0 0 0.5rem' }}>PyTaskQ Dashboard</h2>
           <p style={{ color: 'var(--text-secondary)', marginBottom: '1.5rem' }}>Enter your API Key to access your tenant dashboard.</p>
           {authError && (
-            <div style={{ background: '#fef2f2', border: '1px solid #f87171', color: '#991b1b', padding: '0.75rem', borderRadius: '6px', marginBottom: '1rem', fontSize: '0.875rem', display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+            <div style={{ background: 'var(--status-failed-bg)', border: '1px solid var(--status-failed-border)', color: 'var(--status-failed-text)', padding: '0.75rem', borderRadius: '6px', marginBottom: '1rem', fontSize: '0.875rem', display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
               <AlertTriangle size={16} />{authError}
             </div>
           )}
@@ -269,26 +289,29 @@ function App() {
               <div style={{ fontSize: '0.75rem', color: 'var(--text-secondary)', fontWeight: 600, marginBottom: '0.3rem' }}>
                 Rate: <span style={{ color: rateColor, fontWeight: 700 }}>{rateUsed}</span> / {metrics.rate_limit_max} req/min
               </div>
-              <div style={{ height: '6px', background: '#e2e8f0', borderRadius: '999px', overflow: 'hidden' }}>
+              <div style={{ height: '6px', background: 'var(--border-color)', borderRadius: '999px', overflow: 'hidden' }}>
                 <div style={{ height: '100%', width: `${ratePct}%`, background: rateColor, borderRadius: '999px', transition: 'width 0.4s ease' }} />
               </div>
             </div>
+            <button onClick={() => setTheme(theme === 'light' ? 'dark' : 'light')} className="btn btn-secondary" style={{ padding: '0.5rem', display: 'flex', alignItems: 'center' }}>
+              {theme === 'light' ? <Moon size={16} /> : <Sun size={16} />}
+            </button>
             <button onClick={() => { setApiKey(''); sessionStorage.removeItem('apiKey'); setIsAuthed(false); }} className="btn btn-secondary" style={{ padding: '0.5rem 1rem' }}>Logout</button>
           </div>
         </div>
       </header>
 
-      <div style={{ background: 'white', border: '1px solid var(--border-color)', borderRadius: '8px', padding: '0.75rem 1.25rem', marginBottom: '1.5rem', display: 'flex', alignItems: 'center', gap: '1rem' }}>
+      <div style={{ background: 'var(--surface-color)', border: '1px solid var(--border-color)', borderRadius: '8px', padding: '0.75rem 1.25rem', marginBottom: '1.5rem', display: 'flex', alignItems: 'center', gap: '1rem' }}>
         <BarChart2 size={16} color="var(--text-secondary)" />
         <span style={{ fontSize: '0.8rem', fontWeight: 600, color: 'var(--text-secondary)', whiteSpace: 'nowrap' }}>Queue Health</span>
-        <div style={{ flex: 1, height: '8px', background: '#e2e8f0', borderRadius: '999px', overflow: 'hidden' }}>
+        <div style={{ flex: 1, height: '8px', background: 'var(--border-color)', borderRadius: '999px', overflow: 'hidden' }}>
           <div style={{ height: '100%', width: `${queuePct}%`, background: queueColor, borderRadius: '999px', transition: 'width 0.5s ease' }} />
         </div>
         <span style={{ fontSize: '0.8rem', fontWeight: 700, color: queueColor, whiteSpace: 'nowrap' }}>{metrics.queue_total} / {metrics.queue_capacity} tasks</span>
         <div style={{ display: 'flex', gap: '0.5rem', fontSize: '0.75rem' }}>
-          <span style={{ background: '#fef2f2', color: '#991b1b', padding: '0.15rem 0.5rem', borderRadius: '999px', fontWeight: 600 }}>H:{metrics.queue_high}</span>
-          <span style={{ background: '#eff6ff', color: '#1e40af', padding: '0.15rem 0.5rem', borderRadius: '999px', fontWeight: 600 }}>D:{metrics.queue_default}</span>
-          <span style={{ background: '#f0fdf4', color: '#065f46', padding: '0.15rem 0.5rem', borderRadius: '999px', fontWeight: 600 }}>L:{metrics.queue_low}</span>
+          <span style={{ background: 'var(--status-failed-bg)', color: 'var(--status-failed-text)', padding: '0.15rem 0.5rem', borderRadius: '999px', fontWeight: 600 }}>H:{metrics.queue_high}</span>
+          <span style={{ background: 'var(--status-processing-bg)', color: 'var(--status-processing-text)', padding: '0.15rem 0.5rem', borderRadius: '999px', fontWeight: 600 }}>D:{metrics.queue_default}</span>
+          <span style={{ background: 'var(--status-success-bg)', color: 'var(--status-success-text)', padding: '0.15rem 0.5rem', borderRadius: '999px', fontWeight: 600 }}>L:{metrics.queue_low}</span>
         </div>
       </div>
 
@@ -298,7 +321,7 @@ function App() {
         <div className="metric-box delayed"><div className="metric-title"><Clock size={16} /> Delayed</div><div className="metric-value" style={{ color: 'var(--warning-color)' }}>{metrics.delayed}</div></div>
         <div className="metric-box dlq"><div className="metric-title"><AlertTriangle size={16} /> Dead Letters</div><div className="metric-value" style={{ color: 'var(--danger-color)' }}>{metrics.dlq}</div></div>
         <div className="metric-box"><div className="metric-title"><CheckCircle size={16} /> Completed</div><div className="metric-value" style={{ color: 'var(--success-color)' }}>{metrics.completed_total}</div></div>
-        <div className="metric-box"><div className="metric-title"><XCircle size={16} /> Failed</div><div className="metric-value" style={{ color: 'var(--danger-color)' }}>{metrics.failed_total}</div></div>
+        <div className="metric-box"><div className="metric-title"><Activity size={16} /> Workers</div><div className="metric-value" style={{ color: 'var(--accent-color)' }}>{metrics.worker_count || workers.length}</div></div>
       </div>
 
       <div className="dashboard-grid">
@@ -308,7 +331,7 @@ function App() {
             <form onSubmit={handleEnqueue}>
               <div className="form-group">
                 <label>Select Task Type</label>
-                <select value={taskName} onChange={(e) => setTaskName(e.target.value)} style={{ padding: '0.75rem', borderRadius: '6px', border: '1px solid var(--border-color)', fontSize: '1rem', backgroundColor: 'white' }}>
+                <select value={taskName} onChange={(e) => setTaskName(e.target.value)} style={{ padding: '0.75rem', borderRadius: '6px', border: '1px solid var(--border-color)', fontSize: '1rem', backgroundColor: 'var(--surface-color)', color: 'var(--text-primary)' }}>
                   <option value="matrix_multiply">Matrix Multiplication (CPU)</option>
                   <option value="url_health_check">URL Health Check (I/O)</option>
                   <option value="generate_csv_report">Generate CSV Report (CPU)</option>
@@ -335,7 +358,7 @@ function App() {
               <h2><Activity size={20} style={{ color: 'var(--success-color)' }} /> Live Task Feed</h2>
               <div style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem' }}>
                 {recentTasks.map((t) => (
-                  <div key={t.task_id} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '0.75rem', background: '#f8fafc', borderRadius: '8px', border: '1px solid var(--border-color)' }}>
+                  <div key={t.task_id} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '0.75rem', background: 'var(--task-bg)', borderRadius: '8px', border: '1px solid var(--border-color)' }}>
                     <div>
                       <div style={{ fontWeight: 600, fontSize: '0.875rem' }}>{t.task_name}</div>
                       <div style={{ fontFamily: 'monospace', fontSize: '0.7rem', color: 'var(--text-secondary)', marginTop: '0.2rem' }}>{t.task_id}</div>
@@ -357,8 +380,27 @@ function App() {
               <button type="submit" className="btn btn-secondary">Search</button>
             </form>
             {lookupResult && (
-              <div style={{ marginTop: '1rem', padding: '1rem', background: '#1e293b', color: '#f8fafc', borderRadius: '6px', fontFamily: 'monospace', fontSize: '0.85rem', overflowX: 'auto', whiteSpace: 'pre-wrap' }}>
+              <div style={{ marginTop: '1rem', padding: '1rem', background: 'var(--code-bg)', color: 'var(--code-text)', borderRadius: '6px', fontFamily: 'monospace', fontSize: '0.85rem', overflowX: 'auto', whiteSpace: 'pre-wrap' }}>
                 {Object.keys(lookupResult).length === 0 ? 'Task not found or expired.' : JSON.stringify(lookupResult, null, 2)}
+              </div>
+            )}
+          </div>
+          
+          <div className="card" style={{ marginTop: '2rem' }}>
+            <h2><Activity size={20} style={{ color: 'var(--accent-color)' }} /> Worker Health</h2>
+            {workers.length === 0 ? (
+              <p style={{ color: 'var(--text-secondary)' }}>No active workers found. Is the worker process running?</p>
+            ) : (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem' }}>
+                {workers.map(w => (
+                  <div key={w.worker_id} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '0.75rem', background: 'var(--task-bg)', borderRadius: '8px', border: '1px solid var(--border-color)' }}>
+                    <div style={{ fontFamily: 'monospace', fontSize: '0.8rem', fontWeight: 600 }}>{w.worker_id}</div>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '1rem' }}>
+                      <span style={{ fontSize: '0.75rem', color: 'var(--text-secondary)' }}>Heartbeat: {w.last_heartbeat_seconds_ago}s ago</span>
+                      <StatusBadge status={w.status === 'healthy' ? 'Success' : 'Failed'} />
+                    </div>
+                  </div>
+                ))}
               </div>
             )}
           </div>
@@ -369,19 +411,19 @@ function App() {
             <h2 style={{ color: '#7c3aed' }}>🔗 Webhook Manager</h2>
             {webhookInfo?.registered ? (
               <div>
-                <div style={{ background: '#f0fdf4', border: '1px solid #86efac', borderRadius: '8px', padding: '1rem', marginBottom: '1rem' }}>
-                  <div style={{ fontSize: '0.75rem', fontWeight: 700, color: '#166534', marginBottom: '0.5rem' }}>✓ WEBHOOK REGISTERED</div>
-                  <div style={{ fontSize: '0.875rem', color: '#166534', wordBreak: 'break-all' }}>{webhookInfo.url}</div>
+                <div style={{ background: 'var(--status-success-bg)', border: '1px solid var(--status-success-border)', borderRadius: '8px', padding: '1rem', marginBottom: '1rem' }}>
+                  <div style={{ fontSize: '0.75rem', fontWeight: 700, color: 'var(--status-success-text)', marginBottom: '0.5rem' }}>✓ WEBHOOK REGISTERED</div>
+                  <div style={{ fontSize: '0.875rem', color: 'var(--status-success-text)', wordBreak: 'break-all' }}>{webhookInfo.url}</div>
                 </div>
-                <div style={{ background: '#1e293b', borderRadius: '8px', padding: '1rem' }}>
+                <div style={{ background: 'var(--code-bg)', borderRadius: '8px', padding: '1rem' }}>
                   <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.5rem' }}>
-                    <span style={{ fontSize: '0.75rem', fontWeight: 700, color: '#94a3b8' }}>HMAC SECRET — keep private!</span>
+                    <span style={{ fontSize: '0.75rem', fontWeight: 700, color: 'var(--text-secondary)' }}>HMAC SECRET — keep private!</span>
                     <div style={{ display: 'flex', gap: '0.5rem' }}>
                       <button className="btn btn-secondary" style={{ padding: '0.2rem 0.6rem', fontSize: '0.7rem' }} onClick={() => setShowSecret(!showSecret)}>{showSecret ? <EyeOff size={12} /> : <Eye size={12} />}</button>
                       <CopyButton text={webhookInfo.secret} />
                     </div>
                   </div>
-                  <code style={{ fontSize: '0.75rem', color: '#e2e8f0', wordBreak: 'break-all', display: 'block' }}>
+                  <code style={{ fontSize: '0.75rem', color: 'var(--code-text)', wordBreak: 'break-all', display: 'block' }}>
                     {showSecret ? webhookInfo.secret : '•'.repeat(64)}
                   </code>
                 </div>
@@ -409,7 +451,12 @@ function App() {
           <div className="card" style={{ flex: 1 }}>
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1.5rem' }}>
               <h2 style={{ color: 'var(--danger-color)', margin: 0, display: 'flex', alignItems: 'center', gap: '0.5rem' }}><AlertOctagon size={20} /> Dead Letter Queue</h2>
-              {dlqTasks.length > 0 && (<button onClick={() => fetch(`${API_URL}/dlq/purge_all`, { method: 'POST', headers: { 'Authorization': `Bearer ${apiKey}` } })} className="btn btn-danger" style={{ padding: '0.5rem 1rem', fontSize: '0.875rem' }}>Purge All</button>)}
+              {dlqTasks.length > 0 && (
+                <div style={{ display: 'flex', gap: '0.5rem' }}>
+                  <button onClick={handleRetryAll} className="btn btn-secondary" style={{ padding: '0.5rem 1rem', fontSize: '0.875rem' }}>Retry All</button>
+                  <button onClick={() => fetch(`${API_URL}/dlq/purge_all`, { method: 'POST', headers: { 'Authorization': `Bearer ${apiKey}` } })} className="btn btn-danger" style={{ padding: '0.5rem 1rem', fontSize: '0.875rem' }}>Purge All</button>
+                </div>
+              )}
             </div>
             {dlqTasks.length === 0 ? (<p style={{ color: 'var(--text-secondary)' }}>✓ The queue is healthy. No failed tasks!</p>) : (
               <div className="table-container">

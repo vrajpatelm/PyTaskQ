@@ -1,5 +1,5 @@
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
-from src.Schema import Taskresult,Taskloader
+from src.schemas.requests import Taskresult,Taskloader
 import json
 import time
 from typing import Any,List
@@ -43,17 +43,15 @@ CONCURRENCY    = CPU_WORKERS + IO_WORKERS    # Total semaphore slots
 class TaskTimeoutError(Exception):
     """Raised when a task exceeds TASK_TIMEOUT. Treated as a retryable failure."""
     
-r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
+from src.core import redis_client
 shutdown_event = asyncio.Event()
 active_tasks = set()
 
-# ── OpenTelemetry: Initialize tracer for worker spans ────────────────────────
-# Shows up as "pytaskq-worker" in Jaeger, separate from "pytaskq-api".
+# OpenTelemetry: Initialize tracer for worker spans 
+
 tracer = init_tracer("pytaskq-worker")
 
 #Fencing Token 
-# It checks if this worker's fence token is still the valid one before saving.
-# If another worker has since claimed the task, we discard our stale result.
 FENCE_SCRIPT = """
 local current = redis.call('get', KEYS[1])
 if current == false or current == ARGV[1] then
@@ -65,21 +63,54 @@ else
 end
 """
 
+# ── Leader Election ────────────────────────────────────────────────────────── 
+# If the leader crashes, the lock expires in 20s and another worker takes over.
+
+async def is_leader() -> bool:
+    try:
+        # 1. Try to acquire the lock (only succeeds if lock doesn't exist)
+        acquired = await redis_client.r.set("pytaskq:leader_lock", WORKER_ID, nx=True, ex=20)
+        if acquired:
+            return True
+            
+        # 2. If we didn't acquire it, check if we ALREADY own it (renew it)
+        current_leader = await redis_client.r.get("pytaskq:leader_lock")
+        if current_leader == WORKER_ID:
+            await redis_client.r.expire("pytaskq:leader_lock", 20)
+            return True
+            
+        return False
+    except Exception as e:
+        logger.warning(f"[Leader Election] Redis error: {e}")
+        return False
+
 #Background scheduler that moves delayed tasks back into task_queue 
 # when their time comes
 
 async def retry_scheduler():
     while True:
+        if not await is_leader():
+            await asyncio.sleep(5)
+            continue
+            
         now = time.time()
-        ready_tasks = await r.zrangebyscore("delayed_tasks", "-inf", now)
-        for task_json in ready_tasks:
-            removed = await r.zrem("delayed_tasks", task_json)
+        ready_tasks = await redis_client.r.zrangebyscore("delayed_tasks", "-inf", now)
+        for i, task_json in enumerate(ready_tasks):
+            # If we are processing a massive backlog, renew the lock every 100 tasks
+            if i > 0 and i % 100 == 0:
+                await redis_client.r.expire("pytaskq:leader_lock", 20)
+                
+            removed = await redis_client.r.zrem("delayed_tasks", task_json)
             if removed:  
                 task_data = json.loads(task_json)
-                await r.lpush(f"queue:{task_data.get('priority', 'default')}", task_json)
                 tenant_id = task_data.get('tenant_id', 'unknown')
-                await r.decr(f"stats:delayed:{tenant_id}")
-                await r.incr(f"stats:pending:{tenant_id}")
+                
+                # Atomic re-queue
+                async with redis_client.r.pipeline(transaction=True) as pipe:
+                    pipe.lpush(f"queue:{task_data.get('priority', 'default')}", task_json)
+                    pipe.decr(f"stats:delayed:{tenant_id}")
+                    pipe.incr(f"stats:pending:{tenant_id}")
+                    await pipe.execute()
                 logger.info(f"[Retry Scheduler] Re-queued task {task_data.get('task_id')} "
                       f"(retry #{task_data.get('retry_count')})")
         
@@ -88,7 +119,7 @@ async def retry_scheduler():
 async def heartbeat():
     while True:
         try:
-            await r.zadd("active_workers",{WORKER_ID:time.time()+30})
+            await redis_client.r.zadd("active_workers",{WORKER_ID:time.time()+30})
             await asyncio.sleep(10)
         except Exception as e:
             logger.warning(f"[Heartbeat] Redis unreachable: {e}. Retrying in 5s")
@@ -96,24 +127,41 @@ async def heartbeat():
     
 async def zombie_sweeper():
     while True:
+        if not await is_leader():
+            await asyncio.sleep(5)
+            continue
+            
         try:
-            expired = await r.zrangebyscore("active_workers", "-inf", time.time())
+            expired = await redis_client.r.zrangebyscore("active_workers", "-inf", time.time())
             for worker_id in expired:
+                tasks_recovered = 0
                 while True:
-                    task = await r.rpop(f"processing_queue:{worker_id}")
+                    task = await redis_client.r.rpop(f"processing_queue:{worker_id}")
                     if not task:
                         break  # No more tasks for this dead worker
+                    
+                    # If this dead worker had a massive backlog, renew lock every 100 tasks
+                    if tasks_recovered > 0 and tasks_recovered % 100 == 0:
+                        await redis_client.r.expire("pytaskq:leader_lock", 20)
+                        
                     task_data = json.loads(task)
                     task_data["fence_token"] += 1
                     task_id = task_data.get("task_id")
                     # Part B: write the NEW token to Redis so old workers know they are stale
-                    await r.set(f"fence:{task_id}", task_data["fence_token"], ex=86400)
-                    await r.lpush("queue:high", json.dumps(task_data))
                     tenant_id = task_data.get('tenant_id', 'unknown')
-                    await r.incr(f"stats:pending:{tenant_id}")
-                    await r.decr(f"stats:processing:{tenant_id}")
+                    
+                    # Atomic recovery
+                    async with redis_client.r.pipeline(transaction=True) as pipe:
+                        pipe.set(f"fence:{task_id}", task_data["fence_token"], ex=86400)
+                        pipe.lpush("queue:high", json.dumps(task_data))
+                        pipe.incr(f"stats:pending:{tenant_id}")
+                        pipe.decr(f"stats:processing:{tenant_id}")
+                        await pipe.execute()
+                    
+                    tasks_recovered += 1
+                    
                 # NOW remove the dead worker from the registry
-                await r.zrem("active_workers", worker_id)
+                await redis_client.r.zrem("active_workers", worker_id)
                 logger.info(f"[Sweeper] Recovered tasks from dead worker: {worker_id}")
         except Exception as e:
             logger.error(f"[Sweeper] Redis error: {e}. Retrying in 5s...")
@@ -152,13 +200,13 @@ async def consumer_task():
     while not shutdown_event.is_set():
         try:
             while True:
-                leftover = await r.rpoplpush(f"processing_queue:{WORKER_ID}", "queue:high")
+                leftover = await redis_client.r.rpoplpush(f"processing_queue:{WORKER_ID}", "queue:high")
                 if not leftover:
                     break
                 task_data = json.loads(leftover)
                 tenant_id = task_data.get('tenant_id', 'unknown')
-                await r.incr(f"stats:pending:{tenant_id}")
-                await r.decr(f"stats:processing:{tenant_id}")
+                await redis_client.r.incr(f"stats:pending:{tenant_id}")
+                await redis_client.r.decr(f"stats:processing:{tenant_id}")
                 logger.info(f"Recovered crashed task on startup: {leftover}")
             break  # Recovery succeeded — exit the retry loop and continue
         except Exception as e:
@@ -177,11 +225,11 @@ async def consumer_task():
         # Unpack the Redis response first
         try:
             await sem.acquire()  # Wait for a free slot
-            task_json = await r.rpoplpush("queue:high", f"processing_queue:{WORKER_ID}")
+            task_json = await redis_client.r.rpoplpush("queue:high", f"processing_queue:{WORKER_ID}")
             if not task_json:
-                task_json = await r.rpoplpush("queue:default", f"processing_queue:{WORKER_ID}")
+                task_json = await redis_client.r.rpoplpush("queue:default", f"processing_queue:{WORKER_ID}")
             if not task_json:
-               task_json = await r.rpoplpush("queue:low", f"processing_queue:{WORKER_ID}")
+               task_json = await redis_client.r.rpoplpush("queue:low", f"processing_queue:{WORKER_ID}")
             if not task_json:
                 await asyncio.sleep(1)
                 sem.release()
@@ -208,7 +256,7 @@ async def consumer_task():
         await asyncio.gather(*active_tasks, return_exceptions=True )
     thread_pool.shutdown(wait=True)
     process_pool.shutdown(wait=True)
-    await r.aclose()
+    await redis_client.r.aclose()
     
     # ── OpenTelemetry: Flush remaining spans before exiting ────────────
     # Ensures no traces are lost if the worker is killed/restarted.
@@ -226,12 +274,12 @@ async def handle_task(task_json, sem, loop, process_pool, thread_pool):
             task_id = tasks.task_id
             my_token = tasks.fence_token  # remember the token we were given
             tenant_id = getattr(tasks, 'tenant_id', 'unknown')
-            await r.decr(f"stats:pending:{tenant_id}")
+            await redis_client.r.decr(f"stats:pending:{tenant_id}")
 
         except Exception as e:
             logger.error(f"Error occurred while validating task JSON: {e}")
             task_id = "Unknown"
-            await r.hset(f"task:{task_id}", mapping={
+            await redis_client.r.hset(f"task:{task_id}", mapping={
                 "task_id": task_id,
                 "status": "Failed",
                 "error": f"JSON Validation Error: {str(e)}"
@@ -258,7 +306,7 @@ async def handle_task(task_json, sem, loop, process_pool, thread_pool):
                 task_type = entry["type"]
                 
                 logger.info(f"Executing task {task_id} ({tasks.task_name})")
-                await r.incr(f"stats:processing:{tenant_id}")  # Atomic counter: task is now actively executing
+                await redis_client.r.incr(f"stats:processing:{tenant_id}")  # Atomic counter: task is now actively executing
                 incr_done = True  # Mark that we INCRed so finally block will DECR
 
                 if task_type == "cpu":
@@ -276,10 +324,10 @@ async def handle_task(task_json, sem, loop, process_pool, thread_pool):
                         # cannot kill a thread/process. Invalidate our fence token so
                         # whenever the orphaned handler eventually finishes, its result
                         # write fails the fence check and is discarded.
-                        await r.incr(f"fence:{task_id}")
+                        await redis_client.r.incr(f"fence:{task_id}")
                         # Bound this key's lifetime like the sweeper does —
                         # without a TTL one fence key leaks per timed-out task.
-                        await r.expire(f"fence:{task_id}", 86400)
+                        await redis_client.r.expire(f"fence:{task_id}", 86400)
                         raise TaskTimeoutError(
                             f"Task exceeded {TASK_TIMEOUT}s limit (execution abandoned; "
                             f"late result will be discarded by fence check)"
@@ -289,7 +337,7 @@ async def handle_task(task_json, sem, loop, process_pool, thread_pool):
 
                 
             # Save Success result to Redis — atomically via Lua fencing check
-                saved = await r.eval(
+                saved = await redis_client.r.eval(
                     FENCE_SCRIPT,
                     2,                        # number of KEYS passed
                     f"fence:{task_id}",       # KEYS[1] — the token we check against
@@ -301,8 +349,10 @@ async def handle_task(task_json, sem, loop, process_pool, thread_pool):
                     tenant_id                 # ARGV[5] — hset field: tenant_id (isolation)
                 )
                 if saved:
-                    await r.expire(f"task:{task_id}", 86400)
-                    await r.incr(f"stats:completed:{tenant_id}")
+                    async with redis_client.r.pipeline(transaction=True) as pipe:
+                        pipe.expire(f"task:{task_id}", 86400)
+                        pipe.incr(f"stats:completed:{tenant_id}")
+                        await pipe.execute()
                     span.set_attribute("task.status", "Success")
                     logger.info(f"Task {task_id} completed and saved ")
                 else:
@@ -321,7 +371,7 @@ async def handle_task(task_json, sem, loop, process_pool, thread_pool):
                         attributes={"task.id": task_id, "webhook.url": tasks.webhook_url},
                     ):
                         payload = {"task_id": task_id, "status": "Success", "result": str(result)}
-                        webhook_secret = await r.hget(f"webhook:{tenant_id}", "secret")
+                        webhook_secret = await redis_client.r.hget(f"webhook:{tenant_id}", "secret")
                         
                         if webhook_secret:
                             webhook_task_id = str(uuid.uuid4())
@@ -336,8 +386,11 @@ async def handle_task(task_json, sem, loop, process_pool, thread_pool):
                                 "client_ip": getattr(tasks, 'client_ip', 'unknown'),
                                 "trace_carrier": inject_trace_context(),
                             })
-                            await r.lpush("queue:high", webhook_task_json)
-                            await r.incr(f"stats:pending:{tenant_id}")
+                            # Atomic enqueue
+                            async with redis_client.r.pipeline(transaction=True) as pipe:
+                                pipe.lpush("queue:high", webhook_task_json)
+                                pipe.incr(f"stats:pending:{tenant_id}")
+                                await pipe.execute()
                             logger.info(f"Enqueued _deliver_webhook task {webhook_task_id} for original task {task_id}")
                         else:
                             logger.warning(f"Task {task_id} has webhook_url but no secret found for tenant {tenant_id}")
@@ -347,18 +400,22 @@ async def handle_task(task_json, sem, loop, process_pool, thread_pool):
                 # Record the error on the OTel span so it shows as a red error in Jaeger
                 span.set_status(trace.StatusCode.ERROR, str(e))
                 span.record_exception(e)
-                await r.incr(f"stats:failed:{tenant_id}")   # Cumulative: total tasks ever failed/retried
+                await redis_client.r.incr(f"stats:failed:{tenant_id}")   # Cumulative: total tasks ever failed/retried
                 if getattr(tasks, 'retry_count', 0) >= 3:
                    logger.error(f"[DLQ] Task {task_id} failed after 3 retries. Moving to dead-letter queue.")
                    span.set_attribute("task.status", "DeadLetter")
-                   await r.lpush(f"dlq:{tenant_id}", task_json)
-                   await r.incr(f"stats:dlq:{tenant_id}")
-                   await r.hset(f"task:{task_id}", mapping={
-                        "task_id": task_id,
-                        "status": "DeadLetter",
-                        "tenant_id": tenant_id,
-                        "error": f"Failed after 3 retries.Last error: {str(e)} "}
-                    )
+                   
+                   # Atomic move to DLQ
+                   async with redis_client.r.pipeline(transaction=True) as pipe:
+                       pipe.lpush(f"dlq:{tenant_id}", task_json)
+                       pipe.incr(f"stats:dlq:{tenant_id}")
+                       pipe.hset(f"task:{task_id}", mapping={
+                            "task_id": task_id,
+                            "status": "DeadLetter",
+                            "tenant_id": tenant_id,
+                            "error": f"Failed after 3 retries.Last error: {str(e)} "}
+                        )
+                       await pipe.execute()
                 else:
                     tasks.retry_count += 1
 
@@ -369,25 +426,26 @@ async def handle_task(task_json, sem, loop, process_pool, thread_pool):
                     delay     = min(MAX_DELAY, random.uniform(BASE, prev * 3))
                     tasks.prev_delay = delay   # save so NEXT retry can use it
 
-                    await r.zadd("delayed_tasks", {json.dumps(tasks.model_dump()): time.time() + delay})
-                    await r.incr(f"stats:delayed:{tenant_id}")
-                    logger.warning(
-                        f"[Retry] Task {task_id} failed. "
-                        f"Retry #{tasks.retry_count} in {delay:.2f}s "
-                        f"(decorrelated jitter, prev={prev:.2f}s)"
-                    )
-                    await r.hset(f"task:{task_id}", mapping={
-                        "task_id": task_id,
-                        "status": "RetryScheduled",
-                        "tenant_id": tenant_id,
-                        "retry_count": tasks.retry_count,
-                        "error": f"Error: {str(e)}. Scheduled for retry in {delay:.2f} seconds."
-                    })
+                    # Atomic scheduling
+                    async with redis_client.r.pipeline(transaction=True) as pipe:
+                        pipe.zadd("delayed_tasks", {json.dumps(tasks.model_dump()): time.time() + delay})
+                        pipe.incr(f"stats:delayed:{tenant_id}")
+                        pipe.hset(f"task:{task_id}", mapping={
+                            "task_id": task_id,
+                            "status": "RetryScheduled",
+                            "tenant_id": tenant_id,
+                            "retry_count": tasks.retry_count,
+                            "error": f"Error: {str(e)}. Scheduled for retry in {delay:.2f} seconds."
+                        })
+                        await pipe.execute()
             
     finally:
-        await r.lrem(f"processing_queue:{WORKER_ID}", count=1, value=task_json)
-        if incr_done:  # Only DECR if we actually INCRed — prevents counter going negative
-            await r.decr(f"stats:processing:{tenant_id}")
+        # Atomic cleanup
+        async with redis_client.r.pipeline(transaction=True) as pipe:
+            pipe.lrem(f"processing_queue:{WORKER_ID}", count=1, value=task_json)
+            if incr_done:  # Only DECR if we actually INCRed
+                pipe.decr(f"stats:processing:{tenant_id}")
+            await pipe.execute()
         sem.release()
 
 #Start the event loop

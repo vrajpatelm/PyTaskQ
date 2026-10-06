@@ -1,17 +1,87 @@
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
 
 :root {
-  /* Premium SaaS Palette */
-  --bg-color: #f1f5f9; /* Slightly darker gray for contrast against white cards */
+  /* Pastel Light Palette */
+  --bg-color: #f8fafc;
   --surface-color: #ffffff;
-  --text-primary: #0f172a;
-  --text-secondary: #475569;
+  --text-primary: #1e293b;
+  --text-secondary: #64748b;
   --border-color: #e2e8f0;
-  --accent-color: #4f46e5; /* Indigo */
-  --accent-hover: #4338ca;
-  --success-color: #059669;
-  --warning-color: #d97706;
-  --danger-color: #dc2626;
+  --accent-color: #6366f1; /* Pastel Indigo */
+  --accent-hover: #4f46e5;
+  --success-color: #10b981;
+  --warning-color: #f59e0b;
+  --danger-color: #ef4444;
+  
+  --card-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.05), 0 2px 4px -2px rgba(0, 0, 0, 0.05);
+  --card-hover: 0 10px 15px -3px rgba(0, 0, 0, 0.08), 0 4px 6px -4px rgba(0, 0, 0, 0.05);
+  
+  --task-bg: #f1f5f9;
+  --code-bg: #1e293b;
+  --code-text: #f8fafc;
+  --table-hover: #f8fafc;
+
+  /* Status Badges */
+  --status-success-bg: #ecfdf5;
+  --status-success-text: #065f46;
+  --status-success-border: #34d399;
+  --status-failed-bg: #fef2f2;
+  --status-failed-text: #991b1b;
+  --status-failed-border: #f87171;
+  --status-warning-bg: #fffbeb;
+  --status-warning-text: #92400e;
+  --status-warning-border: #fbbf24;
+  --status-processing-bg: #eff6ff;
+  --status-processing-text: #1e40af;
+  --status-processing-border: #60a5fa;
+  --status-pending-bg: #f5f3ff;
+  --status-pending-text: #4c1d95;
+  --status-pending-border: #a78bfa;
+  --status-default-bg: #f8fafc;
+  --status-default-text: #475569;
+  --status-default-border: #e2e8f0;
+}
+
+[data-theme='dark'] {
+  /* Modern Black Palette */
+  --bg-color: #09090b;
+  --surface-color: #18181b;
+  --text-primary: #fafafa;
+  --text-secondary: #a1a1aa;
+  --border-color: #27272a;
+  --accent-color: #818cf8;
+  --accent-hover: #6366f1;
+  --success-color: #34d399;
+  --warning-color: #fbbf24;
+  --danger-color: #f87171;
+  
+  --card-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.3), 0 2px 4px -2px rgba(0, 0, 0, 0.3);
+  --card-hover: 0 10px 15px -3px rgba(0, 0, 0, 0.5), 0 4px 6px -4px rgba(0, 0, 0, 0.5);
+  
+  --task-bg: #27272a;
+  --code-bg: #000000;
+  --code-text: #d4d4d8;
+  --table-hover: #27272a;
+
+  /* Status Badges */
+  --status-success-bg: rgba(16, 185, 129, 0.15);
+  --status-success-text: #34d399;
+  --status-success-border: rgba(16, 185, 129, 0.3);
+  --status-failed-bg: rgba(239, 68, 68, 0.15);
+  --status-failed-text: #f87171;
+  --status-failed-border: rgba(239, 68, 68, 0.3);
+  --status-warning-bg: rgba(245, 158, 11, 0.15);
+  --status-warning-text: #fbbf24;
+  --status-warning-border: rgba(245, 158, 11, 0.3);
+  --status-processing-bg: rgba(59, 130, 246, 0.15);
+  --status-processing-text: #60a5fa;
+  --status-processing-border: rgba(59, 130, 246, 0.3);
+  --status-pending-bg: rgba(139, 92, 246, 0.15);
+  --status-pending-text: #a78bfa;
+  --status-pending-border: rgba(139, 92, 246, 0.3);
+  --status-default-bg: #27272a;
+  --status-default-text: #a1a1aa;
+  --status-default-border: #3f3f46;
 }
 
 body {
@@ -67,12 +137,12 @@ body {
   border: 1px solid var(--border-color);
   border-radius: 12px;
   padding: 2rem;
-  box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.05), 0 2px 4px -2px rgba(0, 0, 0, 0.05);
+  box-shadow: var(--card-shadow);
   transition: box-shadow 0.2s ease-in-out;
 }
 
 .card:hover {
-  box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.08), 0 4px 6px -4px rgba(0, 0, 0, 0.05);
+  box-shadow: var(--card-hover);
 }
 
 .card h2 {
@@ -188,30 +258,31 @@ body {
 .btn-primary:hover { background-color: var(--accent-hover); }
 
 .btn-danger {
-  background-color: #fee2e2;
+  background-color: var(--status-failed-bg);
   color: var(--danger-color);
-  border: 1px solid #f87171;
+  border: 1px solid var(--status-failed-border);
 }
-.btn-danger:hover { background-color: #fca5a5; }
+.btn-danger:hover { background-color: var(--status-failed-border); }
 
 .btn-secondary {
-  background-color: #f1f5f9;
+  background-color: var(--task-bg);
   color: var(--text-primary);
   border: 1px solid var(--border-color);
 }
-.btn-secondary:hover { background-color: #e2e8f0; }
+.btn-secondary:hover { background-color: var(--border-color); }
 
-/* Status */
+  /* Status Badges */
 .status-box {
   margin-top: 1.5rem;
   padding: 1rem;
   border-radius: 6px;
   font-weight: 500;
-  background-color: #f8fafc;
+  background-color: var(--status-default-bg);
   border: 1px solid var(--border-color);
+  color: var(--text-primary);
 }
-.status-box.success { background-color: #ecfdf5; border-color: #34d399; color: #065f46; }
-.status-box.error { background-color: #fef2f2; border-color: #f87171; color: #991b1b; }
+.status-box.success { background-color: var(--status-success-bg); border-color: var(--status-success-border); color: var(--status-success-text); }
+.status-box.error { background-color: var(--status-failed-bg); border-color: var(--status-failed-border); color: var(--status-failed-text); }
 
 /* Table */
 .table-container {
@@ -232,4 +303,4 @@ td {
   padding: 1rem;
   border-bottom: 1px solid var(--border-color);
 }
-tr:hover td { background-color: #f8fafc; }
+tr:hover td { background-color: var(--table-hover); }

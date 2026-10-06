@@ -47,8 +47,9 @@ async def test_client(fake_redis_for_app, monkeypatch):
         It temporarily replaces the attribute for the duration of the test,
         then restores it automatically. No manual cleanup needed.
     """
-    import app  # import AFTER monkeypatching below
-    monkeypatch.setattr(app, "r", fake_redis_for_app)
+    import main as app
+    import src.core.redis_client
+    monkeypatch.setattr(src.core.redis_client, "r", fake_redis_for_app)
 
     # Seed a real API key so app.authenticate's Redis lookup works against
     # fakeredis — tests exercise the actual auth dependency, not a stub.
@@ -368,34 +369,35 @@ async def test_stale_pending_claim_is_short_lived_and_reclaimable(test_client, m
     WHY: A long-lived pending tombstone turns a crash into a permanent 409
          for that key. Short TTL + NX gives free reclaim.
     """
-    import app
+    import main as app
     client, r = test_client
 
-    # Simulate "crash before finalize": the claim is made but never completed.
-    async def never_finalized(*args, **kwargs):
-        return None
+    from unittest.mock import patch
 
-    monkeypatch.setattr(app, "store_idempotency_response", never_finalized)
-
+    # Simulate "crash before finalize": the server dies after check_idempotency
+    # but before the transaction completes. We simulate this by raising an error.
     payload = {
         "task_name": "matrix_multiply",
         "args": [13],
         "idempotency_key": "crash-key-001",
     }
-    first = await client.post("/task/enqueue", json=payload, headers=AUTH_HEADERS)
-    assert first.status_code == 200
+    
+    with patch("src.api.v1.tasks.get_client_ip", side_effect=RuntimeError("Simulated crash")):
+        with pytest.raises(RuntimeError, match="Simulated crash"):
+            await client.post("/task/enqueue", json=payload, headers=AUTH_HEADERS)
 
     key = f"idempotency:{TEST_TENANT_ID}:crash-key-001"
     assert await r.get(key) == "pending"
     ttl = await r.ttl(key)
-    assert 0 < ttl <= app.IDEMPOTENCY_PENDING_TTL, (
+    from src.core.config import settings
+    assert 0 < ttl <= settings.IDEMPOTENCY_PENDING_TTL, (
         f"pending claim ttl is {ttl}s — must be short, not the response TTL"
     )
 
     # While still pending, a duplicate is rejected with a Retry-After hint.
     second = await client.post("/task/enqueue", json=payload, headers=AUTH_HEADERS)
     assert second.status_code == 409
-    assert second.headers.get("retry-after") == str(app.IDEMPOTENCY_PENDING_TTL)
+    assert second.headers.get("retry-after") == str(settings.IDEMPOTENCY_PENDING_TTL)
 
     # The claim lapses (TTL expiry) → the same key can be claimed again.
     await r.delete(key)

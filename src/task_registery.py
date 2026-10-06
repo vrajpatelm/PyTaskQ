@@ -18,9 +18,23 @@ import json
 from PIL import Image
 from dotenv import load_dotenv
 
-
 load_dotenv()
 
+class PyTaskQ:
+    def __init__(self):
+        self.TASKS = {}
+        
+    def task(self, type="cpu"):
+        """Decorator to register a new task for the distributed workers."""
+        def decorator(func):
+            self.TASKS[func.__name__] = {"handler": func, "type": type}
+            return func
+        return decorator
+
+# Global SDK instance
+queue = PyTaskQ()
+# Alias for backward compatibility with worker.py
+TASKS = queue.TASKS
 
 # ── SSRF guard ────────────────────────────────────────────────────────────────
 # Task handlers fetch user-supplied URLs. Without a guard a tenant could make
@@ -70,6 +84,7 @@ class _SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
 _SAFE_OPENER = urllib.request.build_opener(_SafeRedirectHandler())
 
 
+@queue.task(type="cpu")
 def matrix_multiply(size: int):
     A = np.random.rand(size, size)
     B = np.random.rand(size, size)
@@ -79,6 +94,7 @@ def matrix_multiply(size: int):
     return f"Matrix multiplication complete: {size}x{size} result computed."
 
 
+@queue.task(type="cpu")
 def generate_csv_report(rows: int):
     try:
         start_time = time.time()
@@ -129,6 +145,7 @@ def send_email(email_to, subject, body):
     return {"result": f"Email sent to {email_to}"}
 
 
+@queue.task(type="cpu")
 def resize_image(image_url: str, width: int, height: int):
     try:
         start_time = time.time()
@@ -165,6 +182,7 @@ def resize_image(image_url: str, width: int, height: int):
         return {"status": "error", "error": str(e)}
     
     
+@queue.task(type="io")
 def url_health_check(url):
     try:
         # SSRF guard: reject URLs that resolve to private/internal addresses
@@ -181,6 +199,7 @@ def url_health_check(url):
     
 
 
+@queue.task(type="io")
 def _deliver_webhook(url: str, payload: dict, secret: str):
     payload_bytes = json.dumps(payload).encode('utf-8')
     signature = hmac.new(secret.encode('utf-8'), payload_bytes, hashlib.sha256).hexdigest()
@@ -198,14 +217,3 @@ def _deliver_webhook(url: str, payload: dict, secret: str):
     except Exception as e:
         raise Exception(f"Webhook delivery failed: {e}")
 
-TASKS = {
-    # Dynamic dispatch to handle multiple tasks
-    # Each entry defines the handler function AND its execution type.
-    # The worker looks up both — the API never needs to know.
-    # "send_email": {"handler": send_email, "type": "io"},  # Disabled: emails would send from platform owner's Gmail
-    "matrix_multiply": {"handler": matrix_multiply, "type": "cpu"},
-    "url_health_check":{"handler":url_health_check,"type":"io"},
-    "generate_csv_report":{"handler":generate_csv_report , "type":"cpu"},
-    "resize_image": {"handler": resize_image, "type": "cpu"},
-    "_deliver_webhook": {"handler": _deliver_webhook, "type": "io"}
-}

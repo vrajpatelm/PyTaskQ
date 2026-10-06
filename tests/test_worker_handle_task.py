@@ -82,7 +82,7 @@ async def test_invalid_json_is_logged_as_failed(r, sem, thread_pool):
     import worker
     loop = asyncio.get_running_loop()
 
-    with patch.object(worker, "r", r):
+    with patch.object(worker.redis_client, "r", r):
         # Put bad JSON in processing_queue first (simulating it was already popped)
         bad_json = "{ this is not valid JSON !!!"
         await r.lpush(f"processing_queue:{worker.WORKER_ID}", bad_json)
@@ -116,7 +116,7 @@ async def test_missing_required_field_fails_validation(r, sem, thread_pool):
     incomplete = json.dumps({"task_id": "abc-123", "retry_count": 0})
     await r.lpush(f"processing_queue:{worker.WORKER_ID}", incomplete)
 
-    with patch.object(worker, "r", r):
+    with patch.object(worker.redis_client, "r", r):
         await worker.handle_task(incomplete, sem, loop, thread_pool, thread_pool)
 
     result = await r.hgetall("task:Unknown")
@@ -145,7 +145,7 @@ async def test_first_failure_schedules_retry(r, sem, thread_pool):
     # Mock the executor to RAISE an exception (simulate task failure)
     failing_executor = AsyncMock(side_effect=Exception("SMTP server unreachable"))
 
-    with patch.object(worker, "r", r):
+    with patch.object(worker.redis_client, "r", r):
         with patch.object(loop, "run_in_executor", failing_executor):
             await worker.handle_task(task_json, sem, loop, thread_pool, thread_pool)
 
@@ -192,7 +192,7 @@ async def test_retry_uses_decorrelated_jitter_delay(r, sem, thread_pool):
         await r.lpush(f"processing_queue:{worker.WORKER_ID}", task_json)
 
         before = time.time()
-        with patch.object(worker, "r", r):
+        with patch.object(worker.redis_client, "r", r):
             with patch.object(loop, "run_in_executor", failing_executor):
                 await worker.handle_task(task_json, sem, loop, thread_pool, thread_pool)
 
@@ -240,7 +240,7 @@ async def test_task_goes_to_dlq_after_3_retries(r, sem, thread_pool):
 
     failing_executor = AsyncMock(side_effect=Exception("Still failing"))
 
-    with patch.object(worker, "r", r):
+    with patch.object(worker.redis_client, "r", r):
         with patch.object(loop, "run_in_executor", failing_executor):
             await worker.handle_task(task_json, sem, loop, thread_pool, thread_pool)
 
@@ -278,7 +278,7 @@ async def test_dlq_preserves_full_task_data(r, sem, thread_pool):
 
     failing_executor = AsyncMock(side_effect=Exception("Unrecoverable"))
 
-    with patch.object(worker, "r", r):
+    with patch.object(worker.redis_client, "r", r):
         with patch.object(loop, "run_in_executor", failing_executor):
             await worker.handle_task(task_json, sem, loop, thread_pool, thread_pool)
 
@@ -317,7 +317,7 @@ async def test_hung_task_times_out_and_frees_slot(r, sem, thread_pool):
         return await asyncio.sleep(3600)  # simulates a wedged handler
 
     slots_before = sem._value
-    with patch.object(worker, "TASK_TIMEOUT", 0.05), patch.object(worker, "r", r), \
+    with patch.object(worker, "TASK_TIMEOUT", 0.05), patch.object(worker.redis_client, "r", r), \
          patch.object(loop, "run_in_executor", side_effect=hang_forever):
         await worker.handle_task(task_json, sem, loop, thread_pool, thread_pool)
 
@@ -352,7 +352,7 @@ async def test_task_completing_within_timeout_succeeds(r, sem, thread_pool):
 
     success_executor = AsyncMock(return_value={"result": "fast"})
 
-    with patch.object(worker, "TASK_TIMEOUT", 5.0), patch.object(worker, "r", r), \
+    with patch.object(worker, "TASK_TIMEOUT", 5.0), patch.object(worker.redis_client, "r", r), \
          patch.object(loop, "run_in_executor", success_executor):
         await worker.handle_task(task_json, sem, loop, thread_pool, thread_pool)
 
@@ -382,7 +382,7 @@ async def test_late_result_of_timed_out_task_is_discarded(r, sem, thread_pool):
         await asyncio.sleep(0.2)   # longer than the patched timeout
         return {"result": "LATE ORPHANED RESULT"}
 
-    with patch.object(worker, "TASK_TIMEOUT", 0.05), patch.object(worker, "r", r), \
+    with patch.object(worker, "TASK_TIMEOUT", 0.05), patch.object(worker.redis_client, "r", r), \
          patch.object(loop, "run_in_executor", side_effect=hang_then_return):
         await worker.handle_task(task_json, sem, loop, thread_pool, thread_pool)
 
@@ -428,7 +428,7 @@ async def test_timeout_disabled_runs_unbounded(r, sem, thread_pool):
         await asyncio.sleep(0.1)
         return {"result": "eventually done"}
 
-    with patch.object(worker, "TASK_TIMEOUT", 0), patch.object(worker, "r", r), \
+    with patch.object(worker, "TASK_TIMEOUT", 0), patch.object(worker.redis_client, "r", r), \
          patch.object(loop, "run_in_executor", side_effect=slow_but_finishes):
         await worker.handle_task(task_json, sem, loop, thread_pool, thread_pool)
 
@@ -457,7 +457,7 @@ async def test_successful_task_saves_result(r, sem, thread_pool):
 
     success_executor = AsyncMock(return_value={"result": "Email sent to a@b.com"})
 
-    with patch.object(worker, "r", r):
+    with patch.object(worker.redis_client, "r", r):
         with patch.object(loop, "run_in_executor", success_executor):
             await worker.handle_task(task_json, sem, loop, thread_pool, thread_pool)
 
@@ -504,7 +504,7 @@ async def test_semaphore_is_always_released(r, sem, thread_pool):
 
     failing_executor = AsyncMock(side_effect=Exception("Crash"))
 
-    with patch.object(worker, "r", r):
+    with patch.object(worker.redis_client, "r", r):
         with patch.object(loop, "run_in_executor", failing_executor):
             await worker.handle_task(task_json, sem, loop, thread_pool, thread_pool)
 

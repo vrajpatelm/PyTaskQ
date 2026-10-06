@@ -73,7 +73,7 @@ async def test_shutdown_event_stops_consumer_loop(r):
                 break
             await asyncio.sleep(0.1)  # yield to event loop
 
-    with patch.object(worker, "r", r):
+    with patch.object(worker.redis_client, "r", r):
         loop_task = asyncio.create_task(run_loop_until_shutdown())
 
         # Set shutdown after 200ms
@@ -227,7 +227,7 @@ async def test_semaphore_released_even_on_timeout(r):
     sem = asyncio.Semaphore(10)
     initial_value = sem._value  # should be 10
 
-    with patch.object(worker, "r", r):
+    with patch.object(worker.redis_client, "r", r):
         # Simulate the exact code path in consumer_task when timeout fires
         await sem.acquire()                    # simulate consumer acquiring
         task_json = None                       # simulate brpoplpush timeout

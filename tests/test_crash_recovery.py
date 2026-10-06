@@ -73,7 +73,7 @@ async def test_single_crashed_task_recovered(r):
     assert await r.llen("processing_queue") == 1
 
     # Run just the crash recovery loop (not the full consumer loop)
-    with patch.object(worker, "r", r):
+    with patch.object(worker.redis_client, "r", r):
         while True:
             leftover = await r.rpoplpush("processing_queue", "queue:high")
             if not leftover:
@@ -103,7 +103,7 @@ async def test_multiple_crashed_tasks_all_recovered(r):
 
     assert await r.llen("processing_queue") == 3
 
-    with patch.object(worker, "r", r):
+    with patch.object(worker.redis_client, "r", r):
         while True:
             leftover = await r.rpoplpush("processing_queue", "queue:high")
             if not leftover:
@@ -125,7 +125,7 @@ async def test_clean_startup_with_empty_processing_queue(r):
     assert await r.llen("processing_queue") == 0
     assert await r.llen("queue:high") == 0
 
-    with patch.object(worker, "r", r):
+    with patch.object(worker.redis_client, "r", r):
         while True:
             leftover = await r.rpoplpush("processing_queue", "queue:high")
             if not leftover:
@@ -158,7 +158,7 @@ async def test_expired_delayed_task_is_requeued(r):
     assert await r.llen("queue:default") == 0
 
     # Run ONE tick of the scheduler manually
-    with patch.object(worker, "r", r):
+    with patch.object(worker.redis_client, "r", r):
         now = time.time()
         ready_tasks = await r.zrangebyscore("delayed_tasks", "-inf", now)
         for task_json in ready_tasks:
@@ -187,7 +187,7 @@ async def test_high_priority_retry_goes_to_queue_high(r):
     high_task = make_task("high-retry-001", retry_count=1, priority="high")
     await r.zadd("delayed_tasks", {high_task: time.time() - 5})
 
-    with patch.object(worker, "r", r):
+    with patch.object(worker.redis_client, "r", r):
         now = time.time()
         ready_tasks = await r.zrangebyscore("delayed_tasks", "-inf", now)
         for task_json in ready_tasks:
@@ -215,7 +215,7 @@ async def test_future_delayed_task_is_not_requeued(r):
     future_time = time.time() + 100  # 100 seconds in the future
     await r.zadd("delayed_tasks", {future_task: future_time})
 
-    with patch.object(worker, "r", r):
+    with patch.object(worker.redis_client, "r", r):
         now = time.time()
         ready_tasks = await r.zrangebyscore("delayed_tasks", "-inf", now)
         for task_json in ready_tasks:
@@ -252,7 +252,7 @@ async def test_only_expired_tasks_are_requeued(r):
         future_1:  now + 100,  # 100s from now — NOT yet ❌
     })
 
-    with patch.object(worker, "r", r):
+    with patch.object(worker.redis_client, "r", r):
         ready = await r.zrangebyscore("delayed_tasks", "-inf", now)
         for task_json in ready:
             removed = await r.zrem("delayed_tasks", task_json)
@@ -278,7 +278,7 @@ async def test_zrem_prevents_duplicate_requeue(r):
     task = make_task("race-test-001")
     await r.zadd("delayed_tasks", {task: time.time() - 1})
 
-    with patch.object(worker, "r", r):
+    with patch.object(worker.redis_client, "r", r):
         # Simulate two workers both trying to zrem the same item
         removed_1 = await r.zrem("delayed_tasks", task)
         removed_2 = await r.zrem("delayed_tasks", task)  # second attempt

@@ -26,7 +26,7 @@ Start-Sleep -Seconds 2
 
 # 2. Backend
 Write-Host "[2/4] Starting FastAPI backend..." -ForegroundColor Green
-Start-Process powershell -ArgumentList "-NoExit", "-Command", "cd '$ProjectRoot'; .\.venv\Scripts\python.exe -m uvicorn src.app:app --reload"
+Start-Process powershell -ArgumentList "-NoExit", "-Command", "cd '$ProjectRoot'; .\.venv\Scripts\python.exe -m uvicorn src.main:app --reload"
 Start-Sleep -Seconds 1
 
 # 3. Worker under VizTracer
