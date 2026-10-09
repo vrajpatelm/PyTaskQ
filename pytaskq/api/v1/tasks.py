@@ -1,6 +1,6 @@
 import logging
 from fastapi import APIRouter, HTTPException
-from src.core import redis_client
+from pytaskq.core import redis_client
 
 router = APIRouter(prefix="/task", tags=["tasks"])
 logger = logging.getLogger("api")

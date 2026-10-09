@@ -31,7 +31,7 @@ class PyTaskQ:
             self.TASKS[task_name] = {"handler": func, "type": type, "cron": cron}
 
             async def delay(*args, priority="default"):
-                from src.core import redis_client
+                from pytaskq.core import redis_client
                 import json
                 import uuid
                 task_id = str(uuid.uuid4())
@@ -50,7 +50,7 @@ class PyTaskQ:
                 return {"task_id": task_id, "status": "queued"}
 
             async def schedule(*args, delay_seconds: int = 60, priority="default"):
-                from src.core import redis_client
+                from pytaskq.core import redis_client
                 import json
                 import uuid
                 import time

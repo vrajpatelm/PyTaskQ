@@ -1,7 +1,7 @@
 import time
 import json
-from src.core import redis_client
-from src.core.config import settings
+from pytaskq.core import redis_client
+from pytaskq.core.config import settings
 
 async def _notify_tenant(tenant_id: str, event_type: str) -> None:
     await redis_client.r.publish("events:global", event_type)

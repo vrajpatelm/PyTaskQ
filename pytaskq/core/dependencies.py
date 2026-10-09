@@ -1,7 +1,7 @@
 import time
 from fastapi import HTTPException, Request
-from src.core import redis_client
-from src.core.config import settings
+from pytaskq.core import redis_client
+from pytaskq.core.config import settings
 
 def get_client_ip(req: Request) -> str:
     """Extract true client IP, respecting proxy headers if behind Docker/Ngrok/Nginx"""

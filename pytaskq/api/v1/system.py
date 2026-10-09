@@ -1,6 +1,6 @@
 import time
 from fastapi import APIRouter
-from src.core import redis_client
+from pytaskq.core import redis_client
 
 router = APIRouter(prefix="/system", tags=["system"])
 

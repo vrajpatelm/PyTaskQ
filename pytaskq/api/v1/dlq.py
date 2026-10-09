@@ -1,7 +1,7 @@
 import json
 from fastapi import APIRouter, HTTPException
-from src.core import redis_client
-from src.services.dashboard_service import _notify_tenant
+from pytaskq.core import redis_client
+from pytaskq.services.dashboard_service import _notify_tenant
 
 router = APIRouter(prefix="/dlq", tags=["dlq"])
 

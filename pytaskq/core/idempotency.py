@@ -2,9 +2,9 @@ import json
 import hashlib
 from fastapi import Request, HTTPException
 from fastapi.responses import JSONResponse
-from src.core import redis_client
-from src.core.config import settings
-from src.schemas.requests import TaskRequest
+from pytaskq.core import redis_client
+from pytaskq.core.config import settings
+from pytaskq.schemas.requests import TaskRequest
 
 def _resolve_idempotency_key(req: Request, body: TaskRequest) -> str | None:
     return req.headers.get("idempotency-key") or body.idempotency_key

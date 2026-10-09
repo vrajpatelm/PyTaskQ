@@ -12,9 +12,9 @@ from opentelemetry import trace
 import croniter
 from datetime import datetime
 
-from src.schemas.requests import Taskresult, Taskloader
-from src.tracing import init_tracer, extract_trace_context, inject_trace_context
-from src.core import redis_client
+from pytaskq.schemas.requests import Taskresult, Taskloader
+from pytaskq.tracing import init_tracer, extract_trace_context, inject_trace_context
+from pytaskq.core import redis_client
 
 TASKS = {}
 

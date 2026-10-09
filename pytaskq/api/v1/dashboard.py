@@ -1,8 +1,8 @@
 import asyncio
 import logging
 from fastapi import APIRouter, Request, WebSocket, WebSocketDisconnect
-from src.core import redis_client
-from src.services.dashboard_service import _get_dashboard_data
+from pytaskq.core import redis_client
+from pytaskq.services.dashboard_service import _get_dashboard_data
 
 router = APIRouter(tags=["dashboard"])
 logger = logging.getLogger("api")
