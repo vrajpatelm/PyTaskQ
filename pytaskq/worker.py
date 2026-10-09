@@ -359,6 +359,7 @@ async def handle_task(task_json, sem, loop, process_pool, thread_pool):
                 pipe.lrem(f"processing_queue:{WORKER_ID}", count=1, value=task_json)
                 if incr_done:
                     pipe.decr("stats:processing")
+                pipe.publish("events:global", "update")
                 await pipe.execute()
         except Exception as e:
             logger.error(f"[Cleanup] Redis error: {e}")

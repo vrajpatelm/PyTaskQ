@@ -34,6 +34,7 @@ async def enqueue_task(req: EnqueueRequest):
     async with redis_client.r.pipeline(transaction=True) as pipe:
         pipe.lpush(f"queue:{req.priority}", payload)
         pipe.incr("stats:pending")
+        pipe.publish("events:global", "update")
         await pipe.execute()
     logger.info(f"Enqueued task {task_id} ({req.task_name}) at priority={req.priority}")
     return {"task_id": task_id, "status": "queued"}
@@ -56,6 +57,7 @@ async def schedule_task(req: EnqueueRequest, delay_seconds: int = 60):
     async with redis_client.r.pipeline(transaction=True) as pipe:
         pipe.zadd("delayed_tasks", {payload: execute_at})
         pipe.incr("stats:delayed")
+        pipe.publish("events:global", "update")
         await pipe.execute()
     logger.info(f"Scheduled task {task_id} ({req.task_name}) in {delay_seconds}s")
     return {"task_id": task_id, "status": "scheduled", "execute_in_seconds": delay_seconds}
