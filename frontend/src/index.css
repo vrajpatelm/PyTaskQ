@@ -84,6 +84,10 @@
   --status-default-border: #3f3f46;
 }
 
+*, *::before, *::after {
+  transition: background-color 0.25s ease, border-color 0.25s ease, color 0.15s ease;
+}
+
 body {
   margin: 0;
   font-family: 'Inter', sans-serif;
