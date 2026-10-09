@@ -29,7 +29,7 @@ class PyTaskQ:
             task_name = func.__name__
             self.TASKS[task_name] = {"handler": func, "type": type, "cron": cron}
 
-            async def delay(*args, priority="default"):
+            async def delay(*args, priority="default", on_success_url: str = None):
                 from pytaskq.core import redis_client
                 import json
                 import uuid
@@ -41,6 +41,7 @@ class PyTaskQ:
                     "retry_count": 0,
                     "fence_token": 0,
                     "priority": priority,
+                    "on_success_url": on_success_url,
                 }
                 async with redis_client.r.pipeline(transaction=True) as pipe:
                     pipe.lpush(f"queue:{priority}", json.dumps(task_payload))
@@ -48,7 +49,7 @@ class PyTaskQ:
                     await pipe.execute()
                 return {"task_id": task_id, "status": "queued"}
 
-            async def schedule(*args, delay_seconds: int = 60, priority="default"):
+            async def schedule(*args, delay_seconds: int = 60, priority="default", on_success_url: str = None):
                 from pytaskq.core import redis_client
                 import json
                 import uuid
@@ -61,6 +62,7 @@ class PyTaskQ:
                     "retry_count": 0,
                     "fence_token": 0,
                     "priority": priority,
+                    "on_success_url": on_success_url,
                 }
                 execute_at = time.time() + delay_seconds
                 async with redis_client.r.pipeline(transaction=True) as pipe:
@@ -228,8 +230,45 @@ def url_health_check(url):
         return {"url": url, "status_code": resp.status, "response_time_ms": round(diff * 1000)}
     except Exception as e  :
         return {"url": url, "status_code": 0, "error": str(e)}
-    
-    
 
 
+# ── Webhook Delivery (Retryable) ───────────────────────────────────────────────
+# Enqueued as a normal task by the worker after a task succeeds.
+# Because it goes through the queue, it gets all retry/DLQ guarantees:
+# a flaky network or sleeping server will NOT cause the webhook to silently drop.
+@queue.task(type="io")
+def _deliver_webhook(url: str, task_id: str, task_name: str, result: str):
+    """
+    Delivers a signed POST to the user's on_success_url.
+    Retried automatically up to 3 times with exponential backoff if the
+    target server is unreachable or returns a non-2xx status code.
+    """
+    _assert_safe_url(url)
 
+    payload = json.dumps({
+        "event": "task.success",
+        "task_id": task_id,
+        "task_name": task_name,
+        "result": result,
+    }).encode("utf-8")
+
+    # Optional HMAC-SHA256 signing if WEBHOOK_SECRET is set
+    secret = os.environ.get("WEBHOOK_SECRET", "")
+    signature = hmac.new(secret.encode(), payload, hashlib.sha256).hexdigest() if secret else "unsigned"
+
+    req = urllib.request.Request(
+        url,
+        data=payload,
+        headers={
+            "Content-Type": "application/json",
+            "User-Agent": "PyTaskQ-Webhook/1.0",
+            "X-PyTaskQ-Signature": f"sha256={signature}",
+            "X-PyTaskQ-Task-ID": task_id,
+        },
+        method="POST"
+    )
+    with _SAFE_OPENER.open(req, timeout=10) as resp:
+        status = resp.status
+        if status < 200 or status >= 300:
+            raise RuntimeError(f"Webhook delivery failed: target returned HTTP {status}")
+    return {"delivered_to": url, "status_code": status}

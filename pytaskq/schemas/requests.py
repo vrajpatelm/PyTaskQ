@@ -10,6 +10,7 @@ class Taskloader(BaseModel):
     fence_token: int = 0
     prev_delay: float = 1.0
     trace_carrier: dict = {}
+    on_success_url: Optional[str] = None  # If set, worker enqueues a webhook delivery task on success
     
 class Taskresult(BaseModel):
     task_id: str

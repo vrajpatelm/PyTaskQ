@@ -296,6 +296,21 @@ async def handle_task(task_json, sem, loop, process_pool, thread_pool):
                         await pipe.execute()
                     span.set_attribute("task.status", "Success")
                     logger.info(f"Task {task_id} completed successfully.")
+                    # ── Webhook delivery ──────────────────────────────────────
+                    # If the task carried an on_success_url, enqueue a
+                    # _deliver_webhook task. It travels through the queue like
+                    # any other task, so network blips are retried automatically.
+                    if tasks.on_success_url:
+                        webhook_payload = json.dumps({
+                            "task_name": "_deliver_webhook",
+                            "task_id": str(uuid.uuid4()),
+                            "args": [tasks.on_success_url, task_id, tasks.task_name, str(result)],
+                            "retry_count": 0,
+                            "fence_token": 0,
+                            "priority": "default",
+                        })
+                        await redis_client.r.lpush("queue:default", webhook_payload)
+                        logger.info(f"Enqueued webhook delivery for task {task_id} → {tasks.on_success_url}")
                 else:
                     span.set_attribute("task.status", "Discarded")
                     span.set_attribute("task.discard_reason", "fence_token_stale")
