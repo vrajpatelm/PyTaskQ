@@ -231,11 +231,13 @@ async def zombie_sweeper():
 async def handle_task(task_json, sem, loop, process_pool, thread_pool):
     incr_done = False
     try:  
+        # Immediately decrement pending since we pulled it from the queue
+        await redis_client.r.decr("stats:pending")
+        
         try:
             tasks = Taskloader.model_validate_json(task_json)
             task_id = tasks.task_id
             my_token = tasks.fence_token
-            await redis_client.r.decr("stats:pending")
         except Exception as e:
             logger.error(f"Task validation error: {e}")
             task_id = "Unknown"
