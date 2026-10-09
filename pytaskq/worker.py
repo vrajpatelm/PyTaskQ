@@ -265,7 +265,10 @@ async def handle_task(task_json, sem, loop, process_pool, thread_pool):
                 task_type = entry["type"]
                 
                 logger.info(f"Executing task {task_id} ({tasks.task_name})")
-                await redis_client.r.incr("stats:processing")
+                async with redis_client.r.pipeline(transaction=True) as pipe:
+                    pipe.incr("stats:processing")
+                    pipe.publish("events:global", "update")
+                    await pipe.execute()
                 incr_done = True
 
                 if task_type == "cpu":
