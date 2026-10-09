@@ -31,7 +31,7 @@ app.add_middleware(
     allow_headers=["Authorization", "Content-Type"],
 )
 
-app.mount("/static", StaticFiles(directory="src/static"), name="static")
+app.mount("/static", StaticFiles(directory="pytaskq/static"), name="static")
 
 app.add_exception_handler(RedisConnectionError, redis_connection_error_handler)
 
@@ -60,4 +60,4 @@ async def health_check():
 
 @app.get("/")
 def homepage():
-    return FileResponse("src/static/index.html")
+    return FileResponse("pytaskq/static/index.html")
