@@ -85,6 +85,7 @@ function App() {
   const [taskName, setTaskName] = useState('matrix_multiply');
   const [taskArgs, setTaskArgs] = useState('50');
   const [delaySeconds, setDelaySeconds] = useState('0');
+  const [webhookUrl, setWebhookUrl] = useState('');
   const [submitStatus, setSubmitStatus] = useState(null);
 
   const [recentTasks, setRecentTasks] = useState([]);
@@ -174,7 +175,7 @@ function App() {
       const response = await fetch(endpoint, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ task_name: taskName, args: parsedArgs })
+        body: JSON.stringify({ task_name: taskName, args: parsedArgs, on_success_url: webhookUrl || null })
       });
       const data = await response.json();
       if (response.ok) {
@@ -279,6 +280,10 @@ function App() {
               <div className="form-group">
                 <label>Delay (seconds) — 0 = immediate</label>
                 <input type="number" min="0" value={delaySeconds} onChange={(e) => setDelaySeconds(e.target.value)} />
+              </div>
+              <div className="form-group">
+                <label>Webhook on Success (optional)</label>
+                <input type="url" placeholder="https://example.com/webhook" value={webhookUrl} onChange={(e) => setWebhookUrl(e.target.value)} />
               </div>
               <button type="submit" className="btn btn-primary" style={{ width: '100%', marginTop: '0.5rem' }}>
                 <Zap size={16} style={{ marginRight: '0.5rem' }} />Dispatch Task
