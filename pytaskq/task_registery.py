@@ -1,7 +1,6 @@
 import uuid
 
 import numpy as np
-import yagmail
 import os
 import csv
 import random
@@ -177,16 +176,6 @@ def generate_csv_report(rows: int):
     except Exception as e:
         return {"status": "error", "error": str(e)}
 
-
-def send_email(email_to, subject, body):
-    sender_email = os.environ.get('EMAIL')
-    password = os.environ.get('EMAIL_PASSWORD')
-    if not sender_email or not password:
-        return {"result": f"Simulated email send to {email_to} (EMAIL credentials not set)"}
-
-    yag = yagmail.SMTP(sender_email, password)
-    yag.send(to=email_to, subject=subject, contents=body)
-    return {"result": f"Email sent to {email_to}"}
 
 
 @queue.task(type="cpu")
