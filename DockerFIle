@@ -16,4 +16,4 @@ USER myuser
 
 # 4. Expose port and start Uvicorn using src.main:app
 EXPOSE 8000
-CMD ["uvicorn", "src.main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["uvicorn", "pytaskq.main:app", "--host", "0.0.0.0", "--port", "8000"]

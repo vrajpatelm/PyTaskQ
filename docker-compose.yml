@@ -45,7 +45,7 @@ services:
   web:
     build:
       context: .
-      dockerfile: DockerFIle
+      dockerfile: Dockerfile
     ports:
       - "8000:8000"
     env_file:
@@ -82,8 +82,8 @@ services:
   worker:
     build:
       context: .
-      dockerfile: DockerFIle
-    command: python -u -m src.worker
+      dockerfile: Dockerfile
+    command: python -u -m pytaskq worker --app example_app:queue
     env_file:
       - .env
     environment:

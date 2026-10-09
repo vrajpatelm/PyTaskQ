@@ -32,7 +32,7 @@ desktop.ini
 *.sln
 *.swp
 .agents
-
+.freebuff
 
 # Redis dump / benchmark artifacts
 dump.rdb

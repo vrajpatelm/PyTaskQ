@@ -5,7 +5,7 @@ setup(
     version="0.1.0",
     description="A highly scalable, asynchronous distributed task queue for Python.",
     author="PyTaskQ Contributors",
-    packages=find_packages(include=['src', 'src.*']),
+    packages=find_packages(include=['pytaskq', 'pytaskq.*']),
     install_requires=[
         "fastapi",
         "redis",
@@ -16,7 +16,7 @@ setup(
     ],
     entry_points={
         "console_scripts": [
-            "pytaskq=src.cli:main",
+            "pytaskq=pytaskq.cli:main",
         ],
     },
 )
