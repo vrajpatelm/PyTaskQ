@@ -28,10 +28,10 @@ def _load_real_task_registery():
     """
     conftest.py injects a MagicMock under sys.modules["task_registery"] to
     shield other suites from yagmail/SMTP. For THESE tests we need the real
-    module, so we load the file directly from src/ by path.
+    module, so we load the file directly from pytaskq/ by path (after refactor from src/).
     """
     path = os.path.abspath(
-        os.path.join(os.path.dirname(__file__), "..", "src", "task_registery.py")
+        os.path.join(os.path.dirname(__file__), "..", "pytaskq", "task_registery.py")
     )
     spec = importlib.util.spec_from_file_location("real_task_registery", path)
     module = importlib.util.module_from_spec(spec)

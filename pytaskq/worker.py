@@ -81,6 +81,17 @@ end
 return 0
 """
 
+PRIORITY_POP_SCRIPT = """
+local dest = KEYS[1]
+for i = 2, #KEYS do
+    local val = redis.call('RPOPLPUSH', KEYS[i], dest)
+    if val then
+        return val
+    end
+end
+return nil
+"""
+
 async def is_leader() -> bool:
     try:
         acquired = await redis_client.r.set("pytaskq:leader_lock", WORKER_ID, nx=True, ex=20)
@@ -414,19 +425,28 @@ async def consumer_task():
     
     logger.info(f"Worker {WORKER_ID} started and ready to process tasks.")
     
+    idle_delay = 0.05
+    max_idle_delay = 1.0
+
     while not shutdown_event.is_set():
         try:
             await sem.acquire()
-            task_json = await redis_client.r.rpoplpush("queue:high", f"processing_queue:{WORKER_ID}")
-            if not task_json:
-                task_json = await redis_client.r.rpoplpush("queue:default", f"processing_queue:{WORKER_ID}")
-            if not task_json:
-                task_json = await redis_client.r.rpoplpush("queue:low", f"processing_queue:{WORKER_ID}")
+            task_json = await redis_client.r.eval(
+                PRIORITY_POP_SCRIPT,
+                4,
+                f"processing_queue:{WORKER_ID}",
+                "queue:high",
+                "queue:default",
+                "queue:low",
+            )
             
             if not task_json:
-                await asyncio.sleep(1)
                 sem.release()
+                await asyncio.sleep(idle_delay)
+                idle_delay = min(idle_delay * 1.5, max_idle_delay)
                 continue
+
+            idle_delay = 0.05
         except Exception as e:
             sem.release()
             logger.error(f"[Main loop] Redis error: {e.__class__.__name__}. Backing off 5s...")

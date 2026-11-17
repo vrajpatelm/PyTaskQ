@@ -41,7 +41,7 @@ async def reset_shutdown_event():
     If one test sets it, the next test starts with it already set.
     This fixture resets it before EVERY test in this file.
     """
-    import worker
+    import pytaskq.worker as worker
     worker.shutdown_event.clear()   # reset to "not set"
     worker.active_tasks.clear()     # empty the tracking set
     yield
@@ -62,7 +62,7 @@ async def test_shutdown_event_stops_consumer_loop(r):
         We run the consumer loop body in a coroutine, set shutdown_event
         after a small delay, and confirm the loop exits within a timeout.
     """
-    import worker
+    import pytaskq.worker as worker
 
     async def run_loop_until_shutdown():
         """Mimics the inner part of consumer_task's main loop."""
@@ -94,7 +94,7 @@ async def test_shutdown_event_is_initially_clear():
     SCENARIO: Worker starts fresh
     EXPECT:   shutdown_event is NOT set (worker should not exit immediately)
     """
-    import worker
+    import pytaskq.worker as worker
     assert not worker.shutdown_event.is_set(), (
         "shutdown_event was already set at startup — worker would exit immediately!"
     )
@@ -111,7 +111,7 @@ async def test_active_tasks_tracks_running_coroutines():
     EXPECT:   active_tasks contains it while it's running,
               then discards it when done (via add_done_callback)
     """
-    import worker
+    import pytaskq.worker as worker
 
     # Track a fake long-running task
     completion_event = asyncio.Event()
@@ -144,7 +144,7 @@ async def test_gather_waits_for_all_active_tasks():
     WHY: This is the core of graceful shutdown — we MUST finish in-flight
          work before exiting, or we lose results.
     """
-    import worker
+    import pytaskq.worker as worker
 
     results = []
 
@@ -178,7 +178,7 @@ async def test_gather_continues_despite_one_task_failing():
     WHY: Without return_exceptions=True, one failure would cancel the gather
          and the other 2 tasks would be abandoned mid-execution.
     """
-    import worker
+    import pytaskq.worker as worker
 
     results = []
 
@@ -222,7 +222,7 @@ async def test_semaphore_released_even_on_timeout(r):
          each timeout cycle leaks a slot. After 10 timeouts, the worker
          deadlocks — all 10 semaphore slots are consumed by nothing.
     """
-    import worker
+    import pytaskq.worker as worker
 
     sem = asyncio.Semaphore(10)
     initial_value = sem._value  # should be 10
