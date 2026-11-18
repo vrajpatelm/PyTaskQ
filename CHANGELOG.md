@@ -2,6 +2,19 @@
 
 All notable changes to PyTaskQ. Versions follow [semantic versioning](https://semver.org/).
 
+## 0.3.1 — 2026-11-18
+
+### Added
+- **Official Docker image** `ghcr.io/vrajpatelm/pytaskq` for amd64 and arm64, published automatically with each release (`0.3.1`, `0.3`, `latest`). It runs as a non-root user and has a built-in health check.
+- **Production setup** in `deploy/`: Caddy for automatic HTTPS, a private password-protected Redis, and a `backup` service that saves a snapshot every 6 hours and keeps 7 days.
+- `deploy/restore.sh` puts a backup back safely: a safety backup first, then a correct load with the append-only log rebuilt and a key-count check.
+- `docs/DEPLOYMENT.md`: a step-by-step self-hosting guide.
+- CI builds the Docker image on every pull request and runs it end to end (`scripts/smoke-test-image.sh`).
+
+### Changed
+- The `Dockerfile` installs the package itself instead of the dev/test requirements, and only copies what the image needs.
+- In the dev `docker-compose.yml`, the worker's health check now tests its Redis connection.
+
 ## 0.3.0 — 2026-11-18
 
 ### Added
