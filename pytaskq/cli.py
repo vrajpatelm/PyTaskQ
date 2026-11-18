@@ -3,7 +3,7 @@ PyTaskQ command line
 ====================
 
     pytaskq worker    --app myapp.tasks:queue [--cpu-workers N] [--io-workers N] [--timeout S]
-    pytaskq dashboard [--app myapp.tasks:queue] [--host 127.0.0.1] [--port 8000]
+    pytaskq dashboard [--app myapp.tasks:queue] [--host 127.0.0.1] [--port 8000] [--workers N]
     pytaskq tasks     --app myapp.tasks:queue
     pytaskq ping
     pytaskq users list | create NAME | reset-password NAME | set-role NAME ROLE | delete NAME | setup-code
@@ -68,9 +68,19 @@ def cmd_dashboard(args):
     if args.app:
         os.environ["PYTASKQ_APP"] = args.app
         load_app(args.app)  # fail fast with a clear message
+    from pytaskq.core.config import settings
+    workers = args.workers if args.workers is not None else settings.WEB_WORKERS
+    if workers <= 0:
+        workers = os.cpu_count() or 1
+    if args.reload and workers > 1:
+        log.info("--reload runs a single process; ignoring --workers")
+        workers = 1
+    os.environ["PYTASKQ_WEB_PROCESSES"] = str(workers)   # shown in Settings → Performance
     url = f"http://{'localhost' if args.host in ('0.0.0.0', '127.0.0.1') else args.host}:{args.port}"
-    log.info(f"PyTaskQ dashboard → {url}   (API docs: {url}/docs)")
-    uvicorn.run("pytaskq.main:app", host=args.host, port=args.port, reload=args.reload, log_level="info")
+    log.info(f"PyTaskQ dashboard → {url}   (API docs: {url}/docs)"
+             + (f"   [{workers} API processes]" if workers > 1 else ""))
+    uvicorn.run("pytaskq.main:app", host=args.host, port=args.port, reload=args.reload,
+                workers=None if args.reload else workers, log_level="info")
 
 
 def cmd_tasks(args):
@@ -94,6 +104,22 @@ def cmd_tasks(args):
             print(f"      {s['doc']}")
 
 
+def _redacted(url: str) -> str:
+    """The Redis URL without its password (this output ends up in logs and health checks)."""
+    from urllib.parse import urlsplit, urlunsplit
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return "(REDIS_URL)"
+    if parts.password is None and "@" not in parts.netloc:
+        return url
+    host = parts.hostname or ""
+    if parts.port:
+        host = f"{host}:{parts.port}"
+    user = f"{parts.username}:***@" if parts.username else "***@"
+    return urlunsplit((parts.scheme, user + host, parts.path, "", ""))
+
+
 def cmd_ping(args):
     from pytaskq.core.redis_client import make_client
     from pytaskq.core.config import settings
@@ -102,12 +128,12 @@ def cmd_ping(args):
         client = make_client()
         try:
             await client.ping()
-            workers = await client.zcard("active_workers")
-            return workers
+            import time
+            return await client.zcount("active_workers", time.time(), "+inf")   # alive ones only
         finally:
             await client.aclose()
 
-    target = settings.REDIS_URL or f"{settings.REDIS_HOST}:{settings.REDIS_PORT}"
+    target = _redacted(settings.REDIS_URL) if settings.REDIS_URL else f"{settings.REDIS_HOST}:{settings.REDIS_PORT}"
     try:
         workers = asyncio.run(go())
     except Exception as e:
@@ -200,6 +226,8 @@ def build_parser() -> argparse.ArgumentParser:
     d.add_argument("--host", default="127.0.0.1")
     d.add_argument("--port", type=int, default=8000)
     d.add_argument("--reload", action="store_true", help="Auto-reload on code changes (development)")
+    d.add_argument("--workers", type=int, default=None,
+                   help="API processes to run (default: WEB_WORKERS setting, 1). 0 = one per CPU core")
     d.set_defaults(func=cmd_dashboard)
 
     t = sub.add_parser("tasks", help="List the tasks registered in an app")

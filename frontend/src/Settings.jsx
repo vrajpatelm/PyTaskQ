@@ -1,6 +1,6 @@
-// Settings tab: your account, API tokens, and (for admins) the team.
+// Settings tab: your account, API tokens, performance advice and (for admins) the team.
 import { useCallback, useEffect, useState } from 'react'
-import { KeyRound, Link2, LogOut, Plus, ShieldAlert, Trash2 } from 'lucide-react'
+import { AlertTriangle, CheckCircle2, Gauge, Info, KeyRound, Link2, LogOut, Pencil, Plus, ShieldAlert, Trash2, XCircle } from 'lucide-react'
 import { api, can, formatClock, ROLE_HELP, ROLE_LABEL, ROLES, timeAgo } from './api'
 import { CopyButton, FormError } from './ui'
 
@@ -95,6 +95,14 @@ function TokensSection({ me, notify }) {
     try { await api(`/auth/me/tokens/${id}`, { method: 'DELETE' }); notify('success', 'Token revoked.'); load(); }
     catch (err) { notify('error', err.message); }
   };
+  const [editing, setEditing] = useState(null);     // { id, name } while renaming
+  const rename = async e => {
+    e.preventDefault();
+    try {
+      await api(`/auth/me/tokens/${editing.id}`, { method: 'PATCH', body: { name: editing.name } });
+      notify('success', 'Token renamed.'); setEditing(null); load();
+    } catch (err) { notify('error', err.message); }
+  };
 
   const origin = window.location.origin;
   return (
@@ -123,7 +131,23 @@ function TokensSection({ me, notify }) {
             <tbody>
               {tokens.map(t => (
                 <tr key={t.id}>
-                  <td className="task-name">{t.name}</td>
+                  <td className="task-name">
+                    {editing?.id === t.id ? (
+                      <form className="rename" onSubmit={rename}>
+                        <input value={editing.name} autoFocus maxLength={60} aria-label="New token name"
+                          onChange={e => setEditing({ ...editing, name: e.target.value })}
+                          onKeyDown={e => { if (e.key === 'Escape') setEditing(null); }} />
+                        <button className="btn btn-secondary btn-sm" disabled={!editing.name.trim()}>Save</button>
+                        <button type="button" className="btn btn-ghost btn-sm" onClick={() => setEditing(null)}>Cancel</button>
+                      </form>
+                    ) : (
+                      <span className="name-cell">
+                        {t.name}
+                        <button className="icon-btn" aria-label={`Rename ${t.name}`} title="Rename"
+                          onClick={() => setEditing({ id: t.id, name: t.name })}><Pencil size={13} /></button>
+                      </span>
+                    )}
+                  </td>
                   <td title={formatClock(t.created_at)}>{timeAgo(t.created_at)}</td>
                   <td>{t.last_used_at ? timeAgo(t.last_used_at) : <span className="muted">never</span>}</td>
                   <td><div className="row-actions"><button className="btn btn-ghost btn-sm" onClick={() => revoke(t.id)}>Revoke</button></div></td>
@@ -132,6 +156,94 @@ function TokensSection({ me, notify }) {
             </tbody>
           </table>
         </div>
+      )}
+    </Section>
+  );
+}
+
+// ── performance ─────────────────────────────────────────────────────────────
+
+const LEVEL = {
+  critical: { icon: XCircle, label: 'Needs attention' },
+  warning: { icon: AlertTriangle, label: 'Worth a look' },
+  info: { icon: Info, label: 'Tip' },
+  ok: { icon: CheckCircle2, label: 'All good' },
+};
+
+const n = v => Number(v || 0).toLocaleString();
+
+function Stat({ label, value, note }) {
+  return (
+    <div className="stat">
+      <div className="stat-label">{label}</div>
+      <div className="stat-value">{value}</div>
+      {note && <div className="stat-note">{note}</div>}
+    </div>
+  );
+}
+
+function PerformanceSection() {
+  const [report, setReport] = useState(null);
+  const [error, setError] = useState('');
+
+  useEffect(() => {
+    let alive = true;
+    const load = () => api('/system/performance')
+      .then(d => { if (alive) { setReport(d); setError(''); } })
+      .catch(e => { if (alive) setError(e.message); });
+    load();
+    const iv = setInterval(load, 10000);
+    return () => { alive = false; clearInterval(iv); };
+  }, []);
+
+  const away = report?.turned_away || {};
+  const refused = (away.queue_full || 0) + (away.redis_busy || 0) + (away.redis_down || 0);
+  const pool = report?.api.redis_connections;
+  return (
+    <Section
+      title="Performance"
+      description="Whether this server is keeping up with its traffic, and which setting to change if it isn't. Refreshes every 10 seconds."
+    >
+      {error && <FormError message={error} />}
+      {!report && !error && <p className="muted small">Checking…</p>}
+      {report && (
+        <>
+          <ul className="advice">
+            {report.suggestions.map(s => {
+              const L = LEVEL[s.level] || LEVEL.info;
+              const Icon = L.icon;
+              return (
+                <li key={s.title} className={`advice-item advice-${s.level}`}>
+                  <Icon size={18} aria-label={L.label} />
+                  <div>
+                    <strong>{s.title}</strong>
+                    <p>{s.detail}</p>
+                    {s.setting && (
+                      <div className="advice-fix">
+                        <span className="muted small">Add to the server’s <code>.env</code>, then restart:</span>
+                        <div className="token-row"><code>{s.setting}</code><CopyButton text={s.setting} label="Copy" /></div>
+                      </div>
+                    )}
+                  </div>
+                </li>
+              );
+            })}
+          </ul>
+
+          <div className="stats">
+            <Stat label={`Turned away, last ${report.window_minutes} min`} value={n(refused)}
+              note={refused ? `${n(away.queue_full)} queue full, ${n(away.redis_busy)} Redis busy, ${n(away.redis_down)} Redis down` : 'none'} />
+            <Stat label="Queue" value={`${report.queue.total} / ${report.queue.capacity}`} note="jobs waiting / QUEUE_CAPACITY" />
+            <Stat label="Workers" value={`${report.workers.running} / ${report.workers.slots}`}
+              note={`jobs running / job slots, on ${report.workers.count} worker${report.workers.count === 1 ? '' : 's'}`} />
+            <Stat label="API" value={`${report.api.processes} of ${report.api.cpu_cores}`}
+              note={`processes / CPU cores. Redis connections: ${pool.in_use} in use, up to ${pool.max_connections}`} />
+          </div>
+          <p className="muted small perf-foot">
+            <Gauge size={13} /> The <a href="https://github.com/vrajpatelm/PyTaskQ/blob/main/docs/PERFORMANCE.md" target="_blank" rel="noreferrer">tuning guide</a> explains
+            every setting and how to load-test your own server.
+          </p>
+        </>
       )}
     </Section>
   );
@@ -255,21 +367,25 @@ function TeamSection({ me, notify }) {
 export default function SettingsView({ me, authEnabled, onSignOut, notify }) {
   if (!authEnabled) {
     return (
-      <section className="panel settings-section">
-        <div className="callout">
-          <ShieldAlert size={18} />
-          <div>
-            <strong>Sign-in is turned off on this server.</strong>
-            <p>Anyone who can open this page has full control. Remove <code>PYTASKQ_AUTH=off</code> from the server’s environment and restart to require accounts.</p>
+      <div className="settings">
+        <section className="panel settings-section">
+          <div className="callout">
+            <ShieldAlert size={18} />
+            <div>
+              <strong>Sign-in is turned off on this server.</strong>
+              <p>Anyone who can open this page has full control. Remove <code>PYTASKQ_AUTH=off</code> from the server’s environment and restart to require accounts.</p>
+            </div>
           </div>
-        </div>
-      </section>
+        </section>
+        <PerformanceSection />
+      </div>
     );
   }
   return (
     <div className="settings">
       <AccountSection me={me} onSignOut={onSignOut} notify={notify} />
       <TokensSection me={me} notify={notify} />
+      <PerformanceSection />
       {can(me, 'admin') && <TeamSection me={me} notify={notify} />}
     </div>
   );

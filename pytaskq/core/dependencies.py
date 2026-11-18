@@ -1,45 +1,39 @@
-import time
 from fastapi import HTTPException, Request
 from pytaskq.core import redis_client
 from pytaskq.core.config import settings
 
 def get_client_ip(req: Request) -> str:
-    """Extract true client IP, respecting proxy headers if behind Docker/Ngrok/Nginx"""
-    forwarded = req.headers.get("x-forwarded-for")
-    if forwarded:
-        return forwarded.split(",")[0].strip()
-    return req.client.host
+    """The caller's IP address (used to throttle sign-in attempts).
+
+    Deliberately NOT read from X-Forwarded-For: anyone can send that header, so
+    trusting it let a client dodge the per-IP limit, or lock out someone else's
+    IP. Behind a reverse proxy, uvicorn already puts the real visitor IP here
+    for proxies listed in FORWARDED_ALLOW_IPS (deploy/ sets this for Caddy).
+    """
+    return req.client.host if req.client else "unknown"
+
+QUEUE_KEYS = ("queue:high", "queue:default", "queue:low")
+RETRY_AFTER_SECONDS = 2
+
+
+def queue_full_error() -> HTTPException:
+    from pytaskq.core import pressure
+    pressure.record("queue_full")
+    return HTTPException(
+        status_code=429,
+        detail="Server is busy. Please retry after a few seconds.",
+        headers={"Retry-After": str(RETRY_AFTER_SECONDS)},
+    )
+
 
 async def check_backpressure():
-    queue_len = (
-        await redis_client.r.llen("queue:high")
-        + await redis_client.r.llen("queue:default")
-        + await redis_client.r.llen("queue:low")
-    )
+    """Refuse new jobs (429) once the queues hold QUEUE_CAPACITY jobs. One Redis round trip."""
+    async with redis_client.r.pipeline(transaction=False) as pipe:
+        for key in QUEUE_KEYS:
+            pipe.llen(key)
+        queue_len = sum(await pipe.execute())
     if queue_len >= settings.QUEUE_CAPACITY:
-        raise HTTPException(
-            status_code=429,
-            detail="Server is busy. Please retry after a few seconds.",
-        )
-
-async def rate_limiter():
-    """
-    CHECK-ONLY rate limiter — does NOT increment the counter.
-    """
-    current_minute = int(time.time() / 60)
-    key = f"rate_limit:global:{current_minute}"
-    count = int(await redis_client.r.get(key) or 0)
-    if count >= settings.RATE_LIMIT_PER_MINUTE:
-        raise HTTPException(status_code=429, detail="Too many Requests. Please wait a minute")
-
-async def _incr_rate_limit() -> None:
-    """Atomically increment the rate limit counter for a confirmed fresh request."""
-    current_minute = int(time.time() / 60)
-    key = f"rate_limit:global:{current_minute}"
-    count = await redis_client.r.incr(key)
-    if count == 1:
-        await redis_client.r.expire(key, 60)
-
+        raise queue_full_error()
 
 # ── Authentication & roles ────────────────────────────────────────────────────
 from urllib.parse import urlparse

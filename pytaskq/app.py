@@ -20,6 +20,7 @@ pytaskq.app — the PyTaskQ SDK
 
     # Enqueue from async code
     await render_report.delay(42, fmt="csv")
+    await render_report.delay(42, idempotency_key=f"report-42")   # safe to retry: queued once
     await render_report.apply_async(args=[42], priority="low", countdown=30)
 
     # …or from plain sync code (scripts, Django/Flask views)
@@ -49,7 +50,7 @@ TASK_TYPES = ("cpu", "io", "async")
 
 # Option names `delay()` treats as queue options rather than task kwargs —
 # unless the task function itself declares a parameter with that name.
-_DELAY_OPTIONS = ("priority", "on_success_url")
+_DELAY_OPTIONS = ("priority", "on_success_url", "idempotency_key")
 
 
 def _redis():
@@ -193,7 +194,7 @@ class PyTaskQ:
 
             async def apply_async(args=None, kwargs=None, *, priority: Optional[str] = None,
                                   countdown: float = 0, on_success_url: Optional[str] = None,
-                                  task_id: Optional[str] = None) -> dict:
+                                  task_id: Optional[str] = None, idempotency_key: Optional[str] = None) -> dict:
                 payload = queueing.new_payload(
                     task_name, args, kwargs,
                     priority=priority or prio,
@@ -202,7 +203,8 @@ class PyTaskQ:
                     timeout=limit,
                     task_id=task_id,
                 )
-                return await queueing.enqueue(_redis(), payload, delay_seconds=countdown)
+                return await queueing.enqueue(_redis(), payload, delay_seconds=countdown,
+                                              idempotency_key=idempotency_key)
 
             async def delay(*args, **kwargs) -> dict:
                 kwargs, opts = _split(kwargs)
@@ -220,6 +222,7 @@ class PyTaskQ:
                     queueing.new_payload(task_name, args, kwargs, priority=opts.get("priority") or prio,
                                          on_success_url=opts.get("on_success_url"),
                                          max_retries=retries, timeout=limit),
+                    idempotency_key=opts.get("idempotency_key"),
                 ))
 
             fn.delay = delay

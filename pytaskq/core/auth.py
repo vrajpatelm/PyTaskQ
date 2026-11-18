@@ -270,33 +270,38 @@ async def set_password(r, username: str, new_password: str, keep_session_sha: Op
 
 # ── login throttling ─────────────────────────────────────────────────────────
 
-async def _failures(r, username: str, ip: str) -> tuple[int, int]:
-    u, i = await r.mget(f"auth:fail:user:{username}", f"auth:fail:ip:{ip}")
-    return int(u or 0), int(i or 0)
+async def _reserve_attempt(r, username: str, ip: str) -> tuple[int, int]:
+    """Count this attempt BEFORE checking the password; returns (attempts by user, by IP).
 
-
-async def _record_failure(r, username: str, ip: str) -> None:
+    Counting first is what makes the limit hold under parallel requests: 40
+    guesses sent at once used to all pass a "fewer than 10 so far?" check before
+    any of them was recorded.
+    """
     async with r.pipeline(transaction=True) as pipe:
         for key in (f"auth:fail:user:{username}", f"auth:fail:ip:{ip}"):
             pipe.incr(key)
             pipe.expire(key, LOGIN_WINDOW)
-        await pipe.execute()
+        by_user, _, by_ip, _ = await pipe.execute()
+    return int(by_user), int(by_ip)
 
 
 async def authenticate(r, username: str, password: str, ip: str = "unknown") -> User:
     """Check a username/password. Raises AuthError (generic message) on failure."""
     name = (username or "").strip().lower()
-    by_user, by_ip = await _failures(r, name, ip)
-    if by_user >= MAX_FAILS_PER_USER or by_ip >= MAX_FAILS_PER_IP:
+    by_user, by_ip = await _reserve_attempt(r, name, ip)
+    if by_user > MAX_FAILS_PER_USER or by_ip > MAX_FAILS_PER_IP:
         raise AuthError("Too many failed sign-in attempts. Try again in 15 minutes.", 429)
 
     h = await r.hgetall(_k_user(name)) if USERNAME_RE.match(name) else {}
     ok = await verify_password(password or "", h.get("password_hash") or _DUMMY_HASH)
     if not h or not ok or h.get("disabled") == "1":
-        await _record_failure(r, name, ip)
-        raise AuthError("Wrong username or password.", 401)
+        raise AuthError("Wrong username or password.", 401)   # the attempt stays counted
 
-    await r.delete(f"auth:fail:user:{name}")
+    # A correct password isn't a failure: clear the user's count, give the IP its attempt back.
+    async with r.pipeline(transaction=True) as pipe:
+        pipe.delete(f"auth:fail:user:{name}")
+        pipe.decr(f"auth:fail:ip:{ip}")
+        await pipe.execute()
     return _user_from_hash(h)
 
 
@@ -320,13 +325,7 @@ async def create_session(r, username: str) -> str:
 async def user_for_session(r, token: str) -> Optional[User]:
     if not token:
         return None
-    username = await r.get(f"auth:session:{_sha(token)}")
-    if not username:
-        return None
-    user = await get_user(r, username)
-    if not user or user.disabled:
-        return None
-    return user
+    return await _lookup(r, "session", f"auth:session:{_sha(token)}")
 
 
 async def end_session(r, token: str) -> None:
@@ -392,19 +391,73 @@ async def revoke_api_token(r, username: str, token_id: str) -> bool:
     return False
 
 
+async def rename_api_token(r, username: str, token_id: str, name: str) -> Optional[dict]:
+    """Change a token's label. The secret itself never changes."""
+    name = (name or "").strip()[:60]
+    if not name:
+        raise AuthError("Give the token a name.")
+    if len(token_id) < 8:
+        return None
+    for sha in await r.smembers(f"auth:user_tokens:{username}"):
+        if sha.startswith(token_id):
+            key = f"auth:token:{sha}"
+            if not await r.exists(key):
+                return None
+            await r.hset(key, "name", name)
+            return _token_view(await r.hgetall(key))
+    return None
+
+
 async def user_for_api_token(r, token: str) -> Optional[User]:
     if not token or not token.startswith(TOKEN_PREFIX):
         return None
-    sha = _sha(token)
-    h = await r.hgetall(f"auth:token:{sha}")
-    if not h:
-        return None
-    user = await get_user(r, h["username"])
-    if not user or user.disabled:
-        return None
-    await r.hset(f"auth:token:{sha}", "last_used_at", time.time())
-    user.via = "token"
+    user = await _lookup(r, "token", f"auth:token:{_sha(token)}")
+    if user:
+        user.via = "token"
     return user
+
+
+# Resolve a session or API token to its user in ONE Redis round trip.
+# Every authenticated request runs this, so it used to cost three sequential
+# calls (credential → user → "last used" write). Nothing is cached: revoking a
+# token, ending a session or disabling a user takes effect on the next request.
+# "last used" is written at most once per TOKEN_TOUCH_SECONDS, not on every call.
+# KEYS[1] credential key   ARGV: kind ("session"|"token"), now, touch interval
+LOOKUP_SCRIPT = """
+local username
+if ARGV[1] == 'token' then
+    local t = redis.call('HMGET', KEYS[1], 'username', 'last_used_at')
+    username = t[1]
+    if username and (tonumber(ARGV[2]) - (tonumber(t[2]) or 0)) >= tonumber(ARGV[3]) then
+        redis.call('HSET', KEYS[1], 'last_used_at', ARGV[2])
+    end
+else
+    username = redis.call('GET', KEYS[1])
+end
+if not username then
+    return false
+end
+return redis.call('HGETALL', 'auth:user:' .. username)
+"""
+TOKEN_TOUCH_SECONDS = 60
+_lookup_script = None
+
+
+async def _lookup(r, kind: str, key: str) -> Optional[User]:
+    global _lookup_script
+    if _lookup_script is None:
+        _lookup_script = r.register_script(LOOKUP_SCRIPT)
+    flat = await _lookup_script(keys=[key], args=[kind, time.time(), TOKEN_TOUCH_SECONDS], client=r)
+    if not flat:
+        return None
+    if isinstance(flat, dict):
+        h = flat
+    else:
+        h = dict(zip(flat[0::2], flat[1::2]))
+    if not h.get("username"):
+        return None
+    user = _user_from_hash(h)
+    return None if user.disabled else user
 
 
 # ── invites ──────────────────────────────────────────────────────────────────
@@ -502,6 +555,9 @@ async def complete_setup(r, code: str, username: str, password: str) -> User:
     if not await r.set("auth:setup_lock", "1", nx=True, ex=30):
         raise AuthError("Setup is already in progress.", 409)
     try:
+        # Check again under the lock: another browser may have just finished.
+        if await user_count(r) > 0:
+            raise AuthError("Setup is already complete. Sign in instead.", 409)
         user = await create_user(r, username, password, "admin", created_by="setup")
         await r.delete(K_SETUP_CODE)
         return user
@@ -515,8 +571,13 @@ async def bootstrap_from_env(r) -> Optional[User]:
         return None
     if await user_count(r) > 0:
         return None
-    user = await create_user(r, settings.PYTASKQ_ADMIN_USER, settings.PYTASKQ_ADMIN_PASSWORD,
-                             "admin", created_by="env")
+    try:
+        user = await create_user(r, settings.PYTASKQ_ADMIN_USER, settings.PYTASKQ_ADMIN_PASSWORD,
+                                 "admin", created_by="env")
+    except AuthError as e:
+        if e.status == 409:      # another API process (--workers N) created it a moment ago
+            return None
+        raise
     await r.delete(K_SETUP_CODE)
     return user
 

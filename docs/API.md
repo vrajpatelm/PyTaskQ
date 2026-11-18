@@ -35,6 +35,7 @@ Returns live cluster-wide queue and worker statistics.
       "queue_default": 0,
       "queue_low": 0,
       "queue_total": 0,
+      "queue_capacity": 500,
       "worker_count": 3
     }
     ```
@@ -138,11 +139,29 @@ Delete all failed tasks permanently.
 Response: `{"task_id": "…", "status": "queued"}` (or `"scheduled"` with `execute_in_seconds`).
 
 Errors:
-* `404` — the task name isn't registered by any worker. The message lists the available tasks.
-* `422` — invalid body (e.g. unknown priority).
-* `429` — the queues are at `QUEUE_CAPACITY`.
+* `404` — the task name isn't advertised by any running worker. The message lists the available tasks.
+* `422` — invalid body: an unknown priority, a delay outside 0 to 1 year, `NaN`/`Infinity` in the arguments, a malformed `Idempotency-Key`, or a key already used for a different job.
+* `429` — the queues are at `QUEUE_CAPACITY`. Wait `Retry-After` seconds and try again.
+* `503` — the server couldn't reach Redis in time. Also carries `Retry-After`.
 
 `POST /task/schedule?delay_seconds=60` still works and takes the same body.
+
+#### Safe retries with `Idempotency-Key`
+
+A client that times out, or gets a 429 or 503, can't tell whether its job was queued. Send any unique string (a UUID works well) in an `Idempotency-Key` header, and resend the exact same request when in doubt:
+
+```bash
+curl -X POST https://jobs.example.com/task/enqueue \
+  -H "Authorization: Bearer ptq_…" -H "Idempotency-Key: order-1042-receipt" \
+  -H "Content-Type: application/json" -d '{"task_name": "send_receipt", "args": [1042]}'
+```
+
+* The first request queues the job. Repeats within `IDEMPOTENCY_TTL` (a day) return the **same** response plus `"duplicate": true`, and queue nothing.
+* Repeats are answered even while the queue is full, since that job was already accepted.
+* Reusing a key for a *different* job (other task, arguments, priority or delay) is a `422`.
+* Keys are 1 to 255 printable characters without spaces, and shared by everyone using this server.
+
+The SDK takes the same option: `await send_receipt.delay(1042, idempotency_key="order-1042-receipt")`.
 
 ### Job status — `GET /task/{task_id}`
 
@@ -181,7 +200,7 @@ Query: `status`, `task_name`, `limit` (1–500). Newest first, drawn from the la
 
 ### Registered tasks — `GET /tasks/registered`
 
-What workers (or `pytaskq dashboard --app …`) advertised, including each parameter:
+What running workers (or `pytaskq dashboard --app …`) advertise, including each parameter. Workers running different apps are all listed; a task drops out about 5 minutes after nothing advertises it any more.
 
 ```json
 {"tasks": [{"name": "send_receipt", "type": "io", "priority": "high", "max_retries": 3, "timeout": 300,
@@ -196,7 +215,7 @@ Each worker reports `hostname`, `pid`, `app`, `active`, `processed`, `failed`, `
 
 ### Dead letters
 
-Each `GET /dlq` entry now includes `error` (the last exception) and `failed_at`. `replay` and `retry_all` put jobs back on their **original priority queue** with a valid fence token.
+Each `GET /dlq` entry includes `error` (the last exception) and `failed_at`. `replay` and `retry_all` put jobs back on their **original priority queue** with a valid fence token. Each dead letter can only be taken once: if two people replay (or delete) the same job at the same moment, the second gets `409` and the job runs once.
 
 ---
 
@@ -222,7 +241,7 @@ With `PYTASKQ_AUTH=off`, every request is treated as an admin called `local`.
 |---|---|---|---|
 | `GET` | `/auth/status` | — | `{"auth_enabled", "setup_required", "user"}` |
 | `POST` | `/auth/setup` | `{"setup_code", "username", "password"}` | Only while no account exists; signs you in |
-| `POST` | `/auth/login` | `{"username", "password"}` | Throttled after 10 failures per user (or 30 per IP) for 15 minutes |
+| `POST` | `/auth/login` | `{"username", "password"}` | After 10 failed attempts per user (or 30 per IP) in 15 minutes, further attempts get `429`. Attempts are counted before the password is checked, so parallel guesses can't exceed the limit. The IP is the connection's (or the one your reverse proxy reports, see `FORWARDED_ALLOW_IPS`), never a client-sent `X-Forwarded-For`. |
 | `GET` | `/auth/invites/{token}` | — | `{"role", "created_by", "expires_at"}` |
 | `POST` | `/auth/invites/{token}/accept` | `{"username", "password"}` | Single use; signs you in |
 
@@ -235,6 +254,7 @@ With `PYTASKQ_AUTH=off`, every request is treated as an admin called `local`.
 | `POST` | `/auth/me/password` | `{"current_password", "new_password"}` | Signs out your other sessions |
 | `GET` | `/auth/me/tokens` | — | Your tokens (never the secret) |
 | `POST` | `/auth/me/tokens` | `{"name"}` | Returns `{"token": "ptq_…"}` **once** |
+| `PATCH` | `/auth/me/tokens/{id}` | `{"name"}` | Rename (the secret doesn't change) |
 | `DELETE` | `/auth/me/tokens/{id}` | — | Revoke |
 
 ### Admin
@@ -252,4 +272,16 @@ The only active admin can't be demoted, disabled or deleted. Make someone else a
 
 ### WebSocket
 
-`/ws/dashboard` accepts the session cookie (same-origin only) or `?token=ptq_…`. Unauthenticated connections are closed with code `4401`.
+`/ws/dashboard` accepts the session cookie (same-origin only) or `?token=ptq_…`. Unauthenticated connections are closed with code `4401`. Updates are pushed at most `LIVE_UPDATES_PER_SECOND` times a second (default 2).
+
+### Calling the API from another website
+
+The dashboard is served from the API's own address and needs no CORS. With the default `ALLOWED_ORIGINS=*`, browser code on other sites can call the API with an API token (`Authorization: Bearer ptq_…`), but **never** with a signed-in visitor's cookie. To let a specific site use cookies, list its exact origin: `ALLOWED_ORIGINS=https://admin.example.com`.
+
+---
+
+## Tracing (optional)
+
+Set `OTEL_EXPORTER_OTLP_ENDPOINT` (and install `pytaskq[tracing]`, already in the Docker image) to send OpenTelemetry traces to Jaeger, Grafana Tempo, Honeycomb, Datadog and others. One trace follows a job from the request that queued it through every attempt: `POST /task/enqueue` → `enqueue send_receipt` → `run send_receipt` (one per attempt) → follow-up webhook jobs. A `traceparent` header sent to the API is continued, and `task.delay()` called inside your own app's span joins your trace.
+
+Spans record task names, job ids, attempt numbers, worker ids, route patterns (`/task/{task_id}`) and status codes, never URLs, headers, bodies or job arguments. `OTEL_SERVICE_NAME` and `OTEL_RESOURCE_ATTRIBUTES` are respected; `https://` endpoints use TLS.

@@ -4,6 +4,7 @@ import time
 from fastapi import APIRouter, Depends, HTTPException
 
 from pytaskq.core import queueing, redis_client
+from pytaskq.core.config import settings
 from pytaskq.core.dependencies import require
 from pytaskq.services.dashboard_service import _notify_tenant
 
@@ -14,19 +15,60 @@ DLQ_KEY = "dlq"
 _DLQ_ONLY_FIELDS = ("error", "failed_at")
 
 
+# Take one entry out of the dead-letter list and queue it again, atomically.
+# If someone else already took it (a second click, another admin, "Replay all"
+# at the same moment), LREM removes nothing and the job is NOT queued twice.
+# KEYS: dlq, target queue, stats:dlq, stats:pending, task hash
+# ARGV: dead-letter entry, new payload, task_id, task_name, priority, note, result TTL
+REPLAY_SCRIPT = """
+if redis.call('LREM', KEYS[1], 1, ARGV[1]) == 0 then
+    return 0
+end
+redis.call('DECR', KEYS[3])
+redis.call('RPUSH', KEYS[2], ARGV[2])
+redis.call('INCR', KEYS[4])
+if ARGV[3] ~= '' then
+    redis.call('HDEL', KEYS[5], 'started_at', 'finished_at', 'duration_ms', 'next_retry_at', 'result')
+    redis.call('HSET', KEYS[5], 'task_id', ARGV[3], 'task_name', ARGV[4], 'status', 'Queued',
+               'priority', ARGV[5], 'retry_count', 0, 'payload', ARGV[2], 'error', '', 'note', ARGV[6])
+    redis.call('EXPIRE', KEYS[5], ARGV[7])
+end
+return 1
+"""
+
+PURGE_SCRIPT = """
+if redis.call('LREM', KEYS[1], 1, ARGV[1]) == 0 then
+    return 0
+end
+redis.call('DECR', KEYS[2])
+return 1
+"""
+
+
+def _reject_constant(name):
+    raise ValueError(name)
+
+
+def _parse(raw: str):
+    try:
+        item = json.loads(raw, parse_constant=_reject_constant)
+    except ValueError:
+        return None
+    return item if isinstance(item, dict) else None
+
+
 @router.get("")
 async def get_dlq():
-    view_dlq = await redis_client.r.lrange(DLQ_KEY, 0, -1)
-    tasks = [json.loads(item) for item in view_dlq]
-    return {"tasks": tasks}
+    items = [_parse(raw) for raw in await redis_client.r.lrange(DLQ_KEY, 0, -1)]
+    return {"tasks": [i for i in items if i is not None]}   # unreadable entries are skipped
 
 
 async def _find(task_id: str):
     for raw in await redis_client.r.lrange(DLQ_KEY, 0, -1):
-        item = json.loads(raw)
-        if item.get("task_id") == task_id:
+        item = _parse(raw)
+        if item is not None and item.get("task_id") == task_id:
             return raw, item
-    raise HTTPException(status_code=404, detail="Task for particular id is not found")
+    raise HTTPException(status_code=404, detail="That job is not in the dead letters (it may have been replayed or deleted).")
 
 
 async def _fresh_payload(item: dict) -> dict:
@@ -40,33 +82,25 @@ async def _fresh_payload(item: dict) -> dict:
     return task
 
 
-def _queue_ops(pipe, raw: str, task: dict):
-    task_id = task.get("task_id")
-    new_raw = json.dumps(task)
-    pipe.lrem(DLQ_KEY, 1, raw)
-    pipe.decr("stats:dlq")
-    pipe.rpush(queueing.queue_key(task.get("priority", "default")), new_raw)
-    pipe.incr("stats:pending")
-    if task_id:
-        pipe.hset(queueing.task_key(task_id), mapping={
-            "task_id": task_id,
-            "task_name": task.get("task_name", ""),
-            "status": queueing.QUEUED,
-            "priority": task.get("priority", "default"),
-            "retry_count": 0,
-            "payload": new_raw,
-            "error": "",
-            "note": f"Replayed from DLQ at {time.strftime('%Y-%m-%d %H:%M:%S')}",
-        })
+async def _replay(raw: str, task: dict) -> bool:
+    """Queue a dead letter again. False if someone else already took it."""
+    task_id = task.get("task_id") or ""
+    priority = task.get("priority", "default")
+    note = f"Replayed from dead letters at {time.strftime('%Y-%m-%d %H:%M:%S')}"
+    done = await redis_client.r.eval(
+        REPLAY_SCRIPT, 5,
+        DLQ_KEY, queueing.queue_key(priority), "stats:dlq", "stats:pending", queueing.task_key(task_id),
+        raw, json.dumps(task), task_id, task.get("task_name", ""), priority, note, int(settings.RESULT_TTL),
+    )
+    return bool(done)
 
 
 @router.post("/replay/{task_id}", dependencies=_operator)
 async def replay_task(task_id: str):
     raw, item = await _find(task_id)
     task = await _fresh_payload(item)
-    async with redis_client.r.pipeline(transaction=True) as pipe:
-        _queue_ops(pipe, raw, task)
-        await pipe.execute()
+    if not await _replay(raw, task):
+        raise HTTPException(status_code=409, detail="This job was already replayed or deleted by someone else.")
     await _notify_tenant("global", "dlq_updated")
     return {"message": "Task replayed successfully", "task": task}
 
@@ -74,10 +108,8 @@ async def replay_task(task_id: str):
 @router.post("/purge/{task_id}", dependencies=_operator)
 async def purge_task(task_id: str):
     raw, item = await _find(task_id)
-    async with redis_client.r.pipeline(transaction=True) as pipe:
-        pipe.lrem(DLQ_KEY, 1, raw)
-        pipe.decr("stats:dlq")
-        await pipe.execute()
+    if not await redis_client.r.eval(PURGE_SCRIPT, 2, DLQ_KEY, "stats:dlq", raw):
+        raise HTTPException(status_code=409, detail="This job was already replayed or deleted by someone else.")
     await _notify_tenant("global", "dlq_updated")
     return {"message": "task is Deleted", "task": item}
 
@@ -100,15 +132,12 @@ async def retry_all_dlq():
         return {"message": "DLQ is empty", "retried": 0}
 
     retried = 0
-    async with redis_client.r.pipeline(transaction=True) as pipe:
-        for raw in raws:
-            try:
-                item = json.loads(raw)
-            except ValueError:
-                continue
-            _queue_ops(pipe, raw, await _fresh_payload(item))
+    for raw in raws:
+        item = _parse(raw)
+        if item is None:
+            continue
+        if await _replay(raw, await _fresh_payload(item)):
             retried += 1
-        await pipe.execute()
 
     await _notify_tenant("global", "dlq_updated")
     return {"message": f"Successfully requeued {retried} tasks", "retried": retried}

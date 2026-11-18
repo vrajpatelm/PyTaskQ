@@ -38,7 +38,7 @@ PYTASKQ_DOMAIN=jobs.example.com
 REDIS_PASSWORD=<paste the output of: python3 -c "import secrets; print(secrets.token_urlsafe(32))">
 ```
 
-Pin the version too (`PYTASKQ_VERSION=0.3.1`), so upgrades only happen when you choose.
+Pin the version too (`PYTASKQ_VERSION=0.3.2`), so upgrades only happen when you choose.
 
 ## 3. Start
 
@@ -123,6 +123,17 @@ docker compose -f docker-compose.prod.yml pull
 docker compose -f docker-compose.prod.yml up -d
 ```
 
+## Tracing (optional)
+
+To see each job's journey in Jaeger, Grafana Tempo, Honeycomb or Datadog, add your collector's OTLP gRPC address to `.env` and restart:
+
+```bash
+OTEL_EXPORTER_OTLP_ENDPOINT=https://otel.example.com:4317
+# OTEL_EXPORTER_OTLP_HEADERS=x-honeycomb-team=YOUR_KEY   # if your service needs an API key
+```
+
+The image already includes the tracing libraries. Spans never contain URLs, job arguments or secrets. Details: [API.md](API.md#tracing-optional).
+
 ## Security checklist
 
 - [ ] `REDIS_PASSWORD` is long and random. Redis is never published to the internet.
@@ -150,3 +161,4 @@ Caddy adds `X-Forwarded-For` and `X-Forwarded-Proto`, so PyTaskQ sees the visito
 | `required variable … is missing a value` | That setting is missing from `.env`. |
 | Dashboard says "No workers are running" | `docker compose -f docker-compose.prod.yml logs worker` |
 | Lost the admin password | `docker compose -f docker-compose.prod.yml exec web pytaskq users reset-password NAME` |
+| Requests get 429 or 503 under load | Open **Settings → Performance** in the dashboard. [PERFORMANCE.md](PERFORMANCE.md) explains each setting. |

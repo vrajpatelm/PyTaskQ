@@ -25,7 +25,7 @@ Thank you for your interest in contributing to this project! Please review the g
 
 *   **PEP 8**: Follow standard PEP 8 naming and formatting practices for Python.
 *   **No hardcoded secrets or hosts**: API keys, master keys, and target hosts come from environment variables (see `.env.example`). Never commit real keys — `.env` is gitignored for a reason.
-*   **Single source of truth for limits**: enforcement paths and reporting paths (`/metrics`) must read the same config constant (e.g., `RATE_LIMIT_PER_MINUTE`) — never a second literal.
+*   **Single source of truth for limits**: enforcement paths and reporting paths (`/metrics`) must read the same config constant (e.g., `QUEUE_CAPACITY`) — never a second literal.
 *   **Asynchronous Code**:
     *   Always use non-blocking libraries (e.g., `redis.asyncio` for Redis).
     *   Avoid calling blocking I/O functions directly within the primary worker event loop; run them within a `ThreadPoolExecutor` or `ProcessPoolExecutor` via `loop.run_in_executor`.
