@@ -60,7 +60,7 @@ pytaskq = "pytaskq.cli:main"
 Homepage = "https://github.com/vrajpatelm/PyTaskQ"
 Documentation = "https://github.com/vrajpatelm/PyTaskQ#readme"
 Issues = "https://github.com/vrajpatelm/PyTaskQ/issues"
-Changelog = "https://github.com/vrajpatelm/PyTaskQ#whats-new-in-03"
+Changelog = "https://github.com/vrajpatelm/PyTaskQ/blob/main/CHANGELOG.md"
 
 [tool.setuptools.dynamic]
 version = { attr = "pytaskq.__version__" }
