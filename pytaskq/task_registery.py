@@ -14,6 +14,7 @@ import csv
 import io
 import random
 import time
+import urllib.request
 import uuid
 
 from pytaskq.app import PyTaskQ, _deliver_webhook  # noqa: F401  (re-exported)

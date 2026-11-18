@@ -92,3 +92,35 @@ def test_ssrf_guard_blocks_hostname_resolving_to_private_ip(monkeypatch):
     )
     with pytest.raises(UnsafeURL):
         _assert_safe_url("https://totally-public.example.com/")
+
+
+def test_resize_image_runs_end_to_end(monkeypatch):
+    """Regression: resize_image lost its `urllib.request` import and silently
+    returned {"status": "error"} on every call. Exercise the full path with a
+    fake download so this can't happen again."""
+    import io
+    import socket
+    from PIL import Image
+
+    buf = io.BytesIO()
+    Image.new("RGB", (40, 30), "purple").save(buf, format="PNG")
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def read(self, limit):
+            return buf.getvalue()
+
+    monkeypatch.setattr(
+        socket, "getaddrinfo",
+        lambda host, *a, **k: [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.215.14", 0))],
+    )
+    monkeypatch.setattr(_real.SAFE_OPENER, "open", lambda req, timeout=10: FakeResponse())
+
+    result = _real.resize_image("https://images.example.com/cat.png", 20, 15)
+    assert result["status"] == "success", result
+    assert result["dimensions"] == "20x15"
