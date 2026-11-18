@@ -100,7 +100,7 @@ def test_resize_image_runs_end_to_end(monkeypatch):
     fake download so this can't happen again."""
     import io
     import socket
-    from PIL import Image
+    Image = pytest.importorskip("PIL.Image", reason="Pillow is only needed for the demo tasks")
 
     buf = io.BytesIO()
     Image.new("RGB", (40, 30), "purple").save(buf, format="PNG")
