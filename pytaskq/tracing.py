@@ -22,10 +22,6 @@ HOW TRACES CROSS THE REDIS QUEUE:
 
 import os
 from opentelemetry import trace
-from opentelemetry.sdk.trace import TracerProvider
-from opentelemetry.sdk.trace.export import BatchSpanProcessor
-from opentelemetry.sdk.resources import Resource
-from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
 from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
 
 # The W3C propagator knows how to serialize/deserialize trace context
@@ -35,30 +31,31 @@ _propagator = TraceContextTextMapPropagator()
 
 def init_tracer(service_name: str) -> trace.Tracer:
     """
-    Initialize OpenTelemetry and return a Tracer for this service.
+    Return a Tracer for this service ("pytaskq-api" or "pytaskq-worker").
 
-    Args:
-        service_name: Identifies this process in Jaeger UI.
-                      Use "pytaskq-api" for app.py, "pytaskq-worker" for worker.py.
-
-    The OTLP exporter sends spans to Jaeger over gRPC (port 4317).
-    The endpoint is read from OTEL_EXPORTER_OTLP_ENDPOINT env var,
-    defaulting to localhost for local dev.
+    Tracing is OPT-IN: nothing is exported unless OTEL_EXPORTER_OTLP_ENDPOINT
+    (or PYTASKQ_TRACING=1) is set. Without it, spans are no-ops, so a fresh
+    install doesn't spam "connection refused" errors when Jaeger isn't running.
     """
+    endpoint = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "")
+    enabled = bool(endpoint) or os.getenv("PYTASKQ_TRACING", "").lower() in ("1", "true", "yes")
+    if not enabled:
+        return trace.get_tracer(service_name)
+
+    try:
+        from opentelemetry.sdk.trace import TracerProvider
+        from opentelemetry.sdk.trace.export import BatchSpanProcessor
+        from opentelemetry.sdk.resources import Resource
+        from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
+    except ImportError:  # exporter not installed → keep no-op tracing
+        return trace.get_tracer(service_name)
+
     # Resource = metadata that Jaeger attaches to every span from this process
     resource = Resource.create({"service.name": service_name})
-
-    # TracerProvider = the "factory" that creates Tracers
     provider = TracerProvider(resource=resource)
-
-    # BatchSpanProcessor = collects spans in memory and ships them to Jaeger
-    # in batches every 5 seconds in a background thread.
-    # This is why there's ZERO latency impact on your API responses.
-    endpoint = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4317")
-    exporter = OTLPSpanExporter(endpoint=endpoint, insecure=True)
+    # BatchSpanProcessor ships spans in a background thread — no request latency.
+    exporter = OTLPSpanExporter(endpoint=endpoint or "http://localhost:4317", insecure=True)
     provider.add_span_processor(BatchSpanProcessor(exporter))
-
-    # Set this as the global TracerProvider
     trace.set_tracer_provider(provider)
 
     return trace.get_tracer(service_name)

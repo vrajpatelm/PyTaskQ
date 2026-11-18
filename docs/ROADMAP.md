@@ -67,7 +67,7 @@ Any authenticated user with an API key should be able to:
 - [x] **Fencing Token (Lua atomic script)** — Prevents stale worker overwriting fresh result; token bumped on recovery AND on timeout.
 - [x] **SSRF Guard** — DNS-based URL validation on all user-fetched URLs.
 - [x] **Tenant-Isolated Results** — `tenant_id` on every write; fail-closed reads.
-- [ ] **Task `started_at` Timestamp** — Record when a task begins executing. Expose elapsed time in dashboard.
+- [x] **Task timings** — `created_at`, `started_at`, `finished_at`, `duration_ms` on every job; shown in the dashboard.
 - [x] **Task Timeout** — `asyncio.wait_for` + fence-token invalidation (`TASK_TIMEOUT` env, default 300s); hung tasks can no longer deadlock a worker.
 - [x] **Redis Persistence (AOF)** — `appendfsync everysec` + RDB snapshots + compose volume; tasks survive restarts.
 - [ ] **Redis HA (Sentinel)** — remove the single point of failure.
@@ -77,8 +77,10 @@ Any authenticated user with an API key should be able to:
 
 ## 💡 Phase 3 — Platform Features
 - [ ] **Task Chaining** — Allow a task to define a `next_task` in its payload. When Task A completes successfully, automatically enqueue Task B with A's result as input.
-- [ ] **Recurring / Cron Tasks** — Allow tenants to register a task that runs on a schedule (e.g., every 5 minutes) using a cron expression.
-- [ ] **Task Search & History Page** — A dedicated dashboard page showing all tasks for a given tenant, filterable by status and date.
+- [x] **Recurring / Cron Tasks** — `@queue.task(cron=...)`, validated at import, enqueued once per tick by the leader.
+- [x] **Task History** — `GET /tasks` + dashboard Jobs tab, filterable by status and task, with a detail drawer.
+- [x] **Cancel waiting jobs** — `POST /task/{id}/cancel`, atomic via Lua.
+- [x] **Task discovery** — workers publish their tasks + parameters; the dashboard builds forms from them.
 - [ ] **Multi-Worker Horizontal Scaling Config** — A `docker-compose.scale.yml` that can spin up N worker replicas with a single command.
 
 ---
@@ -109,7 +111,7 @@ Any authenticated user with an API key should be able to:
 | Matrix size limit (backend + frontend) | 1000×1000 hard cap |
 | React dashboard (Lucide icons) | Metrics, dispatch, DLQ, task lookup, webhook manager |
 | Docker Compose deployment | Redis + API + Worker in one command |
-| pytest suite — 61 passing | queuing, worker paths, DLQ, crash recovery, shutdown, SSRF guard, auth, dedup, tenant isolation |
+| pytest suite — 120 passing | queuing, worker paths, DLQ, crash recovery, shutdown, SSRF guard, auth, dedup, tenant isolation |
 | Env-driven load tests | locustfile + benchmark read `LOADTEST_*` from `.env`, no secrets in source |
 | Consolidated docs | All `.md` in `docs/`, synced to code |
 

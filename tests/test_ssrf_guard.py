@@ -72,5 +72,23 @@ def test_ssrf_guard_blocks_internal_urls(url):
     "https://www.python.org/robots.txt",
     "http://api.github.com/zen",   # http (not just https) must still work
 ])
-def test_ssrf_guard_allows_public_urls(url):
+def test_ssrf_guard_allows_public_urls(url, monkeypatch):
+    # Hermetic: pretend DNS resolves to a public address so the test does not
+    # depend on network access (CI sandboxes often have no DNS).
+    import socket
+    monkeypatch.setattr(
+        socket, "getaddrinfo",
+        lambda host, *a, **k: [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.215.14", 0))],
+    )
     _assert_safe_url(url)  # must not raise
+
+
+def test_ssrf_guard_blocks_hostname_resolving_to_private_ip(monkeypatch):
+    """DNS rebinding style: a public-looking name that resolves to 10.x must be blocked."""
+    import socket
+    monkeypatch.setattr(
+        socket, "getaddrinfo",
+        lambda host, *a, **k: [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("10.1.2.3", 0))],
+    )
+    with pytest.raises(UnsafeURL):
+        _assert_safe_url("https://totally-public.example.com/")

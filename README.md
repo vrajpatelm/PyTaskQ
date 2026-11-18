@@ -1,103 +1,336 @@
 <div align="center">
-  <h1>🚀 PyTaskQ</h1>
-  <p><b>A highly scalable, asynchronous distributed task queue for Python.</b></p>
-  <p>Inspired by Celery, but built natively for the modern async ecosystem (asyncio, FastAPI, Redis).</p>
+
+<img src="pytaskq/static/favicon.svg" width="72" alt="PyTaskQ logo" />
+
+# PyTaskQ
+
+**Background jobs for Python — simple to start, safe in production.**
+
+Decorate a function, call `.delay()`, and watch it run in a live dashboard.<br/>
+Built natively on asyncio, FastAPI and Redis.
+
+[![Python](https://img.shields.io/badge/python-3.10%2B-3776AB?logo=python&logoColor=white)](#quick-start)
+[![Tests](https://img.shields.io/badge/tests-120%20passing-10b981)](#development)
+[![Redis](https://img.shields.io/badge/backend-Redis-DC382D?logo=redis&logoColor=white)](#how-your-jobs-stay-safe)
+[![License](https://img.shields.io/badge/license-MIT-6366f1)](LICENSE)
+
+[Quick start](#quick-start) · [Dashboard](#the-dashboard) · [Customising](#customising-tasks) · [Reliability](#how-your-jobs-stay-safe) · [API](#rest-api) · [What's new](#whats-new-in-02) · [What's next](#whats-next)
+
+<br/>
+
+<img src="docs/images/hero.png" alt="The PyTaskQ dashboard in light and dark themes, showing the job lifecycle strip and a live job list" width="100%" />
+
 </div>
 
 ---
 
-## ⚡ What is PyTaskQ?
+## Why PyTaskQ
 
-PyTaskQ is an enterprise-grade background task processing framework. It allows you to offload heavy CPU or I/O bound operations from your main application thread to a fleet of distributed workers, ensuring your application remains incredibly fast and responsive.
+<table>
+<tr>
+<td width="50%" valign="top">
 
-### 🌟 Key Architectural Features
+**Feels like plain Python**<br/>
+One decorator. Sync, `async def`, CPU-heavy or I/O-bound tasks all work, and each is routed to the right pool automatically.
 
-- **Celery-Like SDK:** Beautiful, intuitive Python decorators (`@queue.task()`) that grant you `.delay()` and `.schedule()` capabilities instantly.
-- **Hybrid Concurrency Engine:** Automatically routes tasks to a `ProcessPoolExecutor` (for heavy CPU bounds) or a `ThreadPoolExecutor` (for I/O bound tasks) to maximize resource utilization.
-- **Atomic Execution & Fencing:** Utilizes Redis Lua scripting to implement strict fencing tokens. This guarantees that if a worker hangs or zombies, its late results won't overwrite a successfully re-assigned task.
-- **Distributed Cron (Beat):** Built-in distributed scheduling with Leader Election. Multiple worker nodes can run concurrently without race conditions, safely scheduling recurring tasks via atomic locks.
-- **Crash Recovery & Zombie Sweepers:** Workers constantly monitor the fleet via Redis heartbeats. If a worker is OOM-killed or loses power mid-execution, a zombie sweeper automatically recovers its in-flight tasks and re-queues them.
-- **Resilient Retries:** Failed tasks undergo exponential backoff with decorrelated jitter, before being safely parked in a Dead Letter Queue (DLQ).
-- **Strict Priority Queues:** Three-tier routing (`high`, `default`, `low`) ensures critical tasks bypass the bulk processing backlog.
+</td>
+<td width="50%" valign="top">
+
+**You can see everything**<br/>
+A live dashboard shows every job's arguments, timing, result and error, and lets you run, cancel and replay jobs.
+
+</td>
+</tr>
+<tr>
+<td valign="top">
+
+**Built for failure**<br/>
+Fencing tokens, crash recovery, retries with jitter, a dead-letter queue and graceful shutdown are built in, not extra plugins.
+
+</td>
+<td valign="top">
+
+**Two commands to run**<br/>
+`pytaskq worker` and `pytaskq dashboard`. Redis is the only infrastructure.
+
+</td>
+</tr>
+</table>
 
 ---
 
-## 🛠️ Quick Start
+## Quick start
 
-**Prerequisites**: Python 3.10+ and a running instance of Redis.
-
-### 1. Define your tasks
-
-Simply import the PyTaskQ registry and decorate your functions:
-
-```python
-# main.py
-from pytaskq.task_registery import queue
-import time
-
-@queue.task(type="cpu")
-def heavy_computation(matrix_size):
-    # Heavy CPU work runs safely in a Process Pool!
-    return matrix_size * matrix_size
-
-@queue.task(type="io", cron="0 0 * * *") # Runs daily at midnight
-def daily_db_cleanup():
-    # I/O bound work runs in a Thread Pool!
-    pass
-```
-
-### 2. Trigger them effortlessly
-
-Anywhere in your application (like a FastAPI route), just call `.delay()`:
-
-```python
-# Trigger immediately (async non-blocking)
-await heavy_computation.delay(500, priority="high")
-
-# Or schedule it to run 1 hour from now
-await heavy_computation.schedule(500, delay_seconds=3600)
-```
-
-### 3. Start the Worker Fleet
-
-Spin up as many workers as you need across different machines:
+**You need** Python 3.10+ and Redis (`docker run -p 6379:6379 redis:7` is enough).
 
 ```bash
-python src/worker.py
+pip install -e .            # or: pip install -r requirements.txt
 ```
 
+**1. Write tasks**
+
+```python
+# tasks.py
+from pytaskq import PyTaskQ
+
+queue = PyTaskQ()
+
+@queue.task(type="io", priority="high", max_retries=5)
+def send_order_confirmation(order_id: int, email: str):
+    """Email the order confirmation and receipt."""
+    ...
+
+@queue.task(type="cpu", timeout=120)
+def generate_invoice_pdf(order_id: int, currency: str = "USD"):
+    """Render a PDF invoice for an order."""
+    ...
+
+@queue.task                                    # async def is detected automatically
+async def sync_inventory(sku: str):
+    ...
+
+@queue.task(cron="0 2 * * *")                  # every night at 02:00, exactly once across the fleet
+def nightly_sales_report():
+    ...
+```
+
+**2. Start a worker and the dashboard**
+
+```bash
+pytaskq worker    --app tasks:queue
+pytaskq dashboard --app tasks:queue            # → http://localhost:8000
+```
+
+**3. Queue jobs from anywhere**
+
+```python
+await send_order_confirmation.delay(10481, email="ada@example.com")         # async code
+await generate_invoice_pdf.apply_async(args=[10481], priority="low", countdown=30)
+send_order_confirmation.delay_sync(10482, email="lin@example.com")          # plain sync code
+
+result = await queue.wait(task_id, timeout=30)   # {"status": "Success", "result": ..., "duration_ms": ...}
+await queue.cancel(task_id)                       # while it's still waiting
+```
+
+> **Just exploring?** `pytaskq worker --app pytaskq.task_registery:queue` runs built-in demo tasks you can trigger from the dashboard.
+
 ---
 
-## 🏗️ Deep Dive into the Architecture
+## The dashboard
 
-PyTaskQ was built to handle failure gracefully. Here is how we guarantee task safety:
+Every view updates live over a WebSocket. Light and dark themes are both built in, and the layout works down to phone width.
 
-1. **The Processing Queue:** When a worker pops a task from `queue:high`, it atomically moves it to `processing_queue:{worker_id}`. If the machine catches fire, the task is safely preserved in Redis.
-2. **The Zombie Sweeper:** The fleet elects a "Leader" worker. The leader monitors the `active_workers` sorted set. If a worker misses its heartbeat by 30 seconds, the leader sweeps its `processing_queue` and returns those tasks to the main queue.
-3. **Fencing Tokens:** To prevent the "split-brain" problem (where a zombie worker wakes up 10 minutes later and overwrites the retry's result), every task payload contains a `fence_token`. The execution Lua script enforces that only the highest token is allowed to write the final state.
+### Know where every job is
+
+The **lifecycle strip** follows a job from *Scheduled* through *Queued* and *Running* to *Succeeded* or *Dead letters*. It also shows how full your queue is and how jobs split across priorities. Below it, **Jobs** lists recent work with filters for status and task, plus search by ID.
+
+<img src="docs/images/dashboard-dark.png" alt="Jobs view with status filters and a live job list" width="100%" />
+
+### Inspect any job
+
+Click a row to open its full record: when it was queued, started and finished, how long it took, which worker ran it, how many attempts it needed, its arguments, and its result or error. Waiting jobs show a **Cancel job** button.
+
+<img src="docs/images/job-details.png" alt="Job detail panel showing timings, arguments and the JSON result" width="100%" />
+
+### Run a task without writing code
+
+Workers announce their tasks, docstrings and parameters. **Run a task** turns each function signature into a form, showing which fields are required, their types and their defaults. Choose a priority, add a delay, or set a webhook, then queue the job.
+
+<img src="docs/images/run-task.png" alt="Run a task view with an auto-generated form for send_order_confirmation" width="100%" />
+
+### Fix failures, then replay
+
+**Dead letters** collects jobs that failed every retry, along with their last error. Replay one or all of them, and each goes back to its original priority queue.
+
+<img src="docs/images/dead-letters.png" alt="Dead letters view showing failed payment jobs with their errors" width="100%" />
+
+### Watch your workers
+
+**Workers** shows the host, process, app, live load, completed and failed counts, pool sizes, uptime and heartbeat health for every worker.
+
+<img src="docs/images/workers.png" alt="Workers view listing two healthy workers" width="100%" />
+
+<table>
+<tr>
+<td width="62%" valign="middle">
+
+### Works on your phone
+
+The same dashboard adapts to small screens, so you can check on a deploy or replay a failed job from anywhere.
+
+When no worker is running, the dashboard tells you so, with the exact command to start one.
+
+</td>
+<td width="38%" align="center">
+<img src="docs/images/mobile.png" alt="PyTaskQ dashboard on a phone" width="260" />
+</td>
+</tr>
+</table>
 
 ---
 
-## 📊 Real-Time Dashboard & API
+## Customising tasks
 
-PyTaskQ ships with a built-in REST API and React Dashboard for observing your fleet.
+| Option | Default | What it does |
+|---|---|---|
+| `type` | `"async"` for `async def`, otherwise `"cpu"` | `"cpu"` → process pool · `"io"` → thread pool · `"async"` → worker event loop |
+| `priority` | `"default"` | Default queue: `"high"`, `"default"` or `"low"` (callers can override) |
+| `max_retries` | `MAX_RETRIES` (3) | Retries with decorrelated-jitter backoff before a job is dead-lettered |
+| `timeout` | `TASK_TIMEOUT` (300 s) | Abandon and retry an attempt after this long (`0` = never) |
+| `cron` | — | 5-field cron expression, enqueued once per tick by the elected leader |
+| `name` | function name | The name the task is registered under |
+
+Bad options fail when your module is imported, not at 2 a.m. in production.
+
+**App-wide defaults:** `PyTaskQ(default_priority="low", max_retries=5, timeout=60)`
+
+**Worker sizing:** `pytaskq worker --app tasks:queue --cpu-workers 4 --io-workers 32 --timeout 120`
+
+**Configuration:** every setting is an environment variable or a line in `.env`. See [`.env.example`](.env.example). Redis is set with `REDIS_URL`, or with `REDIS_HOST`, `REDIS_PORT`, `REDIS_DB` and `REDIS_PASSWORD`.
+
+| Command | Purpose |
+|---|---|
+| `pytaskq worker --app m:queue` | Run a worker |
+| `pytaskq dashboard [--app m:queue]` | Dashboard + REST API on port 8000 |
+| `pytaskq tasks --app m:queue` | List tasks, parameters, retries and schedules |
+| `pytaskq ping` | Check Redis and count live workers |
+
+---
+
+## How your jobs stay safe
+
+<img src="docs/images/architecture.svg" alt="PyTaskQ architecture" width="100%" />
+
+1. **Reliable pop.** A worker atomically moves a job from `queue:{priority}` into its own `processing_queue:{worker_id}`. If the machine dies, the job is still in Redis.
+2. **Zombie sweeper.** Workers heartbeat every 10 s. An elected leader re-queues work from any worker that has gone silent for 30 s.
+3. **Fencing tokens.** Every recovery or timeout bumps the job's token, and a Lua script only accepts a result carrying the current one. A late result from a hung worker can't overwrite a newer one.
+4. **Retries, then dead letters.** Failures back off with decorrelated jitter. After `max_retries`, the job lands in the DLQ with its last error, ready to replay.
+5. **Graceful shutdown.** Ctrl+C or SIGTERM stops new pulls, finishes running jobs and deregisters the worker.
+6. **SSRF guard.** Webhooks and URL-fetching tasks refuse private, loopback and cloud-metadata addresses. Use `pytaskq.net.assert_safe_url` in your own tasks.
+
+**Webhooks.** Pass `on_success_url=` and the worker queues a signed POST (`X-PyTaskQ-Signature`, HMAC-SHA256 with `WEBHOOK_SECRET`). The webhook is retried like any other job.
+
+**Tracing** is opt-in. Set `OTEL_EXPORTER_OTLP_ENDPOINT` to get one continuous trace from the API, through Redis, into the worker. Docker Compose sets this up for the bundled Jaeger.
+
+---
+
+## REST API
+
+Interactive docs are served at `/docs`. Full examples are in [docs/API.md](docs/API.md).
 
 | Method | Route | Description |
 |--------|-------|-------------|
-| `GET` | `/task/{task_id}` | Check task status and fetch the result |
-| `GET` | `/metrics` | View queue depth across all priority levels |
-| `GET` | `/dlq` | View failed tasks sitting in the Dead Letter Queue |
-| `POST` | `/dlq/retry_all` | Atomically sweep all failed tasks back to the active queue |
+| `POST` | `/task/enqueue` | Queue a job: `task_name`, `args`, `kwargs`, `priority`, `delay_seconds`, `on_success_url` |
+| `GET` | `/task/{task_id}` | Status, timings, result or error |
+| `POST` | `/task/{task_id}/cancel` | Cancel a job that hasn't started |
+| `GET` | `/tasks` | Recent jobs, filterable by `status`, `task_name`, `limit` |
+| `GET` | `/tasks/registered` | Tasks advertised by workers, with parameters |
+| `GET` | `/metrics` | Queue depths, counters, worker count |
+| `GET` | `/system/workers` | Worker fleet details |
+| `GET` | `/dlq` | Dead letters with their last error |
+| `POST` | `/dlq/replay/{id}`, `/dlq/retry_all` | Put dead letters back on their original queue |
+| `POST` | `/dlq/purge/{id}`, `/dlq/purge_all` | Delete dead letters |
+
+```bash
+curl -X POST localhost:8000/task/enqueue -H 'Content-Type: application/json' \
+     -d '{"task_name": "send_order_confirmation", "kwargs": {"order_id": 10481, "email": "ada@example.com"}}'
+```
 
 ---
 
-## 🧪 Testing
+## Docker
 
-The test suite relies heavily on `pytest` and `fakeredis` with Lua scripting support, meaning you can test distributed race conditions entirely in-memory!
+```bash
+docker compose up --build        # Redis + dashboard/API + worker + Jaeger
+```
+
+The worker runs `example_app:queue`. Point `command:` and `PYTASKQ_APP` in `docker-compose.yml` at your own module.
+
+## Development
 
 ```bash
 pip install -r requirements.txt
-python -m pytest tests/
+python -m pytest                 # 120 tests, in-memory via fakeredis — no Redis needed
+
+cd frontend && npm install
+npm run dev                      # dashboard with hot reload, talking to localhost:8000
+npm run build                    # writes the bundle into pytaskq/static/
 ```
 
-*Note: The suite aggressively tests SSRF guards, idempotent retry lifecycles, and crash recovery loops.*
+---
+
+## What's new in 0.2
+
+This release focused on three things: making PyTaskQ easy to adopt, making the dashboard useful day to day, and fixing bugs that silently lost work.
+
+<details open>
+<summary><b>Fixes to how jobs behave</b></summary>
+
+- **Timed-out jobs.** When a timed-out job was retried and then succeeded, its result was silently discarded because the retry carried a stale fencing token. Retries now carry the new token.
+- **Retry priority.** Retries used to fall back to the default queue. They now keep their priority, and so do jobs replayed from the dead-letter queue.
+- **Webhooks.** They only worked for the built-in demo app. Every app now includes the webhook task.
+- **"Not found" while waiting.** Looking up a queued job returned "not found". Jobs now have a status the moment they're queued.
+- **Docker dashboard.** The demo dropdown listed tasks the Docker worker didn't have, so 3 of 4 always failed. The dashboard now shows the tasks your workers actually register.
+- **Counters.** Webhook follow-ups no longer push the pending counter negative.
+
+</details>
+
+<details open>
+<summary><b>Easier to use</b></summary>
+
+- **CLI:** new `pytaskq dashboard`, `pytaskq tasks` and `pytaskq ping` commands, and `--cpu-workers`, `--io-workers` and `--timeout` flags for workers.
+- **Task options:** `async def` tasks, keyword arguments, `delay_sync()` for sync code, and `apply_async(countdown=, priority=, task_id=)`.
+- **Per-task settings:** `max_retries`, `timeout`, `priority` and `name`, plus app-wide defaults, all validated at import.
+- **Results:** `queue.status()`, `queue.wait()` and `queue.cancel()`. Results are stored as JSON.
+- **Clearer errors:** an unknown task name returns a 404 that lists the real task names.
+- **Lighter import:** `from pytaskq import PyTaskQ` no longer pulls in numpy and Pillow.
+- **Quieter logs:** tracing is opt-in, so there's no error spam when Jaeger isn't running.
+- **Packaging:** `pip install .` now installs everything needed to run. The dashboard runs from any directory, and Vite builds straight into the package.
+
+</details>
+
+<details open>
+<summary><b>The dashboard, rebuilt</b></summary>
+
+- A lifecycle strip, plus tabs for Jobs, Run a task, Workers and Dead letters.
+- Job history with filters, search by ID and a detail panel with a cancel button.
+- Forms generated from your task signatures.
+- Dead letters show their last error, and "Delete all" asks for confirmation first.
+- Worker health, load and throughput.
+- A connection indicator, and a hint when no worker is running.
+
+</details>
+
+<details open>
+<summary><b>Tests</b></summary>
+
+- 66 new tests covering the SDK, worker behaviour, every REST endpoint, the DLQ fixes and the CLI. The suite now has **120 tests**.
+- Tests that relied on DNS are now hermetic, so the suite passes offline.
+- The release was also verified end to end: real Redis, two workers, the API and a headless browser.
+
+</details>
+
+---
+
+## What's next
+
+These are suggested next steps, roughly in order of impact.
+
+1. **Protect the dashboard and API.** There is currently no authentication: anyone who can reach port 8000 can queue, cancel or delete jobs. Add an API key or basic-auth gate, wired to the existing `MASTER_KEY` setting, before exposing PyTaskQ beyond localhost.
+2. **Continuous integration.** Add a GitHub Actions workflow that runs `pytest`, `ruff` and `npm run build` on every push, so the 120 tests protect every change.
+3. **Publish to PyPI.** Move to `pyproject.toml`, ship the built dashboard in the wheel, and support `pip install pytaskq` (with `[tracing]` and `[demo]` extras).
+4. **Workflows.** Chains (`a.then(b)`), groups and callbacks, so a job's result can feed the next job without glue code.
+5. **Progress reporting.** Let a task report `progress(0.4, "rendering page 2")` and show it as a live bar in the job panel.
+6. **Queue controls.** Pause and resume a queue, per-task rate limits, and unique jobs that skip duplicates while one is pending.
+7. **Metrics export.** A Prometheus `/metrics/prometheus` endpoint (throughput, latency percentiles, failure rate) for existing Grafana setups.
+8. **High availability.** Redis Sentinel or Cluster support, to remove the single point of failure.
+9. **Self-hosted font.** Bundle Inter with the dashboard so it looks the same on offline or locked-down networks.
+10. **Documentation site.** A short guide (MkDocs) with recipes for FastAPI, Django and Flask, deployment and scaling.
+
+See [docs/ROADMAP.md](docs/ROADMAP.md) for the full, living roadmap.
+
+---
+
+<div align="center">
+<sub>MIT licensed · Built with asyncio, FastAPI, Redis and React</sub>
+</div>

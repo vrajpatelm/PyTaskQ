@@ -7,9 +7,9 @@ async def _notify_tenant(tenant_id: str, event_type: str) -> None:
     await redis_client.r.publish("events:global", event_type)
 
 async def _get_dashboard_data(tenant_id: str = "global") -> dict:
-    pending = int(await redis_client.r.get("stats:pending") or 0)
+    pending = max(0, int(await redis_client.r.get("stats:pending") or 0))
     processing = max(0, int(await redis_client.r.get("stats:processing") or 0))
-    delayed = int(await redis_client.r.get("stats:delayed") or 0)
+    delayed = max(0, int(await redis_client.r.get("stats:delayed") or 0))
     dlq_count = await redis_client.r.llen("dlq")
     completed = int(await redis_client.r.get("stats:completed") or 0)
     failed = int(await redis_client.r.get("stats:failed") or 0)
@@ -18,7 +18,8 @@ async def _get_dashboard_data(tenant_id: str = "global") -> dict:
     queue_low = await redis_client.r.llen("queue:low")
     current_minute = int(time.time() / 60)
     rate_used = int(await redis_client.r.get(f"rate_limit:global:{current_minute}") or 0)
-    dlq_tasks = [json.loads(t) for t in await redis_client.r.lrange("dlq", 0, -1)]
+    # Cap what we push to dashboards; the full list is at GET /dlq
+    dlq_tasks = [json.loads(t) for t in await redis_client.r.lrange("dlq", 0, 99)]
     worker_count = await redis_client.r.zcount("active_workers", time.time(), "+inf")
     return {
         "metrics": {

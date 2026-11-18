@@ -1,3 +1,6 @@
-from pytaskq.task_registery import PyTaskQ
+"""PyTaskQ — a modern, async-first distributed task queue for Python."""
 
-__all__ = ["PyTaskQ"]
+from pytaskq.app import PyTaskQ
+
+__version__ = "0.2.0"
+__all__ = ["PyTaskQ", "__version__"]

@@ -1,393 +1,682 @@
-import { useState, useEffect, useRef } from 'react'
-import { Send, Search, AlertOctagon, Inbox, Activity, Clock, AlertTriangle, CheckCircle, XCircle, RotateCcw, Trash2, Zap, BarChart2, Copy, Moon, Sun } from 'lucide-react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import {
+  Moon, Sun, Play, ListChecks, Server, Skull, Search, X, Copy, Check,
+  RotateCcw, Trash2, Ban, Clock, Cpu, Zap, Waves, Terminal, ChevronRight,
+} from 'lucide-react'
+import {
+  api, WS_URL, STATUS, FINAL, CANCELLABLE, timeAgo, formatDuration, formatClock,
+  formatArgs, parseValue, prettyResult, storage,
+} from './api'
 
-const API_URL = import.meta.env.DEV ? 'http://localhost:8000' : '';
+const TABS = [
+  { id: 'jobs', label: 'Jobs', icon: ListChecks },
+  { id: 'run', label: 'Run a task', icon: Play },
+  { id: 'workers', label: 'Workers', icon: Server },
+  { id: 'dead', label: 'Dead letters', icon: Skull },
+];
 
-const STATUS_COLORS = {
-  Success:        { bg: 'var(--status-success-bg)', color: 'var(--status-success-text)', border: 'var(--status-success-border)' },
-  Failed:         { bg: 'var(--status-failed-bg)', color: 'var(--status-failed-text)', border: 'var(--status-failed-border)' },
-  DeadLetter:     { bg: 'var(--status-failed-bg)', color: 'var(--status-failed-text)', border: 'var(--status-failed-border)' },
-  RetryScheduled: { bg: 'var(--status-warning-bg)', color: 'var(--status-warning-text)', border: 'var(--status-warning-border)' },
-  Processing:     { bg: 'var(--status-processing-bg)', color: 'var(--status-processing-text)', border: 'var(--status-processing-border)' },
-  Pending:        { bg: 'var(--status-pending-bg)', color: 'var(--status-pending-text)', border: 'var(--status-pending-border)' },
-  queued:         { bg: 'var(--status-pending-bg)', color: 'var(--status-pending-text)', border: 'var(--status-pending-border)' },
+const EMPTY_METRICS = {
+  pending: 0, processing: 0, delayed: 0, dlq: 0, completed_total: 0, failed_total: 0,
+  queue_high: 0, queue_default: 0, queue_low: 0, queue_total: 0, queue_capacity: 500, worker_count: 0,
 };
 
+// ── small pieces ─────────────────────────────────────────────────────────────
+
 function StatusBadge({ status }) {
-  const s = STATUS_COLORS[status] || { bg: 'var(--status-default-bg)', color: 'var(--status-default-text)', border: 'var(--status-default-border)' };
-  return (
-    <span style={{
-      padding: '0.2rem 0.6rem', borderRadius: '999px', fontSize: '0.75rem',
-      fontWeight: 700, background: s.bg, color: s.color,
-      border: `1px solid ${s.border}`, whiteSpace: 'nowrap'
-    }}>{status}</span>
-  );
+  const s = STATUS[status] || { label: status || 'Unknown', tone: 'muted' };
+  return <span className={`badge tone-${s.tone}`}>{s.label}</span>;
 }
 
-function CopyButton({ text }) {
-  const [copied, setCopied] = useState(false);
+function CopyButton({ text, label = 'Copy ID' }) {
+  const [done, setDone] = useState(false);
+  const copy = () => {
+    navigator.clipboard?.writeText(text).then(() => { setDone(true); setTimeout(() => setDone(false), 1500); }).catch(() => {});
+  };
   return (
-    <button className="btn btn-secondary" style={{ padding: '0.3rem 0.7rem', fontSize: '0.75rem' }}
-      onClick={() => { navigator.clipboard.writeText(text); setCopied(true); setTimeout(() => setCopied(false), 2000); }}>
-      <Copy size={12} style={{ marginRight: '0.3rem' }} />{copied ? 'Copied!' : 'Copy'}
+    <button type="button" className="btn btn-ghost btn-sm" onClick={copy} aria-label={label}>
+      {done ? <Check size={14} /> : <Copy size={14} />} {done ? 'Copied' : label}
     </button>
   );
 }
 
-// ── Animated Theme Toggle ────────────────────────────────────────────────────
-function ThemeToggle({ theme, onToggle }) {
-  const isDark = theme === 'dark';
+function TypeIcon({ type }) {
+  if (type === 'cpu') return <Cpu size={14} aria-label="CPU task" />;
+  if (type === 'async') return <Waves size={14} aria-label="Async task" />;
+  return <Zap size={14} aria-label="I/O task" />;
+}
+
+function Toasts({ toasts, dismiss }) {
   return (
-    <button
-      onClick={onToggle}
-      title={isDark ? 'Switch to Pastel Light' : 'Switch to Modern Dark'}
-      style={{
-        display: 'flex',
-        alignItems: 'center',
-        gap: '0.5rem',
-        padding: '0.45rem 0.9rem',
-        borderRadius: '999px',
-        border: '1px solid var(--border-color)',
-        background: 'var(--surface-color)',
-        color: 'var(--text-secondary)',
-        cursor: 'pointer',
-        fontSize: '0.8rem',
-        fontWeight: 600,
-        fontFamily: 'inherit',
-        transition: 'all 0.2s ease',
-        boxShadow: 'var(--card-shadow)',
-      }}
-    >
-      {isDark ? <Sun size={14} color="#fbbf24" /> : <Moon size={14} color="#6366f1" />}
-      {isDark ? 'Pastel Light' : 'Modern Dark'}
-    </button>
+    <div className="toasts" role="status" aria-live="polite">
+      {toasts.map(t => (
+        <div key={t.id} className={`toast toast-${t.type}`}>
+          <span>{t.msg}</span>
+          <button className="icon-btn" onClick={() => dismiss(t.id)} aria-label="Dismiss"><X size={14} /></button>
+        </div>
+      ))}
+    </div>
   );
 }
 
-function App() {
-  const [theme, setTheme] = useState(localStorage.getItem('theme') || 'dark');
+// ── lifecycle strip: where every job is right now ────────────────────────────
 
-  useEffect(() => {
-    document.documentElement.setAttribute('data-theme', theme);
-    localStorage.setItem('theme', theme);
-  }, [theme]);
-
-  const toggleTheme = () => setTheme(t => t === 'dark' ? 'light' : 'dark');
-
-  const [metrics, setMetrics] = useState({
-    pending: 0, processing: 0, delayed: 0, dlq: 0,
-    completed_total: 0, failed_total: 0,
-    queue_high: 0, queue_default: 0, queue_low: 0,
-    queue_total: 0, queue_capacity: 500,
-    worker_count: 0,
-  });
-
-  const [taskName, setTaskName] = useState('matrix_multiply');
-  const [taskArgs, setTaskArgs] = useState('50');
-  const [delaySeconds, setDelaySeconds] = useState('0');
-  const [webhookUrl, setWebhookUrl] = useState('');
-  const [submitStatus, setSubmitStatus] = useState(null);
-
-  const [recentTasks, setRecentTasks] = useState([]);
-  const recentTasksRef = useRef(recentTasks);
-  recentTasksRef.current = recentTasks;
-
-  const [lookupId, setLookupId] = useState('');
-  const [lookupResult, setLookupResult] = useState(null);
-  const [dlqTasks, setDlqTasks] = useState([]);
-  const [workers, setWorkers] = useState([]);
-
-  // ── WebSocket: real-time dashboard ──────────────────────────────────────
-  useEffect(() => {
-    const WS_URL = import.meta.env.DEV
-      ? `ws://localhost:8000/ws/dashboard`
-      : `${window.location.protocol === 'https:' ? 'wss:' : 'ws:'}//${window.location.host}/ws/dashboard`;
-
-    let ws;
-    let reconnectTimer;
-    let alive = true;
-
-    const connect = () => {
-      ws = new WebSocket(WS_URL);
-
-      ws.onopen = () => {
-        const ids = recentTasksRef.current
-          .filter(t => !['Success', 'Failed', 'DeadLetter'].includes(t.status))
-          .map(t => t.task_id);
-        if (ids.length > 0) ws.send(JSON.stringify({ track: ids }));
-      };
-
-      ws.onmessage = (event) => {
-        const data = JSON.parse(event.data);
-        if (data.metrics) setMetrics(data.metrics);
-        if (data.dlq) setDlqTasks(data.dlq);
-        if (data.task_statuses && Object.keys(data.task_statuses).length > 0) {
-          setRecentTasks(prev => prev.map(t => ({
-            ...t,
-            status: data.task_statuses[t.task_id] || t.status,
-          })));
-        }
-        const pending = recentTasksRef.current
-          .filter(t => !['Success', 'Failed', 'DeadLetter'].includes(t.status))
-          .map(t => t.task_id);
-        if (ws.readyState === WebSocket.OPEN && pending.length > 0) {
-          ws.send(JSON.stringify({ track: pending }));
-        }
-      };
-
-      ws.onclose = () => {
-        if (alive) reconnectTimer = setTimeout(connect, 3000);
-      };
-    };
-
-    connect();
-    return () => {
-      alive = false;
-      clearTimeout(reconnectTimer);
-      if (ws) ws.close();
-    };
-  }, []);
-
-  useEffect(() => {
-    const fetchWorkers = () => {
-      fetch(`${API_URL}/system/workers`)
-        .then(r => r.json()).then(data => setWorkers(data.workers || [])).catch(() => {});
-    };
-    fetchWorkers();
-    const iv = setInterval(fetchWorkers, 5000);
-    return () => clearInterval(iv);
-  }, []);
-
-  const handleEnqueue = async (e) => {
-    e.preventDefault();
-    setSubmitStatus({ type: 'info', msg: 'Dispatching task...' });
-    let parsedArgs = [];
-    if (taskName === 'matrix_multiply') parsedArgs = [Number(taskArgs) || 10];
-    else if (taskName === 'generate_csv_report') parsedArgs = [Number(taskArgs) || 100];
-    else parsedArgs = taskArgs.split(',').map(a => { const t = a.trim(); return isNaN(t) ? t : Number(t); }).filter(a => a !== '');
-    
-    if (taskName === 'matrix_multiply' && parsedArgs[0] > 1000) {
-      setSubmitStatus({ type: 'error', msg: 'Matrix size cannot exceed 1000.' }); return;
-    }
-    const delay = parseInt(delaySeconds, 10);
-    const endpoint = delay > 0 ? `${API_URL}/task/schedule?delay_seconds=${delay}` : `${API_URL}/task/enqueue`;
-    try {
-      const response = await fetch(endpoint, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ task_name: taskName, args: parsedArgs, on_success_url: webhookUrl || null })
-      });
-      const data = await response.json();
-      if (response.ok) {
-        setSubmitStatus({ type: 'success', msg: `✓ Enqueued! ID: ${data.task_id}` });
-        setRecentTasks(prev => [
-          { task_id: data.task_id, task_name: taskName, status: 'queued', dispatched_at: new Date().toLocaleTimeString() },
-          ...prev
-        ].slice(0, 8));
-      } else {
-        setSubmitStatus({ type: 'error', msg: `Error: ${data.detail}` });
-      }
-    } catch (err) { setSubmitStatus({ type: 'error', msg: `Network error: ${err.message}` }); }
-  };
-
-  const handleLookup = async (e) => {
-    e.preventDefault();
-    if (!lookupId) return;
-    try {
-      const res = await fetch(`${API_URL}/task/${lookupId}`);
-      setLookupResult((await res.json()).result);
-    } catch (err) { setLookupResult({ error: err.message }); }
-  };
-
-  const handleReplay = async (taskId) => {
-    try { await fetch(`${API_URL}/dlq/replay/${taskId}`, { method: 'POST' }); }
-    catch (err) { console.error(err); }
-  };
-
-  const handlePurge = async (taskId) => {
-    try { await fetch(`${API_URL}/dlq/purge/${taskId}`, { method: 'POST' }); }
-    catch (err) { console.error(err); }
-  };
-
-  const handleRetryAll = async () => {
-    try { await fetch(`${API_URL}/dlq/retry_all`, { method: 'POST' }); }
-    catch (err) { console.error(err); }
-  };
-
-  const queuePct = Math.min((metrics.queue_total / (metrics.queue_capacity || 500)) * 100, 100);
-  const queueColor = queuePct >= 90 ? 'var(--danger-color)' : queuePct >= 70 ? 'var(--warning-color)' : 'var(--accent-color)';
-
+function Lifecycle({ m }) {
+  const pct = Math.min(100, (m.queue_total / (m.queue_capacity || 1)) * 100);
+  const capTone = pct >= 90 ? 'danger' : pct >= 70 ? 'warning' : 'ok';
   return (
-    <div>
-      {/* ── Header ────────────────────────────────────────────────────────────── */}
-      <header className="header">
-        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+    <section className="lifecycle" aria-label="Job lifecycle">
+      <div className="stage">
+        <div className="stage-name"><Clock size={15} /> Scheduled</div>
+        <div className="stage-count">{m.delayed}</div>
+        <div className="stage-note">waiting for their start time or a retry</div>
+      </div>
+      <ChevronRight className="flow-arrow" aria-hidden="true" />
+      <div className="stage">
+        <div className="stage-name">Queued</div>
+        <div className="stage-count">{m.queue_total}</div>
+        <div className={`capacity cap-${capTone}`} title={`${m.queue_total} of ${m.queue_capacity} queue slots used`}>
+          <div style={{ width: `${pct}%` }} />
+        </div>
+        <div className="stage-note split">
+          <span>high {m.queue_high}</span><span>default {m.queue_default}</span><span>low {m.queue_low}</span>
+        </div>
+      </div>
+      <ChevronRight className="flow-arrow" aria-hidden="true" />
+      <div className="stage stage-running">
+        <div className="stage-name"><span className={`pulse ${m.processing ? 'on' : ''}`} /> Running</div>
+        <div className="stage-count">{m.processing}</div>
+        <div className="stage-note">on {m.worker_count} worker{m.worker_count === 1 ? '' : 's'}</div>
+      </div>
+      <ChevronRight className="flow-arrow" aria-hidden="true" />
+      <div className="stage stage-outcomes">
+        <div className="outcome">
+          <div className="stage-name">Succeeded</div>
+          <div className="stage-count tone-text-success">{m.completed_total}</div>
+        </div>
+        <div className="outcome">
+          <div className="stage-name">Dead letters</div>
+          <div className={`stage-count ${m.dlq ? 'tone-text-danger' : ''}`}>{m.dlq}</div>
+        </div>
+      </div>
+    </section>
+  );
+}
+
+function GettingStarted() {
+  return (
+    <section className="callout">
+      <Terminal size={18} />
+      <div>
+        <strong>No workers are running, so queued jobs will wait.</strong>
+        <p>Start one in a terminal next to your project:</p>
+        <pre>pytaskq worker --app your_module:queue</pre>
+        <p className="muted">Try the built-in demo tasks with <code>pytaskq worker --app pytaskq.task_registery:queue</code>.</p>
+      </div>
+    </section>
+  );
+}
+
+// ── Jobs ─────────────────────────────────────────────────────────────────────
+
+const FILTERS = [
+  { id: '', label: 'All' },
+  { id: 'Queued', label: 'Queued' },
+  { id: 'Scheduled', label: 'Scheduled' },
+  { id: 'Processing', label: 'Running' },
+  { id: 'RetryScheduled', label: 'Retrying' },
+  { id: 'Success', label: 'Succeeded' },
+  { id: 'DeadLetter', label: 'Dead letter' },
+  { id: 'Cancelled', label: 'Cancelled' },
+];
+
+function JobsView({ tasks, filter, setFilter, nameFilter, setNameFilter, taskNames, onOpen, loading }) {
+  const [lookup, setLookup] = useState('');
+  return (
+    <div className="panel">
+      <div className="toolbar">
+        <div className="chips" role="tablist" aria-label="Filter by status">
+          {FILTERS.map(f => (
+            <button key={f.id || 'all'} role="tab" aria-selected={filter === f.id}
+              className={`chip ${filter === f.id ? 'active' : ''}`} onClick={() => setFilter(f.id)}>
+              {f.label}
+            </button>
+          ))}
+        </div>
+        <div className="toolbar-right">
+          <select value={nameFilter} onChange={e => setNameFilter(e.target.value)} aria-label="Filter by task">
+            <option value="">All tasks</option>
+            {taskNames.map(n => <option key={n} value={n}>{n}</option>)}
+          </select>
+          <form className="lookup" onSubmit={e => { e.preventDefault(); if (lookup.trim()) onOpen(lookup.trim()); }}>
+            <Search size={14} />
+            <input value={lookup} onChange={e => setLookup(e.target.value)} placeholder="Find a job by ID" aria-label="Find a job by ID" />
+          </form>
+        </div>
+      </div>
+
+      {tasks.length === 0 ? (
+        <div className="empty">
+          {loading ? 'Loading jobs…' : filter || nameFilter
+            ? 'No jobs match these filters.'
+            : <>No jobs yet. Open <strong>Run a task</strong> to queue your first one.</>}
+        </div>
+      ) : (
+        <div className="table-wrap">
+          <table className="jobs">
+            <thead>
+              <tr><th>Status</th><th>Task</th><th>Arguments</th><th>Queued</th><th className="num">Duration</th><th>Priority</th></tr>
+            </thead>
+            <tbody>
+              {tasks.map(t => (
+                <tr key={t.task_id} onClick={() => onOpen(t.task_id)} tabIndex={0}
+                  onKeyDown={e => { if (e.key === 'Enter') onOpen(t.task_id); }}>
+                  <td><StatusBadge status={t.status} /></td>
+                  <td>
+                    <div className="task-name">{t.task_name}</div>
+                    <div className="task-id">{t.task_id.slice(0, 8)}</div>
+                  </td>
+                  <td className="args">{formatArgs(t.args, t.kwargs) || <span className="muted">none</span>}</td>
+                  <td title={formatClock(t.created_at)}>{timeAgo(t.created_at)}</td>
+                  <td className="num">{formatDuration(t.duration_ms)}</td>
+                  <td><span className={`prio prio-${t.priority}`}>{t.priority}</span></td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function Field({ label, children }) {
+  return (<><dt>{label}</dt><dd>{children}</dd></>);
+}
+
+function TaskDrawer({ taskId, onClose, notify, refreshKey }) {
+  const [task, setTask] = useState(null);
+  const [error, setError] = useState('');
+  const [busy, setBusy] = useState(false);
+
+  const load = useCallback(() => {
+    api(`/task/${encodeURIComponent(taskId)}`)
+      .then(d => { setTask(d.result); setError(''); })
+      .catch(e => { setTask(null); setError(e.message); });
+  }, [taskId]);
+
+  useEffect(() => { load(); }, [load, refreshKey]);
+  useEffect(() => {
+    const onKey = e => { if (e.key === 'Escape') onClose(); };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [onClose]);
+
+  const cancel = async () => {
+    setBusy(true);
+    try { await api(`/task/${taskId}/cancel`, { method: 'POST' }); notify('success', 'Job cancelled.'); load(); }
+    catch (e) { notify('error', e.message); }
+    finally { setBusy(false); }
+  };
+
+  const result = task ? prettyResult(task.result) : '';
+  return (
+    <div className="drawer-backdrop" onClick={onClose}>
+      <aside className="drawer" onClick={e => e.stopPropagation()} aria-label="Job details" role="dialog">
+        <header className="drawer-head">
           <div>
-            <h1>⚡ PyTaskQ</h1>
-            <p>Real-time distributed worker queue dashboard.</p>
+            <h2>{task?.task_name || 'Job details'}</h2>
+            <code className="task-id">{taskId}</code>
           </div>
-          <div style={{ display: 'flex', gap: '0.75rem', alignItems: 'center' }}>
-            <ThemeToggle theme={theme} onToggle={toggleTheme} />
-          </div>
-        </div>
-      </header>
+          <button className="icon-btn" onClick={onClose} aria-label="Close"><X size={18} /></button>
+        </header>
 
-      {/* ── Queue Health Bar ──────────────────────────────────────────────────── */}
-      <div style={{ background: 'var(--surface-color)', border: '1px solid var(--border-color)', borderRadius: '8px', padding: '0.75rem 1.25rem', marginBottom: '1.5rem', display: 'flex', alignItems: 'center', gap: '1rem' }}>
-        <BarChart2 size={16} color="var(--text-secondary)" />
-        <span style={{ fontSize: '0.8rem', fontWeight: 600, color: 'var(--text-secondary)', whiteSpace: 'nowrap' }}>Queue Health</span>
-        <div style={{ flex: 1, height: '8px', background: 'var(--border-color)', borderRadius: '999px', overflow: 'hidden' }}>
-          <div style={{ height: '100%', width: `${queuePct}%`, background: queueColor, borderRadius: '999px', transition: 'width 0.5s ease' }} />
-        </div>
-        <span style={{ fontSize: '0.8rem', fontWeight: 700, color: queueColor, whiteSpace: 'nowrap' }}>{metrics.queue_total} / {metrics.queue_capacity} tasks</span>
-        <div style={{ display: 'flex', gap: '0.5rem', fontSize: '0.75rem' }}>
-          <span style={{ background: 'var(--status-failed-bg)', color: 'var(--status-failed-text)', padding: '0.15rem 0.5rem', borderRadius: '999px', fontWeight: 600 }}>H:{metrics.queue_high}</span>
-          <span style={{ background: 'var(--status-processing-bg)', color: 'var(--status-processing-text)', padding: '0.15rem 0.5rem', borderRadius: '999px', fontWeight: 600 }}>D:{metrics.queue_default}</span>
-          <span style={{ background: 'var(--status-success-bg)', color: 'var(--status-success-text)', padding: '0.15rem 0.5rem', borderRadius: '999px', fontWeight: 600 }}>L:{metrics.queue_low}</span>
-        </div>
-      </div>
-
-      {/* ── Metrics Grid ─────────────────────────────────────────────────────── */}
-      <div className="metrics-grid">
-        <div className="metric-box pending"><div className="metric-title"><Inbox size={16} /> Pending</div><div className="metric-value" style={{ color: 'var(--accent-color)' }}>{metrics.pending}</div></div>
-        <div className="metric-box processing"><div className="metric-title"><Activity size={16} /> Active</div><div className="metric-value" style={{ color: 'var(--success-color)' }}>{metrics.processing}</div></div>
-        <div className="metric-box delayed"><div className="metric-title"><Clock size={16} /> Delayed</div><div className="metric-value" style={{ color: 'var(--warning-color)' }}>{metrics.delayed}</div></div>
-        <div className="metric-box dlq"><div className="metric-title"><AlertTriangle size={16} /> Dead Letters</div><div className="metric-value" style={{ color: 'var(--danger-color)' }}>{metrics.dlq}</div></div>
-        <div className="metric-box"><div className="metric-title"><CheckCircle size={16} /> Completed</div><div className="metric-value" style={{ color: 'var(--success-color)' }}>{metrics.completed_total}</div></div>
-        <div className="metric-box"><div className="metric-title"><Activity size={16} /> Workers</div><div className="metric-value" style={{ color: 'var(--accent-color)' }}>{metrics.worker_count || workers.length}</div></div>
-      </div>
-
-      <div className="dashboard-grid">
-        {/* ── Left Column ─────────────────────────────────────────────────────── */}
-        <div>
-          {/* Dispatch Form */}
-          <div className="card" style={{ marginBottom: '2rem' }}>
-            <h2><Send size={20} style={{ color: 'var(--accent-color)' }} /> Dispatch New Task</h2>
-            <form onSubmit={handleEnqueue}>
-              <div className="form-group">
-                <label>Select Task Type</label>
-                <select value={taskName} onChange={(e) => setTaskName(e.target.value)} style={{ padding: '0.75rem', borderRadius: '6px', border: '1px solid var(--border-color)', fontSize: '1rem', backgroundColor: 'var(--surface-color)', color: 'var(--text-primary)' }}>
-                  <option value="matrix_multiply">Matrix Multiplication (CPU)</option>
-                  <option value="url_health_check">URL Health Check (I/O)</option>
-                  <option value="generate_csv_report">Generate CSV Report (CPU)</option>
-                  <option value="resize_image">Resize Image (I/O)</option>
-                </select>
-              </div>
-              {taskName === 'matrix_multiply' && (<div className="form-group"><label>Matrix Size (N × N) — max 1000</label><input type="number" min="1" max="1000" value={taskArgs} onChange={(e) => setTaskArgs(e.target.value)} required /></div>)}
-              {taskName === 'url_health_check' && (<div className="form-group"><label>URL to check</label><input type="url" placeholder="https://example.com" value={taskArgs} onChange={(e) => setTaskArgs(e.target.value)} required /></div>)}
-              {taskName === 'generate_csv_report' && (<div className="form-group"><label>Number of rows</label><input type="number" min="1" max="100000" value={taskArgs} onChange={(e) => setTaskArgs(e.target.value)} required /></div>)}
-              {taskName === 'resize_image' && (<div className="form-group"><label>Args: image_url, width, height (comma separated)</label><input type="text" placeholder="https://example.com/img.jpg, 800, 600" value={taskArgs} onChange={(e) => setTaskArgs(e.target.value)} required /></div>)}
-              <div className="form-group">
-                <label>Delay (seconds) — 0 = immediate</label>
-                <input type="number" min="0" value={delaySeconds} onChange={(e) => setDelaySeconds(e.target.value)} />
-              </div>
-              <div className="form-group">
-                <label>Webhook on Success (optional)</label>
-                <input type="url" placeholder="https://example.com/webhook" value={webhookUrl} onChange={(e) => setWebhookUrl(e.target.value)} />
-              </div>
-              <button type="submit" className="btn btn-primary" style={{ width: '100%', marginTop: '0.5rem' }}>
-                <Zap size={16} style={{ marginRight: '0.5rem' }} />Dispatch Task
-              </button>
-            </form>
-            {submitStatus && <div className={`status-box ${submitStatus.type}`}>{submitStatus.msg}</div>}
-          </div>
-
-          {/* Live Task Feed */}
-          {recentTasks.length > 0 && (
-            <div className="card" style={{ marginBottom: '2rem' }}>
-              <h2><Activity size={20} style={{ color: 'var(--success-color)' }} /> Live Task Feed</h2>
-              <div style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem' }}>
-                {recentTasks.map((t) => (
-                  <div key={t.task_id} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '0.75rem', background: 'var(--task-bg)', borderRadius: '8px', border: '1px solid var(--border-color)' }}>
-                    <div>
-                      <div style={{ fontWeight: 600, fontSize: '0.875rem' }}>{t.task_name}</div>
-                      <div style={{ fontFamily: 'monospace', fontSize: '0.7rem', color: 'var(--text-secondary)', marginTop: '0.2rem' }}>{t.task_id}</div>
-                    </div>
-                    <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: '0.25rem' }}>
-                      <StatusBadge status={t.status} />
-                      <span style={{ fontSize: '0.7rem', color: 'var(--text-secondary)' }}>{t.dispatched_at}</span>
-                    </div>
-                  </div>
-                ))}
-              </div>
-            </div>
-          )}
-
-          {/* Task Lookup */}
-          <div className="card">
-            <h2><Search size={20} style={{ color: 'var(--accent-color)' }} /> Check Task Status</h2>
-            <form onSubmit={handleLookup} style={{ display: 'flex', gap: '1rem' }}>
-              <input type="text" placeholder="Paste Task ID here..." value={lookupId} onChange={(e) => setLookupId(e.target.value)} style={{ flex: 1, padding: '0.75rem', borderRadius: '6px', border: '1px solid var(--border-color)', background: 'var(--surface-color)', color: 'var(--text-primary)' }} />
-              <button type="submit" className="btn btn-secondary">Search</button>
-            </form>
-            {lookupResult && (
-              <div style={{ marginTop: '1rem', padding: '1rem', background: 'var(--code-bg)', color: 'var(--code-text)', borderRadius: '6px', fontFamily: 'monospace', fontSize: '0.85rem', overflowX: 'auto', whiteSpace: 'pre-wrap' }}>
-                {Object.keys(lookupResult).length === 0 ? 'Task not found or expired.' : JSON.stringify(lookupResult, null, 2)}
-              </div>
-            )}
-          </div>
-        </div>
-
-        {/* ── Right Column ─────────────────────────────────────────────────────── */}
-        <div style={{ display: 'flex', flexDirection: 'column', gap: '2rem' }}>
-          {/* Worker Health */}
-          <div className="card">
-            <h2><Activity size={20} style={{ color: 'var(--accent-color)' }} /> Worker Fleet Health</h2>
-            {workers.length === 0 ? (
-              <p style={{ color: 'var(--text-secondary)' }}>No active workers detected. Is the worker process running?</p>
-            ) : (
-              <div style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem' }}>
-                {workers.map(w => (
-                  <div key={w.worker_id} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '0.75rem', background: 'var(--task-bg)', borderRadius: '8px', border: '1px solid var(--border-color)' }}>
-                    <div style={{ fontFamily: 'monospace', fontSize: '0.8rem', fontWeight: 600 }}>{w.worker_id}</div>
-                    <div style={{ display: 'flex', alignItems: 'center', gap: '1rem' }}>
-                      <span style={{ fontSize: '0.75rem', color: 'var(--text-secondary)' }}>Heartbeat: {w.last_heartbeat_seconds_ago}s ago</span>
-                      <StatusBadge status={w.status === 'healthy' ? 'Success' : 'Failed'} />
-                    </div>
-                  </div>
-                ))}
-              </div>
-            )}
-          </div>
-
-          {/* Dead Letter Queue */}
-          <div className="card" style={{ flex: 1 }}>
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1.5rem' }}>
-              <h2 style={{ color: 'var(--danger-color)', margin: 0, display: 'flex', alignItems: 'center', gap: '0.5rem' }}><AlertOctagon size={20} /> Dead Letter Queue</h2>
-              {dlqTasks.length > 0 && (
-                <div style={{ display: 'flex', gap: '0.5rem' }}>
-                  <button onClick={handleRetryAll} className="btn btn-secondary" style={{ padding: '0.5rem 1rem', fontSize: '0.875rem' }}>Retry All</button>
-                  <button onClick={() => fetch(`${API_URL}/dlq/purge_all`, { method: 'POST' })} className="btn btn-danger" style={{ padding: '0.5rem 1rem', fontSize: '0.875rem' }}>Purge All</button>
-                </div>
+        {error && <div className="notice notice-error">{error}</div>}
+        {task && (
+          <>
+            <div className="drawer-status">
+              <StatusBadge status={task.status} />
+              {!FINAL.has(task.status) && task.status !== 'Processing' && (
+                <span className="muted">Updates live</span>
               )}
             </div>
-            {dlqTasks.length === 0 ? (
-              <p style={{ color: 'var(--text-secondary)' }}>✓ Queue is healthy. No failed tasks!</p>
-            ) : (
-              <div className="table-container">
-                <table>
-                  <thead><tr><th>Task ID</th><th>Name</th><th>Retries</th><th>Actions</th></tr></thead>
-                  <tbody>
-                    {dlqTasks.map((t, idx) => (
-                      <tr key={idx}>
-                        <td style={{ fontFamily: 'monospace', fontSize: '0.8rem' }}>{t.task_id.substring(0, 10)}...</td>
-                        <td style={{ fontWeight: 600 }}>{t.task_name}</td>
-                        <td><span style={{ fontWeight: 700, color: 'var(--danger-color)' }}>{t.retry_count}</span></td>
-                        <td style={{ display: 'flex', gap: '0.5rem' }}>
-                          <button onClick={() => handleReplay(t.task_id)} className="btn btn-secondary" style={{ padding: '0.25rem 0.5rem', fontSize: '0.75rem', display: 'flex', alignItems: 'center', gap: '0.25rem' }}><RotateCcw size={12} /> Replay</button>
-                          <button onClick={() => handlePurge(t.task_id)} className="btn btn-danger" style={{ padding: '0.25rem 0.5rem', fontSize: '0.75rem', display: 'flex', alignItems: 'center', gap: '0.25rem' }}><Trash2 size={12} /> Delete</button>
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            )}
+            <dl className="facts">
+              <Field label="Priority"><span className={`prio prio-${task.priority}`}>{task.priority || 'default'}</span></Field>
+              <Field label="Queued">{formatClock(task.created_at)}</Field>
+              {task.scheduled_for && <Field label="Runs at">{formatClock(task.scheduled_for)}</Field>}
+              {task.started_at && <Field label="Started">{formatClock(task.started_at)}</Field>}
+              {task.finished_at && <Field label="Finished">{formatClock(task.finished_at)}</Field>}
+              {task.duration_ms !== undefined && <Field label="Duration">{formatDuration(task.duration_ms)}</Field>}
+              <Field label="Attempts">{(task.retry_count || 0) + 1}</Field>
+              {task.worker_id && <Field label="Worker"><code>{task.worker_id}</code></Field>}
+              {task.note && <Field label="Note">{task.note}</Field>}
+            </dl>
+
+            <h3>Arguments</h3>
+            <pre className="code">{JSON.stringify({ args: task.args ?? [], kwargs: task.kwargs ?? {} }, null, 2)}</pre>
+
+            {task.error && (<><h3>Error</h3><pre className="code code-error">{task.error}</pre></>)}
+            {result && (<><h3>Result</h3><pre className="code">{result}</pre></>)}
+
+            <div className="drawer-actions">
+              <CopyButton text={taskId} />
+              {CANCELLABLE.has(task.status) && (
+                <button className="btn btn-danger btn-sm" onClick={cancel} disabled={busy}>
+                  <Ban size={14} /> Cancel job
+                </button>
+              )}
+            </div>
+          </>
+        )}
+      </aside>
+    </div>
+  );
+}
+
+// ── Run a task ───────────────────────────────────────────────────────────────
+
+function paramPlaceholder(p) {
+  if ('default' in p) return JSON.stringify(p.default);
+  if (p.annotation === 'int' || p.annotation === 'float') return '42';
+  if (p.annotation === 'str') return 'text';
+  if (p.annotation === 'list') return '[1, 2, 3]';
+  if (p.annotation === 'dict') return '{"key": "value"}';
+  return 'value or JSON';
+}
+
+function RunView({ registered, onQueued, notify }) {
+  const visible = registered.filter(t => !t.internal);
+  const [picked, setName] = useState('');
+  const [values, setValues] = useState({});
+  const [manualArgs, setManualArgs] = useState('[]');
+  const [priority, setPriority] = useState('');
+  const [delay, setDelay] = useState('');
+  const [webhook, setWebhook] = useState('');
+  const [busy, setBusy] = useState(false);
+
+  // Default to the first available task until the person picks one
+  const name = picked || visible[0]?.name || '';
+
+  const spec = visible.find(t => t.name === name);
+  const params = (spec?.params || []).filter(p => !p.kind);
+
+  const submit = async e => {
+    e.preventDefault();
+    let args = [];
+    const kwargs = {};
+    if (spec) {
+      for (const p of params) {
+        const v = parseValue(values[p.name]);
+        if (v === undefined) {
+          if (p.required) { notify('error', `“${p.name}” is required.`); return; }
+          continue;
+        }
+        kwargs[p.name] = v;
+      }
+    } else {
+      try { args = JSON.parse(manualArgs || '[]'); } catch { notify('error', 'Arguments must be a JSON list, e.g. [1, "a"].'); return; }
+      if (!Array.isArray(args)) { notify('error', 'Arguments must be a JSON list, e.g. [1, "a"].'); return; }
+    }
+    setBusy(true);
+    try {
+      const body = { task_name: name, args, kwargs, delay_seconds: Number(delay) || 0, on_success_url: webhook || null };
+      if (priority) body.priority = priority;
+      const res = await api('/task/enqueue', { method: 'POST', body });
+      notify('success', `${name} ${res.status === 'scheduled' ? 'scheduled' : 'queued'}.`, res.task_id);
+      onQueued(res.task_id);
+    } catch (err) {
+      notify('error', err.message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="run-grid">
+      <div className="panel task-list" aria-label="Available tasks">
+        <h2>Tasks</h2>
+        {visible.length === 0 ? (
+          <p className="muted small">
+            No tasks found yet. Workers announce their tasks when they start, or start the dashboard with
+            <code> --app your_module:queue</code>. You can still type a task name.
+          </p>
+        ) : (
+          <ul>
+            {visible.map(t => (
+              <li key={t.name}>
+                <button className={`task-pick ${t.name === name ? 'active' : ''}`} onClick={() => { setName(t.name); setValues({}); }}>
+                  <span className="task-pick-name"><TypeIcon type={t.type} /> {t.name}</span>
+                  {t.doc && <span className="task-pick-doc">{t.doc}</span>}
+                  {t.cron && <span className="task-pick-cron"><Clock size={12} /> {t.cron}</span>}
+                </button>
+              </li>
+            ))}
+          </ul>
+        )}
+      </div>
+
+      <form className="panel run-form" onSubmit={submit}>
+        {spec ? (
+          <>
+            <h2>{spec.name}</h2>
+            <p className="muted small">
+              {spec.type === 'cpu' ? 'Runs in a separate process' : spec.type === 'async' ? 'Runs on the worker event loop' : 'Runs in a worker thread'}
+              {' '}· retried up to {spec.max_retries}× · times out after {spec.timeout ? `${spec.timeout}s` : 'never'}
+            </p>
+            {params.length === 0 && <p className="muted">This task takes no arguments.</p>}
+            {params.map(p => (
+              <label key={p.name} className="field">
+                <span>{p.name}{p.required && <em className="req" aria-label="required">*</em>}{p.annotation && <small> {p.annotation}</small>}</span>
+                <input value={values[p.name] ?? ''} placeholder={paramPlaceholder(p)}
+                  onChange={e => setValues(v => ({ ...v, [p.name]: e.target.value }))} />
+              </label>
+            ))}
+          </>
+        ) : (
+          <>
+            <h2>Run a task</h2>
+            <label className="field"><span>Task name<em className="req">*</em></span>
+              <input value={name} onChange={e => setName(e.target.value)} placeholder="send_welcome_email" required />
+            </label>
+            <label className="field"><span>Arguments <small>JSON list</small></span>
+              <input value={manualArgs} onChange={e => setManualArgs(e.target.value)} placeholder='[42, "hello"]' />
+            </label>
+          </>
+        )}
+
+        <div className="field">
+          <span>Priority</span>
+          <div className="segmented" role="radiogroup" aria-label="Priority">
+            {[['', `Task default${spec && spec.priority !== 'default' ? ` (${spec.priority})` : ''}`], ['high', 'High'], ['default', 'Normal'], ['low', 'Low']].map(([v, l]) => (
+              <button type="button" key={v || 'auto'} role="radio" aria-checked={priority === v}
+                className={priority === v ? 'active' : ''} onClick={() => setPriority(v)}>{l}</button>
+            ))}
           </div>
         </div>
+        <label className="field"><span>Start after <small>seconds, leave empty to start now</small></span>
+          <input type="number" min="0" value={delay} onChange={e => setDelay(e.target.value)} placeholder="0" />
+        </label>
+        <details className="advanced">
+          <summary>Notify a URL when it succeeds</summary>
+          <label className="field"><span>Webhook URL</span>
+            <input type="url" value={webhook} onChange={e => setWebhook(e.target.value)} placeholder="https://example.com/hooks/job-done" />
+          </label>
+        </details>
+        <button className="btn btn-primary" type="submit" disabled={busy || !name}>
+          <Play size={16} /> {Number(delay) > 0 ? 'Schedule job' : 'Queue job'}
+        </button>
+      </form>
+    </div>
+  );
+}
+
+// ── Workers ──────────────────────────────────────────────────────────────────
+
+function uptime(s) {
+  if (s === null || s === undefined) return '—';
+  if (s < 60) return `${s}s`;
+  if (s < 3600) return `${Math.floor(s / 60)}m`;
+  if (s < 86400) return `${Math.floor(s / 3600)}h ${Math.floor((s % 3600) / 60)}m`;
+  return `${Math.floor(s / 86400)}d ${Math.floor((s % 86400) / 3600)}h`;
+}
+
+function WorkersView({ workers }) {
+  if (workers.length === 0) return <div className="panel"><GettingStarted /></div>;
+  return (
+    <div className="panel">
+      <div className="table-wrap">
+        <table>
+          <thead><tr><th>Worker</th><th>App</th><th className="num">Running</th><th className="num">Done</th><th className="num">Failed</th><th>Pools</th><th>Up</th><th>Health</th></tr></thead>
+          <tbody>
+            {workers.map(w => (
+              <tr key={w.worker_id}>
+                <td><div className="task-name">{w.hostname || 'worker'}{w.pid ? ` · pid ${w.pid}` : ''}</div><div className="task-id">{w.worker_id}</div></td>
+                <td>{w.app || <span className="muted">—</span>}</td>
+                <td className="num">{w.active}</td>
+                <td className="num">{w.processed}</td>
+                <td className="num">{w.failed}</td>
+                <td className="small">{w.cpu_workers ?? '?'} proc · {w.io_workers ?? '?'} threads</td>
+                <td>{uptime(w.uptime_seconds)}</td>
+                <td>
+                  <span className={`badge tone-${w.status === 'healthy' ? 'success' : w.status === 'degraded' ? 'warning' : 'danger'}`}>
+                    {w.status === 'healthy' ? 'Healthy' : w.status === 'degraded' ? 'Slow heartbeat' : 'Unresponsive'}
+                  </span>
+                  <div className="muted small">{w.last_heartbeat_seconds_ago}s ago</div>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
       </div>
     </div>
   );
 }
 
-export default App
+// ── Dead letters ─────────────────────────────────────────────────────────────
+
+function DeadLettersView({ items, notify, onOpen }) {
+  const [confirmPurge, setConfirmPurge] = useState(false);
+  const act = async (path, okMsg) => {
+    try { const r = await api(path, { method: 'POST' }); notify('success', okMsg(r)); }
+    catch (e) { notify('error', e.message); }
+  };
+
+  if (items.length === 0) {
+    return <div className="panel"><div className="empty">No dead letters. Jobs that fail every retry land here so you can inspect and replay them.</div></div>;
+  }
+  return (
+    <div className="panel">
+      <div className="toolbar">
+        <p className="muted small">These jobs failed every retry. Fix the cause, then replay them.</p>
+        <div className="toolbar-right">
+          <button className="btn btn-secondary btn-sm" onClick={() => act('/dlq/retry_all', r => `Replaying ${r.retried} job${r.retried === 1 ? '' : 's'}.`)}>
+            <RotateCcw size={14} /> Replay all
+          </button>
+          {confirmPurge ? (
+            <>
+              <button className="btn btn-danger btn-sm" onClick={() => { setConfirmPurge(false); act('/dlq/purge_all', () => 'Dead letters deleted.'); }}>
+                Delete {items.length}
+              </button>
+              <button className="btn btn-ghost btn-sm" onClick={() => setConfirmPurge(false)}>Keep them</button>
+            </>
+          ) : (
+            <button className="btn btn-ghost btn-sm" onClick={() => setConfirmPurge(true)}><Trash2 size={14} /> Delete all</button>
+          )}
+        </div>
+      </div>
+      <div className="table-wrap">
+        <table>
+          <thead><tr><th>Task</th><th>Last error</th><th>Failed</th><th className="num">Attempts</th><th></th></tr></thead>
+          <tbody>
+            {items.map(t => (
+              <tr key={t.task_id}>
+                <td>
+                  <button className="link" onClick={() => onOpen(t.task_id)}>{t.task_name}</button>
+                  <div className="task-id">{t.task_id.slice(0, 8)}</div>
+                </td>
+                <td className="error-cell">{t.error || <span className="muted">not recorded</span>}</td>
+                <td>{timeAgo(t.failed_at)}</td>
+                <td className="num">{(t.retry_count || 0) + 1}</td>
+                <td>
+                  <div className="row-actions">
+                    <button className="btn btn-secondary btn-sm" onClick={() => act(`/dlq/replay/${t.task_id}`, () => `${t.task_name} replayed.`)}><RotateCcw size={14} /> Replay</button>
+                    <button className="btn btn-ghost btn-sm" onClick={() => act(`/dlq/purge/${t.task_id}`, () => 'Dead letter deleted.')} aria-label={`Delete ${t.task_name}`}><Trash2 size={14} /></button>
+                  </div>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+// ── App shell ────────────────────────────────────────────────────────────────
+
+function useHashTab() {
+  const read = () => {
+    const h = window.location.hash.replace('#', '');
+    return TABS.some(t => t.id === h) ? h : 'jobs';
+  };
+  const [tab, setTab] = useState(read);
+  useEffect(() => {
+    const on = () => setTab(read());
+    window.addEventListener('hashchange', on);
+    return () => window.removeEventListener('hashchange', on);
+  }, []);
+  const go = id => { window.location.hash = id; setTab(id); };
+  return [tab, go];
+}
+
+export default function App() {
+  const [theme, setTheme] = useState(() => storage.get('theme', 'dark'));
+  useEffect(() => {
+    document.documentElement.setAttribute('data-theme', theme);
+    storage.set('theme', theme);
+  }, [theme]);
+
+  const [tab, setTab] = useHashTab();
+  const [metrics, setMetrics] = useState(EMPTY_METRICS);
+  const [dlq, setDlq] = useState([]);
+  const [connected, setConnected] = useState(false);
+  const [tick, setTick] = useState(0);          // bumps on every live update
+  const [tasks, setTasks] = useState([]);
+  const [loadingTasks, setLoadingTasks] = useState(true);
+  const [filter, setFilter] = useState('');
+  const [nameFilter, setNameFilter] = useState('');
+  const [registered, setRegistered] = useState([]);
+  const [workers, setWorkers] = useState([]);
+  const [openId, setOpenId] = useState(null);
+  const [toasts, setToasts] = useState([]);
+
+  const notify = useCallback((type, msg, taskId) => {
+    const id = Math.random().toString(36).slice(2);
+    setToasts(t => [...t.slice(-3), { id, type, msg, taskId }]);
+    setTimeout(() => setToasts(t => t.filter(x => x.id !== id)), type === 'error' ? 7000 : 3500);
+  }, []);
+
+  // Live updates over WebSocket (falls back to polling while disconnected)
+  useEffect(() => {
+    let ws, retry, alive = true;
+    const connect = () => {
+      ws = new WebSocket(WS_URL);
+      ws.onopen = () => setConnected(true);
+      ws.onmessage = ev => {
+        const data = JSON.parse(ev.data);
+        if (data.metrics) setMetrics(data.metrics);
+        if (data.dlq) setDlq(data.dlq);
+        setTick(t => t + 1);
+      };
+      ws.onclose = () => { setConnected(false); if (alive) retry = setTimeout(connect, 3000); };
+      ws.onerror = () => ws.close();
+    };
+    connect();
+    return () => { alive = false; clearTimeout(retry); if (ws) ws.close(); };
+  }, []);
+
+  useEffect(() => {
+    if (connected) return;
+    const poll = () => {
+      api('/metrics').then(setMetrics).catch(() => {});
+      api('/dlq').then(d => setDlq(d.tasks || [])).catch(() => {});
+      setTick(t => t + 1);
+    };
+    const iv = setInterval(poll, 5000);
+    return () => clearInterval(iv);
+  }, [connected]);
+
+  // Job history follows live updates, throttled to at most ~1 request/second
+  const lastFetch = useRef(0);
+  const pending = useRef(null);
+  useEffect(() => {
+    const run = () => {
+      lastFetch.current = Date.now();
+      const q = new URLSearchParams({ limit: '100' });
+      if (filter) q.set('status', filter);
+      if (nameFilter) q.set('task_name', nameFilter);
+      api(`/tasks?${q}`).then(d => setTasks(d.tasks || [])).catch(() => {}).finally(() => setLoadingTasks(false));
+    };
+    const wait = Math.max(0, 1000 - (Date.now() - lastFetch.current));
+    clearTimeout(pending.current);
+    pending.current = setTimeout(run, wait);
+    return () => clearTimeout(pending.current);
+  }, [tick, filter, nameFilter]);
+
+  useEffect(() => {
+    const load = () => {
+      api('/tasks/registered').then(d => setRegistered(d.tasks || [])).catch(() => {});
+      api('/system/workers').then(d => setWorkers(d.workers || [])).catch(() => {});
+    };
+    load();
+    const iv = setInterval(load, 5000);
+    return () => clearInterval(iv);
+  }, []);
+
+  const taskNames = useMemo(() => {
+    const s = new Set(registered.filter(t => !t.internal).map(t => t.name));
+    tasks.forEach(t => s.add(t.task_name));
+    return [...s].sort();
+  }, [registered, tasks]);
+
+  const workerCount = Math.max(metrics.worker_count || 0, workers.length);
+
+  return (
+    <div className="shell">
+      <header className="topbar">
+        <div className="brand">
+          <img src="/static/favicon.svg" alt="" width="26" height="26" />
+          <span>PyTaskQ</span>
+        </div>
+        <div className="topbar-right">
+          <span className={`conn ${connected ? 'live' : ''}`}>
+            <span className="dot" /> {connected ? 'Live' : 'Reconnecting…'}
+          </span>
+          <button className="btn btn-ghost btn-sm" onClick={() => setTheme(t => (t === 'dark' ? 'light' : 'dark'))}
+            aria-label={theme === 'dark' ? 'Switch to light theme' : 'Switch to dark theme'}>
+            {theme === 'dark' ? <Sun size={15} /> : <Moon size={15} />}
+          </button>
+        </div>
+      </header>
+
+      <Lifecycle m={{ ...metrics, worker_count: workerCount }} />
+      {workerCount === 0 && tab !== 'workers' && <GettingStarted />}
+
+      <nav className="tabs" aria-label="Sections">
+        {TABS.map(t => {
+          const Icon = t.icon;
+          const count = t.id === 'dead' ? dlq.length : t.id === 'workers' ? workerCount : null;
+          return (
+            <a key={t.id} href={`#${t.id}`} className={`tab ${tab === t.id ? 'active' : ''}`}
+              aria-current={tab === t.id ? 'page' : undefined} onClick={e => { e.preventDefault(); setTab(t.id); }}>
+              <Icon size={16} /> {t.label}
+              {count ? <span className={`count ${t.id === 'dead' ? 'count-danger' : ''}`}>{count}</span> : null}
+            </a>
+          );
+        })}
+      </nav>
+
+      <main>
+        {tab === 'jobs' && (
+          <JobsView tasks={tasks} filter={filter} setFilter={setFilter} nameFilter={nameFilter}
+            setNameFilter={setNameFilter} taskNames={taskNames} onOpen={setOpenId} loading={loadingTasks} />
+        )}
+        {tab === 'run' && (
+          <RunView registered={registered} notify={notify} onQueued={() => {}} />
+        )}
+        {tab === 'workers' && <WorkersView workers={workers} />}
+        {tab === 'dead' && <DeadLettersView items={dlq} notify={notify} onOpen={setOpenId} />}
+      </main>
+
+      {openId && <TaskDrawer taskId={openId} onClose={() => setOpenId(null)} notify={notify} refreshKey={tick} />}
+      <Toasts
+        toasts={toasts.map(t => ({
+          ...t,
+          msg: t.taskId
+            ? <>{t.msg} <button className="link" onClick={() => { setOpenId(t.taskId); setTab('jobs'); }}>View job</button></>
+            : t.msg,
+        }))}
+        dismiss={id => setToasts(t => t.filter(x => x.id !== id))}
+      />
+    </div>
+  );
+}

@@ -1,98 +1,112 @@
 import json
+import time
+
 from fastapi import APIRouter, HTTPException
-from pytaskq.core import redis_client
+
+from pytaskq.core import queueing, redis_client
 from pytaskq.services.dashboard_service import _notify_tenant
 
 router = APIRouter(prefix="/dlq", tags=["dlq"])
 
+DLQ_KEY = "dlq"
+_DLQ_ONLY_FIELDS = ("error", "failed_at")
+
+
 @router.get("")
 async def get_dlq():
-    view_dlq = await redis_client.r.lrange("dlq", 0, -1)
+    view_dlq = await redis_client.r.lrange(DLQ_KEY, 0, -1)
     tasks = [json.loads(item) for item in view_dlq]
     return {"tasks": tasks}
 
+
+async def _find(task_id: str):
+    for raw in await redis_client.r.lrange(DLQ_KEY, 0, -1):
+        item = json.loads(raw)
+        if item.get("task_id") == task_id:
+            return raw, item
+    raise HTTPException(status_code=404, detail="Task for particular id is not found")
+
+
+async def _fresh_payload(item: dict) -> dict:
+    """Reset a dead-lettered task so it can run again with a valid fence token."""
+    task = {k: v for k, v in item.items() if k not in _DLQ_ONLY_FIELDS}
+    task["retry_count"] = 0
+    task["prev_delay"] = 1.0
+    current_fence = await redis_client.r.get(f"fence:{task.get('task_id')}")
+    if current_fence is not None:
+        task["fence_token"] = int(current_fence)
+    return task
+
+
+def _queue_ops(pipe, raw: str, task: dict):
+    task_id = task.get("task_id")
+    new_raw = json.dumps(task)
+    pipe.lrem(DLQ_KEY, 1, raw)
+    pipe.decr("stats:dlq")
+    pipe.rpush(queueing.queue_key(task.get("priority", "default")), new_raw)
+    pipe.incr("stats:pending")
+    if task_id:
+        pipe.hset(queueing.task_key(task_id), mapping={
+            "task_id": task_id,
+            "task_name": task.get("task_name", ""),
+            "status": queueing.QUEUED,
+            "priority": task.get("priority", "default"),
+            "retry_count": 0,
+            "payload": new_raw,
+            "error": "",
+            "note": f"Replayed from DLQ at {time.strftime('%Y-%m-%d %H:%M:%S')}",
+        })
+
+
 @router.post("/replay/{task_id}")
 async def replay_task(task_id: str):
-    dlq_key = "dlq"
-    view_by_id = await redis_client.r.lrange(dlq_key, 0, -1)
-    matched_item = None
-    matched_dict = None
-    for raw in view_by_id:
-        item = json.loads(raw)
-        if item["task_id"] == task_id:
-            matched_item = raw
-            matched_dict = item
-            break
-    if matched_item is None:
-        raise HTTPException(status_code=404, detail="Task for particular id is not found")
-
-    matched_dict["retry_count"] = 0
-    current_fence = await redis_client.r.get(f"fence:{task_id}")
-    if current_fence is not None:
-        matched_dict["fence_token"] = int(current_fence)
-
-    await redis_client.r.lrem(dlq_key, 1, matched_item)
-    await redis_client.r.rpush(f"queue:{matched_dict.get('priority', 'default')}", json.dumps(matched_dict))
-    await redis_client.r.incr("stats:pending")
-    await redis_client.r.decr("stats:dlq")
+    raw, item = await _find(task_id)
+    task = await _fresh_payload(item)
+    async with redis_client.r.pipeline(transaction=True) as pipe:
+        _queue_ops(pipe, raw, task)
+        await pipe.execute()
     await _notify_tenant("global", "dlq_updated")
-    return {
-        "message": "Task replayed successfully",
-        "task": matched_dict,
-    }
+    return {"message": "Task replayed successfully", "task": task}
+
 
 @router.post("/purge/{task_id}")
 async def purge_task(task_id: str):
-    dlq_key = "dlq"
-    view_by_id = await redis_client.r.lrange(dlq_key, 0, -1)
-    matched_item = None
-    matched_dict = None
-    for raw in view_by_id:
-        item = json.loads(raw)
-        if item["task_id"] == task_id:
-            matched_item = raw
-            matched_dict = item
-            break
-    if matched_item is None:
-        raise HTTPException(status_code=404, detail="Task for particular id is not found")
-
-    await redis_client.r.lrem(dlq_key, 1, matched_item)
-    await redis_client.r.decr("stats:dlq")
+    raw, item = await _find(task_id)
+    async with redis_client.r.pipeline(transaction=True) as pipe:
+        pipe.lrem(DLQ_KEY, 1, raw)
+        pipe.decr("stats:dlq")
+        await pipe.execute()
     await _notify_tenant("global", "dlq_updated")
-    return {
-        "message": "task is Deleted",
-        "task": matched_dict,
-    }
+    return {"message": "task is Deleted", "task": item}
+
 
 @router.post("/purge_all")
 async def purge_all():
-    await redis_client.r.delete("dlq")
-    await redis_client.r.set("stats:dlq", 0)
+    async with redis_client.r.pipeline(transaction=True) as pipe:
+        pipe.delete(DLQ_KEY)
+        pipe.set("stats:dlq", 0)
+        await pipe.execute()
     await _notify_tenant("global", "dlq_updated")
-    return {
-        "message": "Entire dlq is cleared",
-    }
+    return {"message": "Entire dlq is cleared"}
+
 
 @router.post("/retry_all")
 async def retry_all_dlq():
-    """Pulls all tasks from DLQ and puts them back into the default queue."""
-    tasks = await redis_client.r.lrange("dlq", 0, -1)
-    if not tasks:
+    """Move every dead-lettered task back onto its original priority queue."""
+    raws = await redis_client.r.lrange(DLQ_KEY, 0, -1)
+    if not raws:
         return {"message": "DLQ is empty", "retried": 0}
-        
+
+    retried = 0
     async with redis_client.r.pipeline(transaction=True) as pipe:
-        for task_json in tasks:
-            task_data = json.loads(task_json)
-            task_data["retry_count"] = 0
-            task_id = task_data.get("task_id")
-            
-            pipe.lpush("queue:default", json.dumps(task_data))
-            pipe.incr("stats:pending")
-            pipe.hset(f"task:{task_id}", mapping={"status": "queued", "error": ""})
-            
-        pipe.delete("dlq")
-        pipe.set("stats:dlq", 0)
+        for raw in raws:
+            try:
+                item = json.loads(raw)
+            except ValueError:
+                continue
+            _queue_ops(pipe, raw, await _fresh_payload(item))
+            retried += 1
         await pipe.execute()
-        
+
     await _notify_tenant("global", "dlq_updated")
-    return {"message": f"Successfully requeued {len(tasks)} tasks", "retried": len(tasks)}
+    return {"message": f"Successfully requeued {retried} tasks", "retried": retried}
