@@ -11,7 +11,7 @@ Thank you for your interest in contributing to this project! Please review the g
     ```powershell
     python -m venv .venv
     .venv\Scripts\Activate.ps1
-    pip install -r requirements.txt
+    pip install -e ".[dev,demo]"
     ```
 3.  **Configure** — copy the template and fill in values; every variable is documented in the file:
     ```powershell
@@ -29,21 +29,20 @@ Thank you for your interest in contributing to this project! Please review the g
 *   **Asynchronous Code**:
     *   Always use non-blocking libraries (e.g., `redis.asyncio` for Redis).
     *   Avoid calling blocking I/O functions directly within the primary worker event loop; run them within a `ThreadPoolExecutor` or `ProcessPoolExecutor` via `loop.run_in_executor`.
-*   **Security-sensitive handlers**: any handler that fetches a user-supplied URL MUST go through `_assert_safe_url()` in `src/task_registery.py`.
-*   **Tenancy**: any new Redis hash write for task state must include `tenant_id`.
+*   **Security-sensitive handlers**: any handler that fetches a user-supplied URL MUST go through `assert_safe_url()` in `pytaskq/net.py`.
+*   **Permissions**: every new API route must declare who may call it with `Depends(require("viewer" | "operator" | "admin"))`.
 *   **Documentation**: Document any changes made to APIs, workers, or helper functions. Ensure inline docstrings describe non-trivial implementations.
 
 ---
 
 ## 📚 Documentation Rules
 
-*   **All Markdown lives in [`docs/`](.)** — the repo root contains only `README.md`.
+*   **Markdown lives in [`docs/`](.)**, except `README.md` and `CHANGELOG.md` in the repo root.
 *   When you change code behavior, update the matching doc in the same PR:
     *   API changes → `API.md`
     *   Queue/worker/retry behavior → `ARCHITECTURE.md`
     *   Config variables (add/remove/rename) → `.env.example` + `ARCHITECTURE.md` §5
-    *   Bug fixes / features → `ROADMAP.md` (move the item to ✅ Completed)
-*   Load-test configuration belongs in `.env` (`LOADTEST_*`) — see `tests/load/`.
+    *   Bug fixes / features → `CHANGELOG.md` (under the next version)
 
 ---
 
@@ -53,7 +52,7 @@ Any bug fix or new feature must include corresponding tests inside the `tests/` 
 
 *   The full suite uses **fakeredis** (with Lua support via `fakeredis[lua]`) — no real services needed:
     ```powershell
-    pytest          # currently 61 tests, must be green before any PR
+    python -m pytest    # must be green before any PR (CI runs it on every push)
     ```
 *   Write isolated tests using `fakeredis` where possible.
 *   If introducing connection error resilience or crash recovery, write mock failure-injection tests in the pattern of the existing `test_crash_recovery.py` and `test_graceful_shutdown.py`.

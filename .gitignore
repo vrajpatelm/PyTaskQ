@@ -31,16 +31,17 @@ desktop.ini
 *.njsproj
 *.sln
 *.swp
-.agents
-.freebuff
+.agents/
+.freebuff/
 
-# Redis dump / benchmark artifacts
+# Redis dump
 dump.rdb
-result.json
-# Bottleneck-capture run output (tests/load/server_bottleneck_capture.sh)
-tests/load/reports/
 
+# Local-only files (kept on your machine, never committed)
 install.cmd
+docs/INTERVIEW_PREP.md
+docs/PYTASKQ_ARCHITECTURE_ANALYSIS.md
+Claude outputs/
 
 # Python packaging output
 dist/

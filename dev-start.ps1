@@ -37,12 +37,12 @@ Start-Sleep -Seconds 2
 
 # -- 3. Start FastAPI Backend --------------------------------
 Write-Host "[2/4] Starting FastAPI backend on http://localhost:8000 ..." -ForegroundColor Green
-Start-Process powershell -ArgumentList "-NoExit", "-Command", "cd '$ProjectRoot'; .\.venv\Scripts\python.exe -m uvicorn src.main:app --reload"
+Start-Process powershell -ArgumentList "-NoExit", "-Command", "cd '$ProjectRoot'; .\.venv\Scripts\python.exe -m pytaskq dashboard --app example_app:queue --reload"
 Start-Sleep -Seconds 1
 
 # -- 4. Start Worker -----------------------------------------
 Write-Host "[3/4] Starting background worker..." -ForegroundColor Green
-Start-Process powershell -ArgumentList "-NoExit", "-Command", "cd '$ProjectRoot'; .\.venv\Scripts\python.exe -m src.worker"
+Start-Process powershell -ArgumentList "-NoExit", "-Command", "cd '$ProjectRoot'; .\.venv\Scripts\python.exe -m pytaskq worker --app example_app:queue"
 Start-Sleep -Seconds 1
 
 # -- 5. Start React Frontend ---------------------------------

@@ -40,12 +40,6 @@ class Settings(BaseSettings):
     DEDUP_TTL: int = 5
     ENVIRONMENT: str = "development"
 
-    # ── Misc / legacy ────────────────────────────────────────────────────────
-    EMAIL: str = ""
-    EMAIL_PASSWORD: str = ""
-    LOADTEST_HOST: str = ""
-    LOADTEST_API_KEY: str = ""
-
     @property
     def auth_enabled(self) -> bool:
         return self.PYTASKQ_AUTH.strip().lower() not in ("off", "false", "0", "no", "disabled")
