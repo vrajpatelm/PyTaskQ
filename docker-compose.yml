@@ -1,3 +1,8 @@
+# Local development stack: Redis + dashboard + worker + Jaeger.
+# Redis is published on localhost:6379 without a password for convenience.
+# For a public server use deploy/docker-compose.prod.yml instead (HTTPS, private
+# Redis with a password, automatic backups). See docs/DEPLOYMENT.md.
+
 services:
   redis:
     image: redis:7-alpine
@@ -89,6 +94,13 @@ services:
       context: .
       dockerfile: Dockerfile
     command: python -u -m pytaskq worker --app example_app:queue
+    # The image's health check probes the dashboard; for a worker, "healthy"
+    # means it can reach Redis.
+    healthcheck:
+      test: ["CMD", "pytaskq", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
     env_file:
       - .env
     environment:

@@ -14,7 +14,7 @@ Async-first, self-hosted, built on FastAPI and Redis.
 [![CI](https://github.com/vrajpatelm/PyTaskQ/actions/workflows/ci.yml/badge.svg)](https://github.com/vrajpatelm/PyTaskQ/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-MIT-6366f1)](https://github.com/vrajpatelm/PyTaskQ/blob/main/LICENSE)
 
-[Quick start](#quick-start) · [Dashboard](#the-dashboard) · [Accounts](#accounts) · [Configuration](#configuration) · [How it works](#how-it-works) · [API](#rest-api) · [Docker](#docker)
+[Quick start](#quick-start) · [Dashboard](#the-dashboard) · [Accounts](#accounts) · [Configuration](#configuration) · [How it works](#how-it-works) · [API](#rest-api) · [Self-hosting](#self-hosting)
 
 <br/>
 
@@ -27,7 +27,7 @@ Async-first, self-hosted, built on FastAPI and Redis.
 - **Plain Python.** One decorator. Sync, `async def`, CPU-heavy and I/O-bound tasks each run in the right pool automatically.
 - **See everything.** A live dashboard shows every job's arguments, timing, result and error, and lets you run, cancel and replay jobs.
 - **Built for failure.** Retries with backoff, a dead-letter queue, crash recovery, fencing tokens and graceful shutdown come built in.
-- **Self-hosted.** Accounts, roles and invite links are included. Redis is the only thing you need to run.
+- **Self-hosted.** Accounts, roles, invite links, HTTPS and backups are included. Redis is the only thing you need to run.
 
 ## Quick start
 
@@ -184,14 +184,28 @@ Interactive docs are served at `/docs`, and the full reference is in [docs/API.m
 | `GET` | `/metrics`, `/system/workers`, `/dlq` | Queue, worker and dead-letter state |
 | `POST` | `/dlq/replay/{id}`, `/dlq/retry_all` | Replay dead letters |
 
-## Docker
+## Self-hosting
+
+Run the official image `ghcr.io/vrajpatelm/pytaskq` (amd64 and arm64) on your own server. The production setup in [`deploy/`](https://github.com/vrajpatelm/PyTaskQ/tree/main/deploy) includes:
+
+- **HTTPS** via Caddy, with an automatic Let's Encrypt certificate.
+- **A private, password-protected Redis.** Only ports 80 and 443 are public.
+- **Automatic backups** every 6 hours, plus a one-command restore.
 
 ```bash
-docker compose up --build    # Redis + dashboard + worker + Jaeger
-docker compose logs web | grep -A4 "setup code"
+cd deploy && cp .env.example .env     # set PYTASKQ_DOMAIN and REDIS_PASSWORD
+docker compose -f docker-compose.prod.yml up -d
 ```
 
-Point `PYTASKQ_APP` and the worker `command:` in `docker-compose.yml` at your own module. Accounts and jobs persist in the `redis-data` volume.
+For your own tasks, build a worker image on top of the official one:
+
+```dockerfile
+FROM ghcr.io/vrajpatelm/pytaskq:0.3
+COPY tasks.py .
+CMD ["pytaskq", "worker", "--app", "tasks:queue"]
+```
+
+The full guide covers backups, restoring, upgrades and a security checklist: [docs/DEPLOYMENT.md](https://github.com/vrajpatelm/PyTaskQ/blob/main/docs/DEPLOYMENT.md). For local development, `docker compose up --build` in the repo root starts Redis, the dashboard, a worker and Jaeger.
 
 ## Development
 

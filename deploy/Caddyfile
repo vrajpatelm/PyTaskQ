@@ -1,0 +1,14 @@
+# HTTPS in front of PyTaskQ. Caddy gets and renews a Let's Encrypt certificate
+# for your domain automatically (port 80 and 443 must reach this server).
+{$PYTASKQ_DOMAIN} {
+	encode zstd gzip
+	reverse_proxy {$PYTASKQ_UPSTREAM:web:8000}
+
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		-Server
+	}
+}

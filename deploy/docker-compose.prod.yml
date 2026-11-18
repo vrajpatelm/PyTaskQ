@@ -1,0 +1,121 @@
+# PyTaskQ for a public server: HTTPS, private Redis, automatic backups.
+#
+#   cp .env.example .env          # set PYTASKQ_DOMAIN and REDIS_PASSWORD
+#   docker compose -f docker-compose.prod.yml up -d
+#
+# Only Caddy is reachable from the internet (ports 80/443). The dashboard,
+# worker and Redis talk on a private network; Redis requires a password.
+# Full guide: docs/DEPLOYMENT.md
+name: pytaskq
+
+x-redis-env: &redis-env
+  REDIS_HOST: redis
+  REDIS_PORT: "6379"
+  REDIS_PASSWORD: ${REDIS_PASSWORD:?Set REDIS_PASSWORD in .env}
+
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    environment:
+      PYTASKQ_DOMAIN: ${PYTASKQ_DOMAIN:?Set PYTASKQ_DOMAIN in .env}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data          # certificates: keep this volume
+      - caddy-config:/config
+    depends_on:
+      - web
+    logging: *logging
+
+  web:
+    image: ghcr.io/vrajpatelm/pytaskq:${PYTASKQ_VERSION:-latest}
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      <<: *redis-env
+      PYTASKQ_APP: ${PYTASKQ_WORKER_APP:-example_app:queue}
+      COOKIE_SECURE: "true"
+      # Trust X-Forwarded-For/Proto from Caddy (nothing else can reach this container)
+      FORWARDED_ALLOW_IPS: "*"
+    expose:
+      - "8000"                    # private: only Caddy connects
+    depends_on:
+      redis:
+        condition: service_healthy
+    logging: *logging
+
+  worker:
+    # For your own tasks, build an image FROM this one with your code in it
+    # and set WORKER_IMAGE in .env (see docs/DEPLOYMENT.md).
+    image: ${WORKER_IMAGE:-ghcr.io/vrajpatelm/pytaskq:${PYTASKQ_VERSION:-latest}}
+    command: ["pytaskq", "worker", "--app", "${PYTASKQ_WORKER_APP:-example_app:queue}"]
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      <<: *redis-env
+    healthcheck:
+      test: ["CMD", "pytaskq", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    depends_on:
+      redis:
+        condition: service_healthy
+    logging: *logging
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    # Append-only log (fsync every second) + periodic snapshots, password required
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --appendfsync
+      - everysec
+      - --save
+      - 900 1 300 10 60 10000
+      - --requirepass
+      - ${REDIS_PASSWORD:?Set REDIS_PASSWORD in .env}
+    environment:
+      REDISCLI_AUTH: ${REDIS_PASSWORD}
+    volumes:
+      - redis-data:/data          # all jobs and accounts live here
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    logging: *logging
+
+  backup:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["sh", "/backup-loop.sh"]
+    environment:
+      REDIS_HOST: redis
+      REDISCLI_AUTH: ${REDIS_PASSWORD}
+      BACKUP_INTERVAL_HOURS: ${BACKUP_INTERVAL_HOURS:-6}
+      BACKUP_KEEP: ${BACKUP_KEEP:-28}
+    volumes:
+      - ./backup-loop.sh:/backup-loop.sh:ro
+      - ./backups:/backups
+    depends_on:
+      redis:
+        condition: service_healthy
+    logging: *logging
+
+volumes:
+  redis-data:
+  caddy-data:
+  caddy-config:

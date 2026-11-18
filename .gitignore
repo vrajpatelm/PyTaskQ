@@ -47,3 +47,7 @@ Claude outputs/
 dist/
 build/
 *.egg-info/
+
+# Production deployment: your settings and backups never go in git
+deploy/.env
+deploy/backups/

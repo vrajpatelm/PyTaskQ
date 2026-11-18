@@ -1,9 +1,10 @@
-# Publishes PyTaskQ to PyPI when you push a version tag:
+# Publishes PyTaskQ to PyPI and the Docker image to GHCR when you push a version tag:
 #
 #   1. bump __version__ in pytaskq/__init__.py and commit
 #   2. git tag v0.3.0 && git push origin v0.3.0
 #
-# Uses PyPI Trusted Publishing (OIDC), so no API token is stored anywhere.
+# Uses PyPI Trusted Publishing (OIDC) and the built-in GITHUB_TOKEN for GHCR,
+# so no secret is stored anywhere.
 # One-time setup on pypi.org is described in docs/RELEASING.md.
 name: Release
 
@@ -70,9 +71,52 @@ jobs:
           path: dist/
       - uses: pypa/gh-action-pypi-publish@release/v1
 
+  docker:
+    name: Docker image
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write   # push to ghcr.io/<owner>/pytaskq
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-qemu-action@v3     # lets one machine build for ARM too
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Image tags (0.3.1, 0.3, latest)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/pytaskq
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest,enable=${{ !contains(github.ref_name, '-') }}
+          labels: |
+            org.opencontainers.image.title=PyTaskQ
+            org.opencontainers.image.description=Background jobs for Python with a live dashboard
+
+      - name: Build and push (amd64 + arm64)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
   github-release:
     name: GitHub release
-    needs: publish
+    needs: [publish, docker]
     runs-on: ubuntu-latest
     permissions:
       contents: write
