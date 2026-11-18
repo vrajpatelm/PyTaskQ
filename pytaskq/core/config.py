@@ -38,10 +38,7 @@ class Settings(BaseSettings):
     WEB_WORKERS: int = 1               # API processes (`pytaskq dashboard --workers`); 0 = one per CPU core
     LIVE_UPDATES_PER_SECOND: float = 2 # cap on dashboard refreshes pushed over the WebSocket
     ALLOWED_ORIGINS: str = "*"
-    RATE_LIMIT_PER_MINUTE: int = 100
-    IDEMPOTENCY_TTL: int = 86400
-    IDEMPOTENCY_PENDING_TTL: int = 30
-    DEDUP_TTL: int = 5
+    IDEMPOTENCY_TTL: int = 86400       # how long an Idempotency-Key is remembered (seconds)
     ENVIRONMENT: str = "development"
 
     @property

@@ -270,33 +270,38 @@ async def set_password(r, username: str, new_password: str, keep_session_sha: Op
 
 # ── login throttling ─────────────────────────────────────────────────────────
 
-async def _failures(r, username: str, ip: str) -> tuple[int, int]:
-    u, i = await r.mget(f"auth:fail:user:{username}", f"auth:fail:ip:{ip}")
-    return int(u or 0), int(i or 0)
+async def _reserve_attempt(r, username: str, ip: str) -> tuple[int, int]:
+    """Count this attempt BEFORE checking the password; returns (attempts by user, by IP).
 
-
-async def _record_failure(r, username: str, ip: str) -> None:
+    Counting first is what makes the limit hold under parallel requests: 40
+    guesses sent at once used to all pass a "fewer than 10 so far?" check before
+    any of them was recorded.
+    """
     async with r.pipeline(transaction=True) as pipe:
         for key in (f"auth:fail:user:{username}", f"auth:fail:ip:{ip}"):
             pipe.incr(key)
             pipe.expire(key, LOGIN_WINDOW)
-        await pipe.execute()
+        by_user, _, by_ip, _ = await pipe.execute()
+    return int(by_user), int(by_ip)
 
 
 async def authenticate(r, username: str, password: str, ip: str = "unknown") -> User:
     """Check a username/password. Raises AuthError (generic message) on failure."""
     name = (username or "").strip().lower()
-    by_user, by_ip = await _failures(r, name, ip)
-    if by_user >= MAX_FAILS_PER_USER or by_ip >= MAX_FAILS_PER_IP:
+    by_user, by_ip = await _reserve_attempt(r, name, ip)
+    if by_user > MAX_FAILS_PER_USER or by_ip > MAX_FAILS_PER_IP:
         raise AuthError("Too many failed sign-in attempts. Try again in 15 minutes.", 429)
 
     h = await r.hgetall(_k_user(name)) if USERNAME_RE.match(name) else {}
     ok = await verify_password(password or "", h.get("password_hash") or _DUMMY_HASH)
     if not h or not ok or h.get("disabled") == "1":
-        await _record_failure(r, name, ip)
-        raise AuthError("Wrong username or password.", 401)
+        raise AuthError("Wrong username or password.", 401)   # the attempt stays counted
 
-    await r.delete(f"auth:fail:user:{name}")
+    # A correct password isn't a failure: clear the user's count, give the IP its attempt back.
+    async with r.pipeline(transaction=True) as pipe:
+        pipe.delete(f"auth:fail:user:{name}")
+        pipe.decr(f"auth:fail:ip:{ip}")
+        await pipe.execute()
     return _user_from_hash(h)
 
 
@@ -550,6 +555,9 @@ async def complete_setup(r, code: str, username: str, password: str) -> User:
     if not await r.set("auth:setup_lock", "1", nx=True, ex=30):
         raise AuthError("Setup is already in progress.", 409)
     try:
+        # Check again under the lock: another browser may have just finished.
+        if await user_count(r) > 0:
+            raise AuthError("Setup is already complete. Sign in instead.", 409)
         user = await create_user(r, username, password, "admin", created_by="setup")
         await r.delete(K_SETUP_CODE)
         return user
@@ -563,8 +571,13 @@ async def bootstrap_from_env(r) -> Optional[User]:
         return None
     if await user_count(r) > 0:
         return None
-    user = await create_user(r, settings.PYTASKQ_ADMIN_USER, settings.PYTASKQ_ADMIN_PASSWORD,
-                             "admin", created_by="env")
+    try:
+        user = await create_user(r, settings.PYTASKQ_ADMIN_USER, settings.PYTASKQ_ADMIN_PASSWORD,
+                                 "admin", created_by="env")
+    except AuthError as e:
+        if e.status == 409:      # another API process (--workers N) created it a moment ago
+            return None
+        raise
     await r.delete(K_SETUP_CODE)
     return user
 

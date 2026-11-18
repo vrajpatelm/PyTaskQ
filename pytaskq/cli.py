@@ -104,6 +104,22 @@ def cmd_tasks(args):
             print(f"      {s['doc']}")
 
 
+def _redacted(url: str) -> str:
+    """The Redis URL without its password (this output ends up in logs and health checks)."""
+    from urllib.parse import urlsplit, urlunsplit
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return "(REDIS_URL)"
+    if parts.password is None and "@" not in parts.netloc:
+        return url
+    host = parts.hostname or ""
+    if parts.port:
+        host = f"{host}:{parts.port}"
+    user = f"{parts.username}:***@" if parts.username else "***@"
+    return urlunsplit((parts.scheme, user + host, parts.path, "", ""))
+
+
 def cmd_ping(args):
     from pytaskq.core.redis_client import make_client
     from pytaskq.core.config import settings
@@ -112,12 +128,12 @@ def cmd_ping(args):
         client = make_client()
         try:
             await client.ping()
-            workers = await client.zcard("active_workers")
-            return workers
+            import time
+            return await client.zcount("active_workers", time.time(), "+inf")   # alive ones only
         finally:
             await client.aclose()
 
-    target = settings.REDIS_URL or f"{settings.REDIS_HOST}:{settings.REDIS_PORT}"
+    target = _redacted(settings.REDIS_URL) if settings.REDIS_URL else f"{settings.REDIS_HOST}:{settings.REDIS_PORT}"
     try:
         workers = asyncio.run(go())
     except Exception as e:

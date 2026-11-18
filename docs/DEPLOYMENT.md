@@ -123,6 +123,17 @@ docker compose -f docker-compose.prod.yml pull
 docker compose -f docker-compose.prod.yml up -d
 ```
 
+## Tracing (optional)
+
+To see each job's journey in Jaeger, Grafana Tempo, Honeycomb or Datadog, add your collector's OTLP gRPC address to `.env` and restart:
+
+```bash
+OTEL_EXPORTER_OTLP_ENDPOINT=https://otel.example.com:4317
+# OTEL_EXPORTER_OTLP_HEADERS=x-honeycomb-team=YOUR_KEY   # if your service needs an API key
+```
+
+The image already includes the tracing libraries. Spans never contain URLs, job arguments or secrets. Details: [API.md](API.md#tracing-optional).
+
 ## Security checklist
 
 - [ ] `REDIS_PASSWORD` is long and random. Redis is never published to the internet.

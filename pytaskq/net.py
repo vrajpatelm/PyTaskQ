@@ -5,7 +5,7 @@ pytaskq.net — safe outbound HTTP helpers for task handlers
 Task handlers often fetch user-supplied URLs. Without a guard a caller could make
 workers request internal services (localhost, 169.254.169.254 cloud metadata,
 RFC1918 ranges, ...). `assert_safe_url` resolves the hostname and rejects any URL
-whose DNS points at a non-public address; `SAFE_OPENER` re-validates every redirect
+whose DNS points at a non-public address (loopback, private, link-local, CGNAT…); `SAFE_OPENER` re-validates every redirect
 hop so http://public.host/ can't bounce a worker behind the firewall.
 
 Use it in your own tasks:
@@ -39,15 +39,15 @@ def assert_safe_url(url: str) -> None:
     except socket.gaierror:
         raise UnsafeURL(f"Cannot resolve host: {host}")
     for info in addr_infos:
-        ip = ipaddress.ip_address(info[4][0])
-        if (
-            ip.is_private
-            or ip.is_loopback
-            or ip.is_link_local      # 169.254.0.0/16 — cloud metadata lives here
-            or ip.is_reserved
-            or ip.is_multicast
-            or ip.is_unspecified
-        ):
+        ip = ipaddress.ip_address(info[4][0].split("%", 1)[0])   # drop an IPv6 zone id
+        # ::ffff:127.0.0.1 is 127.0.0.1 written as IPv6: judge the IPv4 address
+        # (older Pythons call the mapped form "global").
+        if ip.version == 6 and ip.ipv4_mapped is not None:
+            ip = ip.ipv4_mapped
+        # Only addresses that are reachable on the public internet are allowed.
+        # `is_global` also rules out ranges the older checks missed, such as
+        # carrier-grade NAT (100.64.0.0/10) used inside many clouds and VPNs.
+        if not ip.is_global or ip.is_multicast:
             raise UnsafeURL(f"Access to non-public address {ip} is not allowed")
 
 

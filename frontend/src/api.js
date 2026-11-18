@@ -1,9 +1,9 @@
 // Small fetch helpers shared by every view.
-export const API_URL = import.meta.env.DEV ? 'http://localhost:8000' : '';
+// Always same-origin: in development, Vite proxies the API to localhost:8000
+// (vite.config.js), so the server never has to accept cookies from another origin.
+export const API_URL = '';
 
-export const WS_URL = import.meta.env.DEV
-  ? 'ws://localhost:8000/ws/dashboard'
-  : `${window.location.protocol === 'https:' ? 'wss:' : 'ws:'}//${window.location.host}/ws/dashboard`;
+export const WS_URL = `${window.location.protocol === 'https:' ? 'wss:' : 'ws:'}//${window.location.host}/ws/dashboard`;
 
 // Fired when the server says the session is gone, so the app can show sign-in.
 export const UNAUTHORIZED_EVENT = 'pytaskq:unauthorized';

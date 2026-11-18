@@ -12,7 +12,10 @@ from redis.exceptions import ConnectionError as RedisConnectionError
 from pytaskq import __version__
 from pytaskq.api.router import api_router
 from pytaskq.core.config import settings
-from pytaskq.core.exceptions import redis_connection_error_handler
+from fastapi.exceptions import RequestValidationError
+
+from pytaskq.core.exceptions import redis_connection_error_handler, validation_error_handler
+from pytaskq.tracing import TracingMiddleware, init_tracer
 
 logging.basicConfig(
     level=logging.INFO,
@@ -20,22 +23,33 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger("api")
+init_tracer("pytaskq-api")   # no-op unless OTEL_EXPORTER_OTLP_ENDPOINT is set
 
 # Resolve relative to this file so the API works from any working directory
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
 
-async def _publish_app_registry():
+async def _publish_app_registry(quiet: bool = False) -> bool:
     """If PYTASKQ_APP is set (e.g. `pytaskq dashboard --app x:queue`), show its tasks right away."""
     spec = os.environ.get("PYTASKQ_APP", "")
     if not spec:
-        return
+        return False
     try:
         from pytaskq.cli import load_app
         await load_app(spec).publish()
-        logger.info(f"Published task registry for {spec}")
+        if not quiet:
+            logger.info(f"Published task registry for {spec}")
     except Exception as e:  # never block startup on this
         logger.warning(f"Could not publish task registry for {spec}: {e}")
+    return True
+
+
+async def _keep_app_registry_fresh():
+    """Advertised tasks expire after a few minutes unless re-advertised (workers do it too)."""
+    import asyncio
+    while True:
+        await asyncio.sleep(60)
+        await _publish_app_registry(quiet=True)
 
 
 async def _prepare_auth():
@@ -68,11 +82,13 @@ async def lifespan(app: FastAPI):
     from pytaskq.core import pressure, redis_client
     from pytaskq.services.live import broadcaster
 
-    await _publish_app_registry()
+    background = [asyncio.create_task(pressure.flush_forever(redis_client.r), name="pytaskq-pressure")]
+    if await _publish_app_registry():
+        background.append(asyncio.create_task(_keep_app_registry_fresh(), name="pytaskq-registry"))
     await _prepare_auth()
-    flusher = asyncio.create_task(pressure.flush_forever(redis_client.r), name="pytaskq-pressure")
     yield
-    flusher.cancel()
+    for task in background:
+        task.cancel()
     await pressure.flush(redis_client.r)
     await broadcaster.stop()
     await redis_client.r.aclose()
@@ -83,7 +99,19 @@ async def lifespan(app: FastAPI):
         provider.force_flush()
 
 
+def _fastapi_options() -> dict:
+    """Newer FastAPI versions trace requests by themselves once tracing is on, recording
+    the full URL path, and an invite link's secret is part of its path. PyTaskQ records its
+    own spans with the route pattern only (pytaskq/tracing.py), so FastAPI's are switched off."""
+    import inspect
+    if "telemetry" in inspect.signature(FastAPI.__init__).parameters:
+        return {"telemetry": {"tracing": False, "operation_spans": False, "metrics": False, "logs": False,
+                              "auto_configure": False}}
+    return {}
+
+
 app = FastAPI(
+    **_fastapi_options(),
     title="PyTaskQ",
     description="Distributed async task queue API",
     version=__version__,
@@ -92,18 +120,28 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# Cross-origin access. The dashboard itself is same-origin and needs none of this.
+# With the default ALLOWED_ORIGINS="*", other sites may call the API with an API
+# token but never with a visitor's session cookie: allowing credentials for "*"
+# made Starlette echo back any Origin, so any site the visitor opened could read
+# API responses as them. List exact origins to allow cookies from them.
+_origins = settings.allowed_origins_list
+_any_origin = "*" in _origins
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=settings.allowed_origins_list,
-    allow_credentials=True,
+    allow_origins=["*"] if _any_origin else _origins,
+    allow_credentials=not _any_origin,
     allow_methods=["GET", "POST", "PATCH", "DELETE"],
-    allow_headers=["Authorization", "Content-Type"],
+    allow_headers=["Authorization", "Content-Type", "Idempotency-Key", "traceparent", "tracestate"],
+    expose_headers=["Retry-After"],
 )
+app.add_middleware(TracingMiddleware)   # outermost: one span per request (steps aside when tracing is off)
 
 if STATIC_DIR.is_dir():
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 app.add_exception_handler(RedisConnectionError, redis_connection_error_handler)
+app.add_exception_handler(RequestValidationError, validation_error_handler)
 
 app.include_router(api_router)
 

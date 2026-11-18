@@ -1,4 +1,8 @@
+import math
+
 from fastapi import Request
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from redis.exceptions import ConnectionError as RedisConnectionError
 
@@ -24,3 +28,19 @@ async def redis_connection_error_handler(request: Request, exc: RedisConnectionE
         content={"error": "Redis is unavailable", "detail": detail},
         headers={"Retry-After": str(RETRY_AFTER_SECONDS)},
     )
+
+
+def _json_safe(value):
+    """Infinity and NaN aren't valid JSON: show them as text in error responses."""
+    if isinstance(value, float) and not math.isfinite(value):
+        return str(value)
+    if isinstance(value, dict):
+        return {k: _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    return value
+
+
+async def validation_error_handler(request: Request, exc: RequestValidationError):
+    """FastAPI's 422, except that echoing an input of Infinity/NaN can't crash it."""
+    return JSONResponse(status_code=422, content={"detail": _json_safe(jsonable_encoder(exc.errors()))})

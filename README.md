@@ -172,6 +172,8 @@ Every server setting is an environment variable or a line in `.env`, and all of 
 4. **Retries, then dead letters.** Failures back off with jitter. After `max_retries`, the job is dead-lettered with its last error.
 5. **Graceful shutdown.** Ctrl+C finishes running jobs before exiting.
 6. **Safe outbound calls.** Webhooks (`on_success_url=`) are signed with HMAC and retried. Use `pytaskq.net.assert_safe_url` to block requests to private networks.
+7. **Safe retries.** Send an `Idempotency-Key` header (or `delay(..., idempotency_key=…)`) and a retried submission returns the original job instead of queueing a second one.
+8. **Tracing (optional).** Set `OTEL_EXPORTER_OTLP_ENDPOINT` and one OpenTelemetry trace follows each job from the request that queued it through every attempt, in Jaeger, Grafana Tempo, Honeycomb or Datadog.
 
 ## REST API
 
@@ -179,7 +181,7 @@ Interactive docs are served at `/docs`, and the full reference is in [docs/API.m
 
 | Method | Route | |
 |---|---|---|
-| `POST` | `/task/enqueue` | Queue a job (`task_name`, `args`, `kwargs`, `priority`, `delay_seconds`) |
+| `POST` | `/task/enqueue` | Queue a job (`task_name`, `args`, `kwargs`, `priority`, `delay_seconds`). Optional `Idempotency-Key` header |
 | `GET` | `/task/{id}` | Status, timings, result or error |
 | `POST` | `/task/{id}/cancel` | Cancel a waiting job |
 | `GET` | `/tasks` | Recent jobs, filterable by status and task |

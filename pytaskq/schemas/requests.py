@@ -1,4 +1,4 @@
-from typing import Literal, Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional
 from pydantic import BaseModel, Field
 
 
@@ -23,10 +23,3 @@ class Taskresult(BaseModel):
     task_id: str
     status: str
     result: str
-
-
-class TaskRequest(BaseModel):
-    task_name: str
-    args: List[Any] = Field(default_factory=list)
-    priority: Literal["high", "default", "low"] = "default"
-    idempotency_key: Optional[str] = None

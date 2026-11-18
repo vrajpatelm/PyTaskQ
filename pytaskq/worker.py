@@ -34,7 +34,7 @@ from pytaskq.core import queueing
 from pytaskq.core import redis_client
 from pytaskq.core.config import settings
 from pytaskq.schemas.requests import Taskloader, Taskresult  # noqa: F401  (Taskresult kept for API compat)
-from pytaskq.tracing import extract_trace_context, init_tracer, inject_trace_context  # noqa: F401
+from pytaskq.tracing import extract_trace_context, init_tracer, inject_trace_context  # noqa: F401  (re-exported)
 
 TASKS = {}
 APP_NAME = ""
@@ -87,11 +87,24 @@ FENCE_SCRIPT = """
 local current = redis.call('get', KEYS[1])
 if current == false or current == ARGV[1] then
     redis.call('hset', KEYS[2], 'task_id', ARGV[2], 'status', ARGV[3], 'result', ARGV[4])
-    redis.call('expire', KEYS[2], 86400)
+    redis.call('expire', KEYS[2], tonumber(ARGV[5]) or 86400)
     return 1
 else
     return 0
 end
+"""
+
+# On timeout, invalidate this attempt — but only if it still owns the job.
+# If the sweeper already handed the job to another worker, bumping the fence
+# would wrongly make THIS attempt's retry the current one. Returns -1 then.
+TIMEOUT_FENCE_SCRIPT = """
+local current = redis.call('get', KEYS[1])
+if current == false or current == ARGV[1] then
+    local token = redis.call('incr', KEYS[1])
+    redis.call('expire', KEYS[1], 86400)
+    return token
+end
+return -1
 """
 
 REQUEUE_SCRIPT = """
@@ -328,6 +341,74 @@ def _resolve(value, entry, key, default):
     return default
 
 
+async def _record_failure(r, tasks, task_json, task_id, error, max_retries) -> str:
+    """
+    Schedule a retry or dead-letter a failed attempt — unless the attempt is stale.
+
+    An attempt is stale when the job was handed to another worker meanwhile (the
+    sweeper thought this worker was dead and bumped the job's fence token). The
+    newer attempt owns the job, so this one must not schedule a second copy or
+    dead-letter it. The fence is checked and the retry/DLQ written atomically
+    (WATCH), so a takeover can't slip in between.
+    """
+    from redis.exceptions import WatchError
+    fence_key = f"fence:{task_id}"
+    finished_at = time.time()
+    dead = tasks.retry_count >= max_retries
+    async with r.pipeline(transaction=True) as pipe:
+        try:
+            await pipe.watch(fence_key)
+            current = await pipe.get(fence_key)
+            if current is not None and current != str(tasks.fence_token):
+                await pipe.reset()
+                logger.warning(f"Task {task_id} attempt failed after the job was handed to another worker; "
+                               f"ignoring it ({error}).")
+                return "Discarded"
+            pipe.multi()
+            pipe.incr("stats:failed")
+            pipe.hincrby(f"worker:{WORKER_ID}", "failed", 1)
+            if dead:
+                dlq_entry = json.loads(task_json)
+                dlq_entry["fence_token"] = tasks.fence_token
+                dlq_entry["error"] = error
+                dlq_entry["failed_at"] = finished_at
+                pipe.lpush("dlq", json.dumps(dlq_entry))
+                pipe.incr("stats:dlq")
+                pipe.hset(queueing.task_key(task_id), mapping={
+                    "task_id": task_id,
+                    "status": queueing.DEAD_LETTER,
+                    "finished_at": finished_at,
+                    "error": f"Failed after {tasks.retry_count} retries. Last error: {error}",
+                })
+                pipe.expire(queueing.task_key(task_id), settings.RESULT_TTL)
+            else:
+                tasks.retry_count += 1
+                base, max_delay = 1.0, 30.0
+                delay = min(max_delay, random.uniform(base, (tasks.prev_delay or base) * 3))
+                tasks.prev_delay = delay
+                retry_raw = json.dumps(tasks.model_dump())
+                pipe.zadd("delayed_tasks", {retry_raw: finished_at + delay})
+                pipe.incr("stats:delayed")
+                pipe.hset(queueing.task_key(task_id), mapping={
+                    "task_id": task_id,
+                    "status": queueing.RETRY_SCHEDULED,
+                    "retry_count": tasks.retry_count,
+                    "next_retry_at": finished_at + delay,
+                    "payload": retry_raw,
+                    "error": f"{error}. Retry {tasks.retry_count}/{max_retries} in {delay:.1f}s.",
+                })
+                pipe.expire(queueing.task_key(task_id), int(settings.RESULT_TTL + delay))
+            await pipe.execute()
+        except WatchError:
+            logger.warning(f"Task {task_id} was handed to another worker while recording its failure; ignoring it.")
+            return "Discarded"
+    if dead:
+        logger.error(f"[DLQ] Task {task_id} failed after {tasks.retry_count} retries. Moving to DLQ. ({error})")
+        return "DeadLetter"
+    logger.error(f"Task {task_id} failed: {error}. Retry {tasks.retry_count}/{max_retries} scheduled.")
+    return "RetryScheduled"
+
+
 async def handle_task(task_json, sem, loop, process_pool, thread_pool):
     incr_done = False
     r = redis_client.r
@@ -352,6 +433,7 @@ async def handle_task(task_json, sem, loop, process_pool, thread_pool):
                     "error": f"Invalid task payload: {e}",
                     "finished_at": time.time(),
                 })
+                pipe.expire(queueing.task_key(task_id), settings.RESULT_TTL)
                 pipe.incr("stats:failed")
                 await pipe.execute()
             return
@@ -362,12 +444,14 @@ async def handle_task(task_json, sem, loop, process_pool, thread_pool):
 
         parent_ctx = extract_trace_context(getattr(tasks, "trace_carrier", {}))
         with tracer.start_as_current_span(
-            "execute_task",
+            f"run {tasks.task_name}",
             context=parent_ctx,
+            kind=trace.SpanKind.CONSUMER,
             attributes={
                 "task.id": task_id,
                 "task.name": tasks.task_name,
                 "task.retry_count": tasks.retry_count,
+                "task.priority": tasks.priority,
                 "worker.id": WORKER_ID,
             },
         ) as span:
@@ -393,6 +477,7 @@ async def handle_task(task_json, sem, loop, process_pool, thread_pool):
                         "worker_id": WORKER_ID,
                         "retry_count": tasks.retry_count,
                     })
+                    pipe.expire(queueing.task_key(task_id), settings.RESULT_TTL)
                     pipe.publish(queueing.EVENTS_CHANNEL, "update")
                     await pipe.execute()
                 incr_done = True
@@ -412,9 +497,9 @@ async def handle_task(task_json, sem, loop, process_pool, thread_pool):
                     except asyncio.TimeoutError:
                         # Invalidate this attempt; the retry carries the new token so
                         # ITS result is accepted while any late write from this one is not.
-                        new_token = await r.incr(f"fence:{task_id}")
-                        await r.expire(f"fence:{task_id}", 86400)
-                        tasks.fence_token = int(new_token)
+                        new_token = int(await r.eval(TIMEOUT_FENCE_SCRIPT, 1, f"fence:{task_id}", str(my_token)))
+                        if new_token >= 0:
+                            tasks.fence_token = new_token
                         raise TaskTimeoutError(
                             f"Task exceeded {timeout:g}s limit. Execution abandoned."
                         ) from None
@@ -425,6 +510,7 @@ async def handle_task(task_json, sem, loop, process_pool, thread_pool):
                     FENCE_SCRIPT, 2,
                     f"fence:{task_id}", queueing.task_key(task_id),
                     str(my_token), task_id, queueing.SUCCESS, queueing.encode_result(result),
+                    int(settings.RESULT_TTL),
                 )
 
                 if saved:
@@ -458,51 +544,12 @@ async def handle_task(task_json, sem, loop, process_pool, thread_pool):
 
             except Exception as e:
                 error = f"{type(e).__name__}: {e}"
-                logger.error(f"Task {task_id} failed: {error}")
                 span.set_status(trace.StatusCode.ERROR, str(e))
                 span.record_exception(e)
-                finished_at = time.time()
-                await r.incr("stats:failed")
-                await r.hincrby(f"worker:{WORKER_ID}", "failed", 1)
-
-                if tasks.retry_count >= max_retries:
-                    logger.error(f"[DLQ] Task {task_id} failed after {tasks.retry_count} retries. Moving to DLQ.")
-                    span.set_attribute("task.status", "DeadLetter")
-                    dlq_entry = json.loads(task_json)
-                    dlq_entry["fence_token"] = tasks.fence_token
-                    dlq_entry["error"] = error
-                    dlq_entry["failed_at"] = finished_at
-                    async with r.pipeline(transaction=True) as pipe:
-                        pipe.lpush("dlq", json.dumps(dlq_entry))
-                        pipe.incr("stats:dlq")
-                        pipe.hset(queueing.task_key(task_id), mapping={
-                            "task_id": task_id,
-                            "status": queueing.DEAD_LETTER,
-                            "finished_at": finished_at,
-                            "error": f"Failed after {tasks.retry_count} retries. Last error: {error}",
-                        })
-                        await pipe.execute()
-                else:
-                    tasks.retry_count += 1
-                    BASE = 1.0
-                    MAX_DELAY = 30.0
-                    prev = getattr(tasks, "prev_delay", BASE)
-                    delay = min(MAX_DELAY, random.uniform(BASE, prev * 3))
-                    tasks.prev_delay = delay
-                    retry_raw = json.dumps(tasks.model_dump())
-
-                    async with r.pipeline(transaction=True) as pipe:
-                        pipe.zadd("delayed_tasks", {retry_raw: time.time() + delay})
-                        pipe.incr("stats:delayed")
-                        pipe.hset(queueing.task_key(task_id), mapping={
-                            "task_id": task_id,
-                            "status": queueing.RETRY_SCHEDULED,
-                            "retry_count": tasks.retry_count,
-                            "next_retry_at": time.time() + delay,
-                            "payload": retry_raw,
-                            "error": f"{error}. Retry {tasks.retry_count}/{max_retries} in {delay:.1f}s.",
-                        })
-                        await pipe.execute()
+                outcome = await _record_failure(r, tasks, task_json, task_id, error, max_retries)
+                span.set_attribute("task.status", outcome)
+                if outcome == "Discarded":
+                    span.set_attribute("task.discard_reason", "fence_token_stale")
 
     finally:
         try:
@@ -579,6 +626,9 @@ async def consumer_task():
     while not shutdown_event.is_set():
         try:
             await sem.acquire()
+            if shutdown_event.is_set():     # stopping: don't start another job
+                sem.release()
+                break
             task_json = await redis_client.r.eval(
                 PRIORITY_POP_SCRIPT,
                 4,

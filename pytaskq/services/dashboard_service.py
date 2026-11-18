@@ -8,10 +8,8 @@ async def _notify_tenant(tenant_id: str, event_type: str) -> None:
 
 async def _get_dashboard_data(tenant_id: str = "global", include_dlq: bool = True) -> dict:
     """Every number the dashboard shows, fetched in a single Redis round trip."""
-    current_minute = int(time.time() / 60)
     async with redis_client.r.pipeline(transaction=False) as pipe:
-        pipe.mget("stats:pending", "stats:processing", "stats:delayed", "stats:completed", "stats:failed",
-                  f"rate_limit:global:{current_minute}")
+        pipe.mget("stats:pending", "stats:processing", "stats:delayed", "stats:completed", "stats:failed")
         pipe.llen("dlq")
         pipe.llen("queue:high")
         pipe.llen("queue:default")
@@ -22,7 +20,7 @@ async def _get_dashboard_data(tenant_id: str = "global", include_dlq: bool = Tru
         counters, dlq_count, queue_high, queue_default, queue_low, worker_count, *rest = await pipe.execute()
     dlq_raw = rest[0] if rest else []
 
-    pending, processing, delayed, completed, failed, rate_used = (int(v or 0) for v in counters)
+    pending, processing, delayed, completed, failed = (int(v or 0) for v in counters)
     dlq_tasks = []
     for raw in dlq_raw:
         try:
@@ -42,8 +40,6 @@ async def _get_dashboard_data(tenant_id: str = "global", include_dlq: bool = Tru
             "queue_low": queue_low,
             "queue_total": queue_high + queue_default + queue_low,
             "queue_capacity": settings.QUEUE_CAPACITY,
-            "rate_limit_used": rate_used,
-            "rate_limit_max": settings.RATE_LIMIT_PER_MINUTE,
             "worker_count": worker_count,
         },
         "dlq": dlq_tasks,
