@@ -1,10 +1,11 @@
 import time
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
 
 from pytaskq.core import redis_client
+from pytaskq.core.dependencies import require
 
-router = APIRouter(prefix="/system", tags=["system"])
+router = APIRouter(prefix="/system", tags=["system"], dependencies=[Depends(require("viewer"))])
 
 
 @router.get("/stats")

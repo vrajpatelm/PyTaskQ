@@ -6,8 +6,10 @@ PyTaskQ command line
     pytaskq dashboard [--app myapp.tasks:queue] [--host 127.0.0.1] [--port 8000]
     pytaskq tasks     --app myapp.tasks:queue
     pytaskq ping
+    pytaskq users list | create NAME | reset-password NAME | set-role NAME ROLE | delete NAME | setup-code
 
 `--app` can also come from the PYTASKQ_APP environment variable.
+`users` talks to Redis directly, so it works even when you're locked out of the dashboard.
 """
 
 import argparse
@@ -113,6 +115,74 @@ def cmd_ping(args):
     print(f"Redis OK at {target} — {workers} worker(s) registered")
 
 
+def _with_redis(fn):
+    """Run an async function with a fresh Redis client (CLI helpers)."""
+    from pytaskq.core.redis_client import make_client
+
+    async def go():
+        client = make_client()
+        try:
+            return await fn(client)
+        finally:
+            await client.aclose()
+
+    return asyncio.run(go())
+
+
+def _ask_password(given: str = "") -> str:
+    if given:
+        return given
+    import getpass
+    first = getpass.getpass("New password: ")
+    if first != getpass.getpass("Repeat password: "):
+        raise CLIError("Passwords don't match.")
+    return first
+
+
+def cmd_users(args):
+    from datetime import datetime
+
+    from pytaskq.core import auth
+
+    action = args.action
+    try:
+        if action == "list":
+            users = _with_redis(auth.list_users)
+            if not users:
+                print("No users yet. Open the dashboard and use the setup code, or run: pytaskq users create NAME --role admin")
+                return
+            print(f"{'USERNAME':<24}{'ROLE':<10}{'STATUS':<10}LAST SIGN-IN")
+            for u in users:
+                last = datetime.fromtimestamp(u.last_login_at).strftime("%Y-%m-%d %H:%M") if u.last_login_at else "never"
+                print(f"{u.username:<24}{u.role:<10}{'disabled' if u.disabled else 'active':<10}{last}")
+        elif action == "create":
+            password = _ask_password(args.password)
+            user = _with_redis(lambda r: auth.create_user(r, args.username, password, args.role, created_by="cli"))
+            print(f"Created {user.role} '{user.username}'.")
+        elif action == "reset-password":
+            name = auth.normalize_username(args.username)
+            password = _ask_password(args.password)
+            _with_redis(lambda r: auth.set_password(r, name, password))
+            print(f"Password for '{name}' changed; their other sessions were signed out.")
+        elif action == "set-role":
+            name = auth.normalize_username(args.username)
+            user = _with_redis(lambda r: auth.update_user(r, name, role=args.role))
+            print(f"'{user.username}' is now {user.role}.")
+        elif action == "delete":
+            name = auth.normalize_username(args.username)
+            _with_redis(lambda r: auth.delete_user(r, name))
+            print(f"Deleted '{name}'.")
+        elif action == "setup-code":
+            code = _with_redis(auth.ensure_setup_code)
+            print(code if code else "Setup is already complete (an account exists). Use 'pytaskq users list'.")
+    except auth.AuthError as e:
+        raise CLIError(e.message) from e
+    except CLIError:
+        raise
+    except Exception as e:  # connection problems etc.
+        raise CLIError(f"Could not reach Redis: {e}") from e
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="pytaskq", description="PyTaskQ — background jobs for Python")
     sub = parser.add_subparsers(dest="command")
@@ -138,6 +208,24 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("ping", help="Check the Redis connection")
     p.set_defaults(func=cmd_ping)
+
+    u = sub.add_parser("users", help="Manage dashboard accounts (works even when locked out)")
+    us = u.add_subparsers(dest="action", required=True)
+    us.add_parser("list", help="List accounts")
+    c = us.add_parser("create", help="Create an account")
+    c.add_argument("username")
+    c.add_argument("--role", choices=["viewer", "operator", "admin"], default="viewer")
+    c.add_argument("--password", default="", help="Omit to be prompted (keeps it out of shell history)")
+    rp = us.add_parser("reset-password", help="Set a new password for an account")
+    rp.add_argument("username")
+    rp.add_argument("--password", default="")
+    sr = us.add_parser("set-role", help="Change an account's role")
+    sr.add_argument("username")
+    sr.add_argument("role", choices=["viewer", "operator", "admin"])
+    d = us.add_parser("delete", help="Delete an account")
+    d.add_argument("username")
+    us.add_parser("setup-code", help="Show the first-run setup code")
+    u.set_defaults(func=cmd_users)
     return parser
 
 

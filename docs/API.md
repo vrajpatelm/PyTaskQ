@@ -197,3 +197,59 @@ Each worker reports `hostname`, `pid`, `app`, `active`, `processed`, `failed`, `
 ### Dead letters
 
 Each `GET /dlq` entry now includes `error` (the last exception) and `failed_at`. `replay` and `retry_all` put jobs back on their **original priority queue** with a valid fence token.
+
+---
+
+## Authentication (v0.3)
+
+Every route except `/health`, `/` (the dashboard page) and the public `/auth` routes requires a caller:
+
+| Caller | How | Permissions |
+|---|---|---|
+| Dashboard | `pytaskq_session` cookie, set by `/auth/login`, `/auth/setup` or accepting an invite | The user's role |
+| Script or service | `Authorization: Bearer ptq_…` (created under *Settings → API tokens*) | The token owner's role |
+| Automation | `Authorization: Bearer <MASTER_KEY>` (only if set, ≥ 16 characters) | Admin |
+
+Roles: **viewer** can use every `GET` route and the live WebSocket. **operator** can also enqueue, schedule and cancel jobs and replay or delete dead letters. **admin** can also use the `/auth/users` and `/auth/invites` management routes.
+
+Errors: `401` means not signed in, or the token is invalid or revoked. `403` means the role is too low, or a cookie-authenticated write came from another website.
+
+With `PYTASKQ_AUTH=off`, every request is treated as an admin called `local`.
+
+### Public
+
+| Method | Route | Body | Notes |
+|---|---|---|---|
+| `GET` | `/auth/status` | — | `{"auth_enabled", "setup_required", "user"}` |
+| `POST` | `/auth/setup` | `{"setup_code", "username", "password"}` | Only while no account exists; signs you in |
+| `POST` | `/auth/login` | `{"username", "password"}` | Throttled after 10 failures per user (or 30 per IP) for 15 minutes |
+| `GET` | `/auth/invites/{token}` | — | `{"role", "created_by", "expires_at"}` |
+| `POST` | `/auth/invites/{token}/accept` | `{"username", "password"}` | Single use; signs you in |
+
+### Signed in
+
+| Method | Route | Body | Notes |
+|---|---|---|---|
+| `GET` | `/auth/me` | — | Current user |
+| `POST` | `/auth/logout` | — | Ends this session |
+| `POST` | `/auth/me/password` | `{"current_password", "new_password"}` | Signs out your other sessions |
+| `GET` | `/auth/me/tokens` | — | Your tokens (never the secret) |
+| `POST` | `/auth/me/tokens` | `{"name"}` | Returns `{"token": "ptq_…"}` **once** |
+| `DELETE` | `/auth/me/tokens/{id}` | — | Revoke |
+
+### Admin
+
+| Method | Route | Body | Notes |
+|---|---|---|---|
+| `GET` | `/auth/users` | — | Everyone, with role, status and last sign-in |
+| `PATCH` | `/auth/users/{username}` | `{"role"?, "disabled"?}` | Disabling signs the user out everywhere |
+| `DELETE` | `/auth/users/{username}` | — | Also revokes their tokens |
+| `GET` | `/auth/invites` | — | Pending invites |
+| `POST` | `/auth/invites` | `{"role"}` | Returns `{"token", "path": "/?invite=…"}` |
+| `DELETE` | `/auth/invites/{id}` | — | Revoke a pending invite |
+
+The only active admin can't be demoted, disabled or deleted. Make someone else an admin first.
+
+### WebSocket
+
+`/ws/dashboard` accepts the session cookie (same-origin only) or `?token=ptq_…`. Unauthenticated connections are closed with code `4401`.

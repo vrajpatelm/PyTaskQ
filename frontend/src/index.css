@@ -317,3 +317,57 @@ table.jobs tbody tr:focus { outline: none; }
 .toast-error { border-left: 3px solid var(--danger-color); }
 .stage-note.split { display: flex; flex-wrap: wrap; gap: 0.15rem 0.6rem; }
 .stage-note.split span { white-space: nowrap; }
+
+/* ── Sign-in screens ───────────────────────────────────────────────────── */
+.auth-page { min-height: calc(100vh - 6rem); display: flex; flex-direction: column; }
+.auth-card {
+  width: min(420px, 100%); margin: 6vh auto 0; background: var(--surface-color);
+  border: 1px solid var(--border-color); border-radius: 14px; padding: 1.75rem 1.75rem 1.5rem;
+}
+.auth-card h1 { font-size: 1.45rem; letter-spacing: -0.02em; margin: 0 0 0.35rem; }
+.auth-card > p { margin: 0 0 1.1rem; }
+.auth-form { display: flex; flex-direction: column; gap: 0.9rem; }
+.auth-form .btn-primary { margin-top: 0.25rem; }
+.auth-form .field small.muted { font-size: 0.78rem; line-height: 1.4; }
+.code-input { font-family: ui-monospace, Menlo, Consolas, monospace; letter-spacing: 0.06em; text-transform: uppercase; }
+.auth-foot { margin: 1.1rem 0 0; }
+.center { text-align: center; margin-top: 20vh; }
+.notice-info { background: var(--status-processing-bg); color: var(--status-processing-text); margin: 0 0 1rem; }
+.auth-card .notice { margin-top: 0; }
+
+/* ── Signed-in user chip ───────────────────────────────────────────────── */
+.user-chip {
+  display: inline-flex; align-items: center; gap: 0.4rem; font: inherit; font-size: 0.82rem; font-weight: 600;
+  padding: 0.3rem 0.65rem; border-radius: 99px; border: 1px solid var(--border-color);
+  background: transparent; color: var(--text-primary); cursor: pointer;
+}
+.user-chip:hover { background: var(--task-bg); }
+.user-chip svg { color: var(--text-secondary); }
+.user-chip .role { font-weight: 500; color: var(--text-secondary); }
+@media (max-width: 520px) { .user-chip .role, .conn { display: none; } }
+
+/* ── Settings ──────────────────────────────────────────────────────────── */
+.settings { display: flex; flex-direction: column; gap: 1rem; }
+.settings-section h2 { margin-bottom: 0.15rem; }
+.settings-section h3 { margin-top: 1.1rem; }
+.settings-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 1rem; margin-bottom: 0.75rem; }
+.settings-head p { margin: 0; }
+.grid-3 { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 0.75rem; }
+@media (max-width: 760px) { .grid-3 { grid-template-columns: 1fr; } }
+.inline-form { display: flex; flex-direction: column; gap: 0.6rem; }
+.inline-form h3 { margin: 0; }
+.inline-form p { margin: 0; }
+.inline-row { display: flex; flex-wrap: wrap; align-items: center; gap: 0.5rem; margin: 0.5rem 0 0.75rem; }
+.inline-row input { flex: 1 1 16rem; min-width: 0; }
+.token-reveal {
+  border: 1px solid var(--status-success-border); background: var(--status-success-bg);
+  border-radius: 10px; padding: 0.85rem 1rem; margin: 0.25rem 0 0.75rem;
+  display: flex; flex-direction: column; gap: 0.6rem;
+}
+.token-reveal p { margin: 0; font-size: 0.88rem; }
+.token-reveal .btn-ghost { align-self: flex-start; }
+.token-row { display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap; }
+.token-row code {
+  flex: 1 1 18rem; min-width: 0; overflow-wrap: anywhere; font-size: 0.8rem;
+  background: var(--surface-color); border: 1px solid var(--border-color); border-radius: 6px; padding: 0.45rem 0.6rem;
+}

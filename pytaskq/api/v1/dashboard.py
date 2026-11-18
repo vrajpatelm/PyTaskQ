@@ -1,19 +1,37 @@
 import asyncio
 import logging
-from fastapi import APIRouter, Request, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, Depends, HTTPException, Request, WebSocket, WebSocketDisconnect
 from pytaskq.core import redis_client
+from pytaskq.core.config import settings
+from pytaskq.core.dependencies import _same_origin, authenticate_request, require
 from pytaskq.services.dashboard_service import _get_dashboard_data
 
 router = APIRouter(tags=["dashboard"])
 logger = logging.getLogger("api")
 
-@router.get("/metrics")
+@router.get("/metrics", dependencies=[Depends(require("viewer"))])
 async def metrics(req: Request):
     data = await _get_dashboard_data("global")
     return data["metrics"]
 
 @router.websocket("/ws/dashboard")
 async def dashboard_websocket(websocket: WebSocket):
+    # Browsers send cookies with WebSocket handshakes from any site, so check
+    # the Origin as well as the session. Scripts can pass ?token=ptq_… instead.
+    if settings.auth_enabled:
+        headers = dict(websocket.headers)
+        token = websocket.query_params.get("token")
+        if token:
+            headers["authorization"] = f"Bearer {token}"
+        try:
+            if not _same_origin(headers.get("origin", ""), headers.get("host", "")):
+                raise HTTPException(status_code=403)
+            user = await authenticate_request(headers, websocket.cookies, "GET")
+            if not user.can("viewer"):
+                raise HTTPException(status_code=403)
+        except HTTPException:
+            await websocket.close(code=4401)
+            return
     await websocket.accept()
     logger.info("[WS] Dashboard connected")
 

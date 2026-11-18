@@ -5,14 +5,21 @@ export const WS_URL = import.meta.env.DEV
   ? 'ws://localhost:8000/ws/dashboard'
   : `${window.location.protocol === 'https:' ? 'wss:' : 'ws:'}//${window.location.host}/ws/dashboard`;
 
+// Fired when the server says the session is gone, so the app can show sign-in.
+export const UNAUTHORIZED_EVENT = 'pytaskq:unauthorized';
+
 export async function api(path, options = {}) {
   const res = await fetch(`${API_URL}${path}`, {
     headers: options.body ? { 'Content-Type': 'application/json' } : undefined,
+    credentials: 'include',            // send the session cookie (also to the Vite dev server's API)
     ...options,
     body: options.body ? JSON.stringify(options.body) : undefined,
   });
   let data = null;
   try { data = await res.json(); } catch { /* empty body */ }
+  if (res.status === 401 && !path.startsWith('/auth/')) {
+    window.dispatchEvent(new Event(UNAUTHORIZED_EVENT));
+  }
   if (!res.ok) {
     const detail = data?.detail;
     const msg = Array.isArray(detail)
@@ -90,3 +97,15 @@ export const storage = {
     try { localStorage.setItem(key, value); } catch { /* private mode */ }
   },
 };
+
+// Roles, lowest to highest. `can(user, 'operator')` mirrors the server's check.
+export const ROLES = ['viewer', 'operator', 'admin'];
+export const ROLE_LABEL = { viewer: 'Viewer', operator: 'Operator', admin: 'Admin' };
+export const ROLE_HELP = {
+  viewer: 'Can see jobs, workers and dead letters',
+  operator: 'Can see everything and run, cancel, replay or delete jobs',
+  admin: 'Can do everything, including managing people and invites',
+};
+export function can(user, role) {
+  return !!user && !user.disabled && ROLES.indexOf(user.role) >= ROLES.indexOf(role);
+}

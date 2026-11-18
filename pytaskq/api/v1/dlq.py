@@ -1,12 +1,14 @@
 import json
 import time
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 
 from pytaskq.core import queueing, redis_client
+from pytaskq.core.dependencies import require
 from pytaskq.services.dashboard_service import _notify_tenant
 
-router = APIRouter(prefix="/dlq", tags=["dlq"])
+router = APIRouter(prefix="/dlq", tags=["dlq"], dependencies=[Depends(require("viewer"))])
+_operator = [Depends(require("operator"))]
 
 DLQ_KEY = "dlq"
 _DLQ_ONLY_FIELDS = ("error", "failed_at")
@@ -58,7 +60,7 @@ def _queue_ops(pipe, raw: str, task: dict):
         })
 
 
-@router.post("/replay/{task_id}")
+@router.post("/replay/{task_id}", dependencies=_operator)
 async def replay_task(task_id: str):
     raw, item = await _find(task_id)
     task = await _fresh_payload(item)
@@ -69,7 +71,7 @@ async def replay_task(task_id: str):
     return {"message": "Task replayed successfully", "task": task}
 
 
-@router.post("/purge/{task_id}")
+@router.post("/purge/{task_id}", dependencies=_operator)
 async def purge_task(task_id: str):
     raw, item = await _find(task_id)
     async with redis_client.r.pipeline(transaction=True) as pipe:
@@ -80,7 +82,7 @@ async def purge_task(task_id: str):
     return {"message": "task is Deleted", "task": item}
 
 
-@router.post("/purge_all")
+@router.post("/purge_all", dependencies=_operator)
 async def purge_all():
     async with redis_client.r.pipeline(transaction=True) as pipe:
         pipe.delete(DLQ_KEY)
@@ -90,7 +92,7 @@ async def purge_all():
     return {"message": "Entire dlq is cleared"}
 
 
-@router.post("/retry_all")
+@router.post("/retry_all", dependencies=_operator)
 async def retry_all_dlq():
     """Move every dead-lettered task back onto its original priority queue."""
     raws = await redis_client.r.lrange(DLQ_KEY, 0, -1)

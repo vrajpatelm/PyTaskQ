@@ -24,9 +24,16 @@ class Settings(BaseSettings):
     RESULT_TTL: int = 86400            # how long task status/results are kept (seconds)
     HISTORY_LIMIT: int = 500           # how many recent tasks the dashboard can list
 
+    # ── Authentication (self-hosting) ────────────────────────────────────────
+    PYTASKQ_AUTH: str = "on"           # "off" disables login (local development only)
+    SESSION_TTL_DAYS: int = 30         # how long a dashboard sign-in lasts
+    COOKIE_SECURE: str = "auto"        # "auto" = Secure cookie when served over HTTPS
+    PYTASKQ_ADMIN_USER: str = ""       # optional: create the first admin on startup…
+    PYTASKQ_ADMIN_PASSWORD: str = ""   # …instead of using the setup code
+    MASTER_KEY: str = ""               # optional: Bearer key with admin rights (automation)
+
     # ── API ──────────────────────────────────────────────────────────────────
     ALLOWED_ORIGINS: str = "*"
-    MASTER_KEY: str = ""
     RATE_LIMIT_PER_MINUTE: int = 100
     IDEMPOTENCY_TTL: int = 86400
     IDEMPOTENCY_PENDING_TTL: int = 30
@@ -38,6 +45,10 @@ class Settings(BaseSettings):
     EMAIL_PASSWORD: str = ""
     LOADTEST_HOST: str = ""
     LOADTEST_API_KEY: str = ""
+
+    @property
+    def auth_enabled(self) -> bool:
+        return self.PYTASKQ_AUTH.strip().lower() not in ("off", "false", "0", "no", "disabled")
 
     @property
     def allowed_origins_list(self) -> list[str]:

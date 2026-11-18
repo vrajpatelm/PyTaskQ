@@ -38,9 +38,34 @@ async def _publish_app_registry():
         logger.warning(f"Could not publish task registry for {spec}: {e}")
 
 
+async def _prepare_auth():
+    """Create the first admin from env vars, or print the one-time setup code."""
+    from pytaskq.core import auth, redis_client
+    if not settings.auth_enabled:
+        logger.warning("Sign-in is DISABLED (PYTASKQ_AUTH=off). Anyone who can reach this server has full control.")
+        return
+    try:
+        r = redis_client.r
+        user = await auth.bootstrap_from_env(r)
+        if user:
+            logger.info(f"Created admin '{user.username}' from PYTASKQ_ADMIN_USER.")
+        code = await auth.ensure_setup_code(r)
+        if code:
+            bar = "=" * 64
+            logger.warning(
+                f"\n{bar}\n  PyTaskQ first-run setup\n\n"
+                f"  Open the dashboard and enter this setup code to create the admin:\n\n"
+                f"      {code}\n\n"
+                f"  (Lost it? Run: pytaskq users setup-code)\n{bar}"
+            )
+    except Exception as e:  # Redis down at startup must not crash the API
+        logger.warning(f"Could not prepare sign-in yet: {e}")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await _publish_app_registry()
+    await _prepare_auth()
     yield
     from pytaskq.core import redis_client
     await redis_client.r.aclose()
@@ -64,7 +89,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.allowed_origins_list,
     allow_credentials=True,
-    allow_methods=["GET", "POST", "DELETE"],
+    allow_methods=["GET", "POST", "PATCH", "DELETE"],
     allow_headers=["Authorization", "Content-Type"],
 )
 

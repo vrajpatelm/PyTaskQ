@@ -10,11 +10,11 @@ Decorate a function, call `.delay()`, and watch it run in a live dashboard.<br/>
 Built natively on asyncio, FastAPI and Redis.
 
 [![Python](https://img.shields.io/badge/python-3.10%2B-3776AB?logo=python&logoColor=white)](#quick-start)
-[![Tests](https://img.shields.io/badge/tests-120%20passing-10b981)](#development)
+[![CI](https://github.com/vrajpatelm/PyTaskQ/actions/workflows/ci.yml/badge.svg)](https://github.com/vrajpatelm/PyTaskQ/actions/workflows/ci.yml)
 [![Redis](https://img.shields.io/badge/backend-Redis-DC382D?logo=redis&logoColor=white)](#how-your-jobs-stay-safe)
 [![License](https://img.shields.io/badge/license-MIT-6366f1)](LICENSE)
 
-[Quick start](#quick-start) · [Dashboard](#the-dashboard) · [Customising](#customising-tasks) · [Reliability](#how-your-jobs-stay-safe) · [API](#rest-api) · [What's new](#whats-new-in-02) · [What's next](#whats-next)
+[Quick start](#quick-start) · [Dashboard](#the-dashboard) · [Accounts](#accounts-and-sign-in) · [Customising](#customising-tasks) · [Reliability](#how-your-jobs-stay-safe) · [API](#rest-api) · [What's new](#whats-new-in-02) · [What's next](#whats-next)
 
 <br/>
 
@@ -101,6 +101,8 @@ pytaskq worker    --app tasks:queue
 pytaskq dashboard --app tasks:queue            # → http://localhost:8000
 ```
 
+The first time the dashboard starts, it prints a **one-time setup code** in its log. Open the dashboard, enter the code and create your admin account. See [Accounts and sign-in](#accounts-and-sign-in).
+
 **3. Queue jobs from anywhere**
 
 ```python
@@ -169,6 +171,58 @@ When no worker is running, the dashboard tells you so, with the exact command to
 
 ---
 
+## Accounts and sign-in
+
+PyTaskQ is built to be self-hosted, so it ships with its own accounts. There's no external service to set up.
+
+<table>
+<tr>
+<td width="50%" valign="top">
+
+**First start.** The server log prints a one-time setup code. Only someone who can see the server's logs can create the first admin, so a stranger can't claim a freshly exposed server.
+
+<img src="docs/images/setup.png" alt="First-run setup screen asking for the setup code, a username and a password" />
+
+</td>
+<td width="50%" valign="top">
+
+**Your team.** Admins create single-use invite links (valid for 7 days). Teammates choose their own username and password. Roles can be changed and accounts disabled at any time.
+
+<img src="docs/images/team.png" alt="Team settings listing people, their roles and invite links" />
+
+</td>
+</tr>
+</table>
+
+| Role | Can |
+|---|---|
+| **Viewer** | See jobs, workers and dead letters |
+| **Operator** | Everything a viewer can, plus run, cancel, replay and delete jobs |
+| **Admin** | Everything, plus invite people, change roles and disable accounts |
+
+**Scripts and services** use a personal API token from *Settings → API tokens*. It acts as you, with your role:
+
+```bash
+curl -X POST https://pytaskq.example.com/task/enqueue \
+     -H "Authorization: Bearer ptq_…" -H "Content-Type: application/json" \
+     -d '{"task_name": "send_order_confirmation", "kwargs": {"order_id": 10481, "email": "ada@example.com"}}'
+```
+
+**Locked out?** Every account command works on the server, straight against Redis:
+
+```bash
+pytaskq users list
+pytaskq users reset-password vraj
+pytaskq users create ops --role admin
+pytaskq users setup-code              # if you missed it in the log
+```
+
+**How it's protected.** Passwords are hashed with scrypt. Sessions, invites and tokens are random 256-bit secrets, and Redis stores only their SHA-256. The session cookie is `HttpOnly` and `SameSite=Lax`, writes from other websites are rejected, and repeated failed sign-ins are throttled. Behind HTTPS, the cookie is automatically marked `Secure`.
+
+> For local development you can turn sign-in off with `PYTASKQ_AUTH=off`. Never do this on a server others can reach.
+
+---
+
 ## Customising tasks
 
 | Option | Default | What it does |
@@ -216,7 +270,7 @@ Bad options fail when your module is imported, not at 2 a.m. in production.
 
 ## REST API
 
-Interactive docs are served at `/docs`. Full examples are in [docs/API.md](docs/API.md).
+Interactive docs are served at `/docs`. Full examples are in [docs/API.md](docs/API.md). Every route except `/health` and the sign-in routes needs a session or an `Authorization: Bearer ptq_…` token. Reading needs *viewer*; changing jobs needs *operator*.
 
 | Method | Route | Description |
 |--------|-------|-------------|
@@ -231,10 +285,7 @@ Interactive docs are served at `/docs`. Full examples are in [docs/API.md](docs/
 | `POST` | `/dlq/replay/{id}`, `/dlq/retry_all` | Put dead letters back on their original queue |
 | `POST` | `/dlq/purge/{id}`, `/dlq/purge_all` | Delete dead letters |
 
-```bash
-curl -X POST localhost:8000/task/enqueue -H 'Content-Type: application/json' \
-     -d '{"task_name": "send_order_confirmation", "kwargs": {"order_id": 10481, "email": "ada@example.com"}}'
-```
+Account routes live under `/auth`: `status`, `setup`, `login`, `logout`, `me`, `me/password`, `me/tokens`, `users`, and `invites`.
 
 ---
 
@@ -246,11 +297,13 @@ docker compose up --build        # Redis + dashboard/API + worker + Jaeger
 
 The worker runs `example_app:queue`. Point `command:` and `PYTASKQ_APP` in `docker-compose.yml` at your own module.
 
+Get the first-run setup code with `docker compose logs web | grep -A4 "setup code"`, or `docker compose exec web pytaskq users setup-code`. Accounts live in Redis, so they survive rebuilds through the `redis-data` volume.
+
 ## Development
 
 ```bash
 pip install -r requirements.txt
-python -m pytest                 # 120 tests, in-memory via fakeredis — no Redis needed
+python -m pytest                 # 155 tests, in-memory via fakeredis — no Redis needed
 
 cd frontend && npm install
 npm run dev                      # dashboard with hot reload, talking to localhost:8000
@@ -258,6 +311,13 @@ npm run build                    # writes the bundle into pytaskq/static/
 ```
 
 ---
+
+## What's new in 0.3
+
+- **Accounts for self-hosting.** First-run setup with a one-time code, sign-in, Viewer / Operator / Admin roles, invite links, personal API tokens, and a Settings tab for your account and your team. `pytaskq users …` commands handle recovery.
+- **Continuous integration.** Every push runs the test suite on Python 3.10, 3.12 and 3.13, a bug-finding lint pass, and a dashboard build that checks the committed bundle is current.
+- **Ready for PyPI.** `pyproject.toml` packaging includes the dashboard, and tagging a release publishes it automatically.
+- **Fix:** the demo `resize_image` task had lost an import and failed on every call. The new lint step caught it.
 
 ## What's new in 0.2
 
@@ -316,9 +376,9 @@ This release focused on three things: making PyTaskQ easy to adopt, making the d
 
 These are suggested next steps, roughly in order of impact.
 
-1. **Protect the dashboard and API.** There is currently no authentication: anyone who can reach port 8000 can queue, cancel or delete jobs. Add an API key or basic-auth gate, wired to the existing `MASTER_KEY` setting, before exposing PyTaskQ beyond localhost.
-2. **Continuous integration.** Add a GitHub Actions workflow that runs `pytest`, `ruff` and `npm run build` on every push, so the 120 tests protect every change.
-3. **Publish to PyPI.** Move to `pyproject.toml`, ship the built dashboard in the wheel, and support `pip install pytaskq` (with `[tracing]` and `[demo]` extras).
+1. **Single sign-on.** Sign in with GitHub, Google or your company's OIDC provider, alongside local accounts.
+2. **Audit log.** A Settings page showing who queued, cancelled, replayed or deleted what, and when. Jobs already record `created_by` and `cancelled_by`.
+3. **One-command install.** A published Docker image (`ghcr.io/vrajpatelm/pytaskq`) and a `docker-compose.prod.yml` with HTTPS via Caddy.
 4. **Workflows.** Chains (`a.then(b)`), groups and callbacks, so a job's result can feed the next job without glue code.
 5. **Progress reporting.** Let a task report `progress(0.4, "rendering page 2")` and show it as a live bar in the job panel.
 6. **Queue controls.** Pause and resume a queue, per-task rate limits, and unique jobs that skip duplicates while one is pending.

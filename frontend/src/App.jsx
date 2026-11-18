@@ -1,18 +1,23 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
-  Moon, Sun, Play, ListChecks, Server, Skull, Search, X, Copy, Check,
+  Play, ListChecks, Server, Skull, Search, X,
   RotateCcw, Trash2, Ban, Clock, Cpu, Zap, Waves, Terminal, ChevronRight,
+  Settings as SettingsIcon, UserRound,
 } from 'lucide-react'
 import {
   api, WS_URL, STATUS, FINAL, CANCELLABLE, timeAgo, formatDuration, formatClock,
-  formatArgs, parseValue, prettyResult, storage,
+  formatArgs, parseValue, prettyResult, storage, can, ROLE_LABEL, UNAUTHORIZED_EVENT,
 } from './api'
+import { Brand, CopyButton, ThemeButton } from './ui'
+import SettingsView from './Settings'
+import { InviteScreen, LoginScreen, SetupScreen } from './AuthScreens'
 
 const TABS = [
   { id: 'jobs', label: 'Jobs', icon: ListChecks },
   { id: 'run', label: 'Run a task', icon: Play },
   { id: 'workers', label: 'Workers', icon: Server },
   { id: 'dead', label: 'Dead letters', icon: Skull },
+  { id: 'settings', label: 'Settings', icon: SettingsIcon },
 ];
 
 const EMPTY_METRICS = {
@@ -25,18 +30,6 @@ const EMPTY_METRICS = {
 function StatusBadge({ status }) {
   const s = STATUS[status] || { label: status || 'Unknown', tone: 'muted' };
   return <span className={`badge tone-${s.tone}`}>{s.label}</span>;
-}
-
-function CopyButton({ text, label = 'Copy ID' }) {
-  const [done, setDone] = useState(false);
-  const copy = () => {
-    navigator.clipboard?.writeText(text).then(() => { setDone(true); setTimeout(() => setDone(false), 1500); }).catch(() => {});
-  };
-  return (
-    <button type="button" className="btn btn-ghost btn-sm" onClick={copy} aria-label={label}>
-      {done ? <Check size={14} /> : <Copy size={14} />} {done ? 'Copied' : label}
-    </button>
-  );
 }
 
 function TypeIcon({ type }) {
@@ -193,7 +186,7 @@ function Field({ label, children }) {
   return (<><dt>{label}</dt><dd>{children}</dd></>);
 }
 
-function TaskDrawer({ taskId, onClose, notify, refreshKey }) {
+function TaskDrawer({ taskId, onClose, notify, refreshKey, canOperate }) {
   const [task, setTask] = useState(null);
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
@@ -248,6 +241,8 @@ function TaskDrawer({ taskId, onClose, notify, refreshKey }) {
               {task.duration_ms !== undefined && <Field label="Duration">{formatDuration(task.duration_ms)}</Field>}
               <Field label="Attempts">{(task.retry_count || 0) + 1}</Field>
               {task.worker_id && <Field label="Worker"><code>{task.worker_id}</code></Field>}
+              {task.created_by && <Field label="Queued by">{task.created_by}</Field>}
+              {task.cancelled_by && <Field label="Cancelled by">{task.cancelled_by}</Field>}
               {task.note && <Field label="Note">{task.note}</Field>}
             </dl>
 
@@ -259,7 +254,7 @@ function TaskDrawer({ taskId, onClose, notify, refreshKey }) {
 
             <div className="drawer-actions">
               <CopyButton text={taskId} />
-              {CANCELLABLE.has(task.status) && (
+              {canOperate && CANCELLABLE.has(task.status) && (
                 <button className="btn btn-danger btn-sm" onClick={cancel} disabled={busy}>
                   <Ban size={14} /> Cancel job
                 </button>
@@ -453,7 +448,7 @@ function WorkersView({ workers }) {
 
 // ── Dead letters ─────────────────────────────────────────────────────────────
 
-function DeadLettersView({ items, notify, onOpen }) {
+function DeadLettersView({ items, notify, onOpen, canOperate }) {
   const [confirmPurge, setConfirmPurge] = useState(false);
   const act = async (path, okMsg) => {
     try { const r = await api(path, { method: 'POST' }); notify('success', okMsg(r)); }
@@ -467,7 +462,7 @@ function DeadLettersView({ items, notify, onOpen }) {
     <div className="panel">
       <div className="toolbar">
         <p className="muted small">These jobs failed every retry. Fix the cause, then replay them.</p>
-        <div className="toolbar-right">
+        {canOperate && <div className="toolbar-right">
           <button className="btn btn-secondary btn-sm" onClick={() => act('/dlq/retry_all', r => `Replaying ${r.retried} job${r.retried === 1 ? '' : 's'}.`)}>
             <RotateCcw size={14} /> Replay all
           </button>
@@ -481,7 +476,7 @@ function DeadLettersView({ items, notify, onOpen }) {
           ) : (
             <button className="btn btn-ghost btn-sm" onClick={() => setConfirmPurge(true)}><Trash2 size={14} /> Delete all</button>
           )}
-        </div>
+        </div>}
       </div>
       <div className="table-wrap">
         <table>
@@ -497,10 +492,10 @@ function DeadLettersView({ items, notify, onOpen }) {
                 <td>{timeAgo(t.failed_at)}</td>
                 <td className="num">{(t.retry_count || 0) + 1}</td>
                 <td>
-                  <div className="row-actions">
+                  {canOperate && <div className="row-actions">
                     <button className="btn btn-secondary btn-sm" onClick={() => act(`/dlq/replay/${t.task_id}`, () => `${t.task_name} replayed.`)}><RotateCcw size={14} /> Replay</button>
                     <button className="btn btn-ghost btn-sm" onClick={() => act(`/dlq/purge/${t.task_id}`, () => 'Dead letter deleted.')} aria-label={`Delete ${t.task_name}`}><Trash2 size={14} /></button>
-                  </div>
+                  </div>}
                 </td>
               </tr>
             ))}
@@ -513,29 +508,22 @@ function DeadLettersView({ items, notify, onOpen }) {
 
 // ── App shell ────────────────────────────────────────────────────────────────
 
-function useHashTab() {
-  const read = () => {
-    const h = window.location.hash.replace('#', '');
-    return TABS.some(t => t.id === h) ? h : 'jobs';
-  };
-  const [tab, setTab] = useState(read);
+function useHashTab(tabs) {
+  // Keep the raw hash; which tabs are allowed depends on the user's role.
+  const [hash, setHash] = useState(() => window.location.hash.replace('#', ''));
   useEffect(() => {
-    const on = () => setTab(read());
+    const on = () => setHash(window.location.hash.replace('#', ''));
     window.addEventListener('hashchange', on);
     return () => window.removeEventListener('hashchange', on);
   }, []);
-  const go = id => { window.location.hash = id; setTab(id); };
-  return [tab, go];
+  const go = id => { window.location.hash = id; setHash(id); };
+  return [tabs.some(t => t.id === hash) ? hash : 'jobs', go];
 }
 
-export default function App() {
-  const [theme, setTheme] = useState(() => storage.get('theme', 'dark'));
-  useEffect(() => {
-    document.documentElement.setAttribute('data-theme', theme);
-    storage.set('theme', theme);
-  }, [theme]);
-
-  const [tab, setTab] = useHashTab();
+function Dashboard({ me, authEnabled, onSignOut, theme, setTheme }) {
+  const canOperate = can(me, 'operator');
+  const tabs = useMemo(() => TABS.filter(t => t.id !== 'run' || canOperate), [canOperate]);
+  const [tab, setTab] = useHashTab(tabs);
   const [metrics, setMetrics] = useState(EMPTY_METRICS);
   const [dlq, setDlq] = useState([]);
   const [connected, setConnected] = useState(false);
@@ -567,7 +555,11 @@ export default function App() {
         if (data.dlq) setDlq(data.dlq);
         setTick(t => t + 1);
       };
-      ws.onclose = () => { setConnected(false); if (alive) retry = setTimeout(connect, 3000); };
+      ws.onclose = ev => {
+        setConnected(false);
+        if (ev.code === 4401) { window.dispatchEvent(new Event(UNAUTHORIZED_EVENT)); return; }
+        if (alive) retry = setTimeout(connect, 3000);
+      };
       ws.onerror = () => ws.close();
     };
     connect();
@@ -623,18 +615,17 @@ export default function App() {
   return (
     <div className="shell">
       <header className="topbar">
-        <div className="brand">
-          <img src="/static/favicon.svg" alt="" width="26" height="26" />
-          <span>PyTaskQ</span>
-        </div>
+        <Brand />
         <div className="topbar-right">
           <span className={`conn ${connected ? 'live' : ''}`}>
             <span className="dot" /> {connected ? 'Live' : 'Reconnecting…'}
           </span>
-          <button className="btn btn-ghost btn-sm" onClick={() => setTheme(t => (t === 'dark' ? 'light' : 'dark'))}
-            aria-label={theme === 'dark' ? 'Switch to light theme' : 'Switch to dark theme'}>
-            {theme === 'dark' ? <Sun size={15} /> : <Moon size={15} />}
+          <button className="user-chip" onClick={() => setTab('settings')} title="Account settings">
+            <UserRound size={14} />
+            <span>{authEnabled ? me.username : 'Sign-in off'}</span>
+            {authEnabled && <span className="role">{ROLE_LABEL[me.role]}</span>}
           </button>
+          <ThemeButton theme={theme} setTheme={setTheme} />
         </div>
       </header>
 
@@ -642,7 +633,7 @@ export default function App() {
       {workerCount === 0 && tab !== 'workers' && <GettingStarted />}
 
       <nav className="tabs" aria-label="Sections">
-        {TABS.map(t => {
+        {tabs.map(t => {
           const Icon = t.icon;
           const count = t.id === 'dead' ? dlq.length : t.id === 'workers' ? workerCount : null;
           return (
@@ -664,10 +655,11 @@ export default function App() {
           <RunView registered={registered} notify={notify} onQueued={() => {}} />
         )}
         {tab === 'workers' && <WorkersView workers={workers} />}
-        {tab === 'dead' && <DeadLettersView items={dlq} notify={notify} onOpen={setOpenId} />}
+        {tab === 'dead' && <DeadLettersView items={dlq} notify={notify} onOpen={setOpenId} canOperate={canOperate} />}
+        {tab === 'settings' && <SettingsView me={me} authEnabled={authEnabled} onSignOut={onSignOut} notify={notify} />}
       </main>
 
-      {openId && <TaskDrawer taskId={openId} onClose={() => setOpenId(null)} notify={notify} refreshKey={tick} />}
+      {openId && <TaskDrawer taskId={openId} onClose={() => setOpenId(null)} notify={notify} refreshKey={tick} canOperate={canOperate} />}
       <Toasts
         toasts={toasts.map(t => ({
           ...t,
@@ -679,4 +671,76 @@ export default function App() {
       />
     </div>
   );
+}
+
+// ── Root: decides between setup, sign-in, invite and the dashboard ────────────
+
+function readInviteToken() {
+  try { return new URLSearchParams(window.location.search).get('invite'); } catch { return null; }
+}
+
+function clearInviteFromUrl() {
+  const url = new URL(window.location.href);
+  url.searchParams.delete('invite');
+  window.history.replaceState(null, '', url.pathname + url.search + url.hash);
+}
+
+export default function App() {
+  const [theme, setTheme] = useState(() => storage.get('theme', 'dark'));
+  useEffect(() => {
+    document.documentElement.setAttribute('data-theme', theme);
+    storage.set('theme', theme);
+  }, [theme]);
+
+  // status: null while loading, then the /auth/status response
+  const [status, setStatus] = useState(null);
+  const [error, setError] = useState('');
+  const [invite, setInvite] = useState(readInviteToken);
+  const [notice, setNotice] = useState('');
+
+  const refresh = useCallback(() => {
+    api('/auth/status').then(s => { setStatus(s); setError(''); })
+      .catch(e => setError(`Can’t reach the PyTaskQ server: ${e.message}`));
+  }, []);
+  useEffect(() => { refresh(); }, [refresh]);
+
+  // Any 401 from the API (expired or revoked session) sends you back to sign-in
+  useEffect(() => {
+    const onUnauthorized = () => {
+      setNotice('Your session ended. Please sign in again.');
+      setStatus(s => (s && s.auth_enabled ? { ...s, user: null } : s));
+    };
+    window.addEventListener(UNAUTHORIZED_EVENT, onUnauthorized);
+    return () => window.removeEventListener(UNAUTHORIZED_EVENT, onUnauthorized);
+  }, []);
+
+  const signedIn = user => {
+    setNotice('');
+    if (invite) { clearInviteFromUrl(); setInvite(null); }
+    setStatus(s => ({ ...s, setup_required: false, user }));
+  };
+  const signOut = async () => {
+    try { await api('/auth/logout', { method: 'POST' }); } catch { /* already gone */ }
+    setNotice('');
+    setStatus(s => ({ ...s, user: null }));
+  };
+  const screen = { theme, setTheme };
+
+  if (error) {
+    return (
+      <div className="auth-page"><main className="auth-card">
+        <h1>PyTaskQ</h1>
+        <p className="notice notice-error">{error}</p>
+        <button className="btn btn-secondary" onClick={refresh}>Try again</button>
+      </main></div>
+    );
+  }
+  if (!status) return <div className="auth-page"><p className="muted center">Loading…</p></div>;
+  if (status.setup_required) return <SetupScreen onDone={signedIn} {...screen} />;
+  if (!status.user && invite) {
+    return <InviteScreen token={invite} onDone={signedIn} {...screen}
+      onCancel={() => { clearInviteFromUrl(); setInvite(null); }} />;
+  }
+  if (!status.user) return <LoginScreen onDone={signedIn} notice={notice} {...screen} />;
+  return <Dashboard me={status.user} authEnabled={status.auth_enabled} onSignOut={signOut} {...screen} />;
 }

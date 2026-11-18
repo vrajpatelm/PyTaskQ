@@ -18,8 +18,11 @@ from pytaskq.core import queueing
 
 @pytest.fixture
 async def client(r):
+    # These tests cover job behaviour, so sign-in is off here.
+    # Authentication and roles are covered in test_auth.py.
+    from pytaskq.core.config import settings
     from pytaskq.main import app
-    with patch("pytaskq.core.redis_client.r", r):
+    with patch("pytaskq.core.redis_client.r", r), patch.object(settings, "PYTASKQ_AUTH", "off"):
         transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
             yield c

@@ -5,10 +5,12 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from pytaskq.core import queueing, redis_client
-from pytaskq.core.dependencies import check_backpressure
+from pytaskq.core import auth
+from pytaskq.core.dependencies import check_backpressure, require
 
-router = APIRouter(prefix="/task", tags=["tasks"])
-list_router = APIRouter(prefix="/tasks", tags=["tasks"])
+# Reading needs "viewer"; anything that changes jobs needs "operator".
+router = APIRouter(prefix="/task", tags=["tasks"], dependencies=[Depends(require("viewer"))])
+list_router = APIRouter(prefix="/tasks", tags=["tasks"], dependencies=[Depends(require("viewer"))])
 logger = logging.getLogger("api")
 
 
@@ -39,19 +41,20 @@ async def _validated_payload(req: EnqueueRequest) -> dict:
 
 
 @router.post("/enqueue", dependencies=[Depends(check_backpressure)])
-async def enqueue_task(req: EnqueueRequest):
+async def enqueue_task(req: EnqueueRequest, user: auth.User = Depends(require("operator"))):
     """Enqueue a task (immediately, or after `delay_seconds`)."""
     payload = await _validated_payload(req)
-    result = await queueing.enqueue(redis_client.r, payload, delay_seconds=req.delay_seconds)
+    result = await queueing.enqueue(redis_client.r, payload, delay_seconds=req.delay_seconds, created_by=user.username)
     logger.info(f"Enqueued task {payload['task_id']} ({req.task_name}) priority={payload['priority']}")
     return result
 
 
 @router.post("/schedule", dependencies=[Depends(check_backpressure)])
-async def schedule_task(req: EnqueueRequest, delay_seconds: float = Query(60, ge=0)):
+async def schedule_task(req: EnqueueRequest, delay_seconds: float = Query(60, ge=0),
+                        user: auth.User = Depends(require("operator"))):
     """Schedule a task to run after `delay_seconds` (query parameter, default 60)."""
     payload = await _validated_payload(req)
-    result = await queueing.enqueue(redis_client.r, payload, delay_seconds=delay_seconds)
+    result = await queueing.enqueue(redis_client.r, payload, delay_seconds=delay_seconds, created_by=user.username)
     logger.info(f"Scheduled task {payload['task_id']} ({req.task_name}) in {delay_seconds}s")
     return result
 
@@ -66,9 +69,9 @@ async def task_result_display(task_id: str):
 
 
 @router.post("/{task_id}/cancel")
-async def cancel_task(task_id: str):
+async def cancel_task(task_id: str, user: auth.User = Depends(require("operator"))):
     """Cancel a task that is still waiting (queued, scheduled or awaiting retry)."""
-    ok, status = await queueing.cancel(redis_client.r, task_id)
+    ok, status = await queueing.cancel(redis_client.r, task_id, by=user.username)
     if ok:
         return {"task_id": task_id, "status": status, "cancelled": True}
     if status == "NotFound":

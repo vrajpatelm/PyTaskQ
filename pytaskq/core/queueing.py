@@ -127,7 +127,7 @@ async def record(r, payload: dict, status: str = QUEUED) -> None:
         await pipe.execute()
 
 
-async def enqueue(r, payload: dict, delay_seconds: float = 0) -> dict:
+async def enqueue(r, payload: dict, delay_seconds: float = 0, created_by: Optional[str] = None) -> dict:
     """Push a task payload onto its priority queue (or the delayed set)."""
     task_id = payload["task_id"]
     priority = payload.get("priority", "default")
@@ -136,6 +136,8 @@ async def enqueue(r, payload: dict, delay_seconds: float = 0) -> dict:
     delay_seconds = max(0.0, float(delay_seconds or 0))
     status = SCHEDULED if delay_seconds > 0 else QUEUED
     meta = _meta(payload, raw, status, now, delay_seconds)
+    if created_by:
+        meta["created_by"] = created_by
 
 
     async with r.pipeline(transaction=True) as pipe:
@@ -179,7 +181,7 @@ return 0
 """
 
 
-async def cancel(r, task_id: str) -> tuple[bool, str]:
+async def cancel(r, task_id: str, by: Optional[str] = None) -> tuple[bool, str]:
     """
     Cancel a task that has not started yet. Returns (cancelled, status).
     Running or finished tasks cannot be cancelled.
@@ -198,6 +200,8 @@ async def cancel(r, task_id: str) -> tuple[bool, str]:
         payload, str(time.time()),
     )
     if ok:
+        if by:
+            await r.hset(task_key(task_id), "cancelled_by", by)
         await r.publish(EVENTS_CHANNEL, "update")
         return True, CANCELLED
     # Payload was picked up between the read and the script — report fresh state
