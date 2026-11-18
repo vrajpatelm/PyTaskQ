@@ -1,11 +1,13 @@
 # Runs on every push to main and on every pull request.
-# Four independent jobs, so one failure doesn't hide the others:
+# Independent jobs, so one failure doesn't hide the others:
 #   tests     – the pytest suite on the oldest and newest supported Pythons
 #   lint      – ruff, limited to rules that catch real bugs (not style)
 #   dashboard – lints and builds the React dashboard, and checks that the
 #               bundle committed in pytaskq/static matches the source
 #   package   – builds the wheel, installs it in a clean environment and
 #               checks the CLI and bundled dashboard work
+#   docker    – builds the Docker image and runs it end to end (Redis +
+#               dashboard + worker, sign in, queue a job)
 name: CI
 
 on:
@@ -111,3 +113,23 @@ jobs:
           cd /tmp
           /tmp/clean/bin/pytaskq --help
           /tmp/clean/bin/python -c "import pathlib, pytaskq; p = pathlib.Path(pytaskq.__file__).parent / 'static' / 'index.html'; assert p.is_file(), 'dashboard missing from wheel'; print('dashboard bundled, version', pytaskq.__version__)"
+
+  docker:
+    name: Docker image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: pytaskq:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Run it end to end
+        run: bash scripts/smoke-test-image.sh pytaskq:ci

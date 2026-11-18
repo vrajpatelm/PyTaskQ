@@ -1,7 +1,8 @@
 # Releasing PyTaskQ
 
-Releases are automatic: push a version tag and GitHub Actions tests, builds and
-publishes to PyPI, then creates a GitHub release with the files attached.
+Releases are automatic: push a version tag and GitHub Actions tests, builds,
+publishes to PyPI, pushes the Docker image to `ghcr.io/vrajpatelm/pytaskq`, then
+creates a GitHub release with the files attached.
 
 ## One-time setup (about 5 minutes)
 
@@ -22,6 +23,8 @@ PyTaskQ uses **PyPI Trusted Publishing**. PyPI trusts this repository's
    "Pending" means the project doesn't exist on PyPI yet. Your first release creates it and reserves the name.
 3. **Create the `pypi` environment on GitHub.** In the repo, go to Settings → Environments → New environment → `pypi`.
    Recommended: under *Deployment protection rules*, add yourself as a **required reviewer**. Every release then waits for you to click "Approve" before anything is uploaded.
+
+4. **After the first Docker release**, make the image public: on GitHub, go to your profile → **Packages** → `pytaskq` → **Package settings** → **Change visibility** → Public. GitHub creates new packages as private.
 
 ## Every release
 
@@ -45,7 +48,8 @@ Then watch the **Actions** tab. The `Release` workflow will:
 2. check the tag matches `__version__` (it stops if you forgot to bump),
 3. build the wheel and sdist and validate them with `twine check`,
 4. publish to PyPI (after your approval, if you set up a reviewer),
-5. create a GitHub release with auto-generated notes and the built files.
+5. build the Docker image for amd64 and arm64 and push it to GHCR as `X.Y.Z`, `X.Y` and `latest`,
+6. create a GitHub release with auto-generated notes and the built files.
 
 A minute later: `pip install --upgrade pytaskq`.
 

@@ -1,19 +1,35 @@
-FROM python:3.11-slim
+# PyTaskQ image — published as ghcr.io/vrajpatelm/pytaskq
+#
+#   Dashboard + API (default):   docker run -p 8000:8000 -e REDIS_HOST=… ghcr.io/vrajpatelm/pytaskq
+#   Worker for your own tasks:   FROM ghcr.io/vrajpatelm/pytaskq:0.3
+#                                COPY tasks.py .
+#                                CMD ["pytaskq", "worker", "--app", "tasks:queue"]
+FROM python:3.12-slim
 
-#make a app dir in conatiner
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+# 1. Install the package itself (runtime dependencies only, plus tracing export)
+WORKDIR /src
+COPY pyproject.toml README.md LICENSE ./
+COPY pytaskq ./pytaskq
+RUN pip install ".[tracing]" && rm -rf /src
+
+# 2. /app is where task code lives; the bundled example works out of the box:
+#    pytaskq worker --app example_app:queue
 WORKDIR /app
+COPY example_app.py ./
 
-# 1. Install dependencies first (for layer caching)
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# 3. Never run as root
+RUN useradd --create-home --uid 10001 pytaskq && chown -R pytaskq:pytaskq /app
+USER pytaskq
 
-# 2. Copy source code
-COPY . /app
-
-# 3. Create non-root user and assign ownership
-RUN useradd -m myuser && chown -R myuser:myuser /app
-USER myuser
-
-# 4. Expose port and start Uvicorn using src.main:app
 EXPOSE 8000
-CMD ["uvicorn", "pytaskq.main:app", "--host", "0.0.0.0", "--port", "8000"]
+
+# Healthy = the API answers and can reach Redis. Workers override this in compose.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
+  CMD ["python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=4)"]
+
+CMD ["pytaskq", "dashboard", "--host", "0.0.0.0", "--port", "8000"]
