@@ -41,3 +41,8 @@ result.json
 tests/load/reports/
 
 install.cmd
+
+# Python packaging output
+dist/
+build/
+*.egg-info/

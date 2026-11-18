@@ -1,9 +1,11 @@
 # Runs on every push to main and on every pull request.
-# Three independent jobs, so one failure doesn't hide the others:
+# Four independent jobs, so one failure doesn't hide the others:
 #   tests     – the pytest suite on the oldest and newest supported Pythons
 #   lint      – ruff, limited to rules that catch real bugs (not style)
 #   dashboard – lints and builds the React dashboard, and checks that the
 #               bundle committed in pytaskq/static matches the source
+#   package   – builds the wheel, installs it in a clean environment and
+#               checks the CLI and bundled dashboard work
 name: CI
 
 on:
@@ -87,3 +89,25 @@ jobs:
             git status --short pytaskq/static
             exit 1
           fi
+
+  package:
+    name: Package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install build twine
+      - run: python -m build
+      - run: twine check --strict dist/*
+
+      - name: Install the wheel in a clean environment
+        run: |
+          python -m venv /tmp/clean
+          /tmp/clean/bin/pip install dist/*.whl
+          cd /tmp
+          /tmp/clean/bin/pytaskq --help
+          /tmp/clean/bin/python -c "import pathlib, pytaskq; p = pathlib.Path(pytaskq.__file__).parent / 'static' / 'index.html'; assert p.is_file(), 'dashboard missing from wheel'; print('dashboard bundled, version', pytaskq.__version__)"

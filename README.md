@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="pytaskq/static/favicon.svg" width="72" alt="PyTaskQ logo" />
+<img src="https://raw.githubusercontent.com/vrajpatelm/PyTaskQ/main/pytaskq/static/favicon.svg" width="72" alt="PyTaskQ logo" />
 
 # PyTaskQ
 
@@ -12,13 +12,13 @@ Built natively on asyncio, FastAPI and Redis.
 [![Python](https://img.shields.io/badge/python-3.10%2B-3776AB?logo=python&logoColor=white)](#quick-start)
 [![CI](https://github.com/vrajpatelm/PyTaskQ/actions/workflows/ci.yml/badge.svg)](https://github.com/vrajpatelm/PyTaskQ/actions/workflows/ci.yml)
 [![Redis](https://img.shields.io/badge/backend-Redis-DC382D?logo=redis&logoColor=white)](#how-your-jobs-stay-safe)
-[![License](https://img.shields.io/badge/license-MIT-6366f1)](LICENSE)
+[![License](https://img.shields.io/badge/license-MIT-6366f1)](https://github.com/vrajpatelm/PyTaskQ/blob/main/LICENSE)
 
 [Quick start](#quick-start) · [Dashboard](#the-dashboard) · [Accounts](#accounts-and-sign-in) · [Customising](#customising-tasks) · [Reliability](#how-your-jobs-stay-safe) · [API](#rest-api) · [What's new](#whats-new-in-02) · [What's next](#whats-next)
 
 <br/>
 
-<img src="docs/images/hero.png" alt="The PyTaskQ dashboard in light and dark themes, showing the job lifecycle strip and a live job list" width="100%" />
+<img src="https://raw.githubusercontent.com/vrajpatelm/PyTaskQ/main/docs/images/hero.png" alt="The PyTaskQ dashboard in light and dark themes, showing the job lifecycle strip and a live job list" width="100%" />
 
 </div>
 
@@ -64,7 +64,8 @@ Fencing tokens, crash recovery, retries with jitter, a dead-letter queue and gra
 **You need** Python 3.10+ and Redis (`docker run -p 6379:6379 redis:7` is enough).
 
 ```bash
-pip install -e .            # or: pip install -r requirements.txt
+pip install pytaskq          # from PyPI
+# or, from a clone:  pip install -e ".[dev]"
 ```
 
 **1. Write tasks**
@@ -126,31 +127,31 @@ Every view updates live over a WebSocket. Light and dark themes are both built i
 
 The **lifecycle strip** follows a job from *Scheduled* through *Queued* and *Running* to *Succeeded* or *Dead letters*. It also shows how full your queue is and how jobs split across priorities. Below it, **Jobs** lists recent work with filters for status and task, plus search by ID.
 
-<img src="docs/images/dashboard-dark.png" alt="Jobs view with status filters and a live job list" width="100%" />
+<img src="https://raw.githubusercontent.com/vrajpatelm/PyTaskQ/main/docs/images/dashboard-dark.png" alt="Jobs view with status filters and a live job list" width="100%" />
 
 ### Inspect any job
 
 Click a row to open its full record: when it was queued, started and finished, how long it took, which worker ran it, how many attempts it needed, its arguments, and its result or error. Waiting jobs show a **Cancel job** button.
 
-<img src="docs/images/job-details.png" alt="Job detail panel showing timings, arguments and the JSON result" width="100%" />
+<img src="https://raw.githubusercontent.com/vrajpatelm/PyTaskQ/main/docs/images/job-details.png" alt="Job detail panel showing timings, arguments and the JSON result" width="100%" />
 
 ### Run a task without writing code
 
 Workers announce their tasks, docstrings and parameters. **Run a task** turns each function signature into a form, showing which fields are required, their types and their defaults. Choose a priority, add a delay, or set a webhook, then queue the job.
 
-<img src="docs/images/run-task.png" alt="Run a task view with an auto-generated form for send_order_confirmation" width="100%" />
+<img src="https://raw.githubusercontent.com/vrajpatelm/PyTaskQ/main/docs/images/run-task.png" alt="Run a task view with an auto-generated form for send_order_confirmation" width="100%" />
 
 ### Fix failures, then replay
 
 **Dead letters** collects jobs that failed every retry, along with their last error. Replay one or all of them, and each goes back to its original priority queue.
 
-<img src="docs/images/dead-letters.png" alt="Dead letters view showing failed payment jobs with their errors" width="100%" />
+<img src="https://raw.githubusercontent.com/vrajpatelm/PyTaskQ/main/docs/images/dead-letters.png" alt="Dead letters view showing failed payment jobs with their errors" width="100%" />
 
 ### Watch your workers
 
 **Workers** shows the host, process, app, live load, completed and failed counts, pool sizes, uptime and heartbeat health for every worker.
 
-<img src="docs/images/workers.png" alt="Workers view listing two healthy workers" width="100%" />
+<img src="https://raw.githubusercontent.com/vrajpatelm/PyTaskQ/main/docs/images/workers.png" alt="Workers view listing two healthy workers" width="100%" />
 
 <table>
 <tr>
@@ -164,7 +165,7 @@ When no worker is running, the dashboard tells you so, with the exact command to
 
 </td>
 <td width="38%" align="center">
-<img src="docs/images/mobile.png" alt="PyTaskQ dashboard on a phone" width="260" />
+<img src="https://raw.githubusercontent.com/vrajpatelm/PyTaskQ/main/docs/images/mobile.png" alt="PyTaskQ dashboard on a phone" width="260" />
 </td>
 </tr>
 </table>
@@ -181,14 +182,14 @@ PyTaskQ is built to be self-hosted, so it ships with its own accounts. There's n
 
 **First start.** The server log prints a one-time setup code. Only someone who can see the server's logs can create the first admin, so a stranger can't claim a freshly exposed server.
 
-<img src="docs/images/setup.png" alt="First-run setup screen asking for the setup code, a username and a password" />
+<img src="https://raw.githubusercontent.com/vrajpatelm/PyTaskQ/main/docs/images/setup.png" alt="First-run setup screen asking for the setup code, a username and a password" />
 
 </td>
 <td width="50%" valign="top">
 
 **Your team.** Admins create single-use invite links (valid for 7 days). Teammates choose their own username and password. Roles can be changed and accounts disabled at any time.
 
-<img src="docs/images/team.png" alt="Team settings listing people, their roles and invite links" />
+<img src="https://raw.githubusercontent.com/vrajpatelm/PyTaskQ/main/docs/images/team.png" alt="Team settings listing people, their roles and invite links" />
 
 </td>
 </tr>
@@ -240,7 +241,7 @@ Bad options fail when your module is imported, not at 2 a.m. in production.
 
 **Worker sizing:** `pytaskq worker --app tasks:queue --cpu-workers 4 --io-workers 32 --timeout 120`
 
-**Configuration:** every setting is an environment variable or a line in `.env`. See [`.env.example`](.env.example). Redis is set with `REDIS_URL`, or with `REDIS_HOST`, `REDIS_PORT`, `REDIS_DB` and `REDIS_PASSWORD`.
+**Configuration:** every setting is an environment variable or a line in `.env`. See [`.env.example`](https://github.com/vrajpatelm/PyTaskQ/blob/main/.env.example). Redis is set with `REDIS_URL`, or with `REDIS_HOST`, `REDIS_PORT`, `REDIS_DB` and `REDIS_PASSWORD`.
 
 | Command | Purpose |
 |---|---|
@@ -253,7 +254,7 @@ Bad options fail when your module is imported, not at 2 a.m. in production.
 
 ## How your jobs stay safe
 
-<img src="docs/images/architecture.svg" alt="PyTaskQ architecture" width="100%" />
+<img src="https://raw.githubusercontent.com/vrajpatelm/PyTaskQ/main/docs/images/architecture.svg" alt="PyTaskQ architecture" width="100%" />
 
 1. **Reliable pop.** A worker atomically moves a job from `queue:{priority}` into its own `processing_queue:{worker_id}`. If the machine dies, the job is still in Redis.
 2. **Zombie sweeper.** Workers heartbeat every 10 s. An elected leader re-queues work from any worker that has gone silent for 30 s.
@@ -270,7 +271,7 @@ Bad options fail when your module is imported, not at 2 a.m. in production.
 
 ## REST API
 
-Interactive docs are served at `/docs`. Full examples are in [docs/API.md](docs/API.md). Every route except `/health` and the sign-in routes needs a session or an `Authorization: Bearer ptq_…` token. Reading needs *viewer*; changing jobs needs *operator*.
+Interactive docs are served at `/docs`. Full examples are in [docs/API.md](https://github.com/vrajpatelm/PyTaskQ/blob/main/docs/API.md). Every route except `/health` and the sign-in routes needs a session or an `Authorization: Bearer ptq_…` token. Reading needs *viewer*; changing jobs needs *operator*.
 
 | Method | Route | Description |
 |--------|-------|-------------|
@@ -303,12 +304,14 @@ Get the first-run setup code with `docker compose logs web | grep -A4 "setup cod
 
 ```bash
 pip install -r requirements.txt
-python -m pytest                 # 155 tests, in-memory via fakeredis — no Redis needed
+python -m pytest                 # 154 tests, in-memory via fakeredis — no Redis needed
 
 cd frontend && npm install
 npm run dev                      # dashboard with hot reload, talking to localhost:8000
 npm run build                    # writes the bundle into pytaskq/static/
 ```
+
+Releases are published to PyPI automatically when you push a version tag. See [docs/RELEASING.md](https://github.com/vrajpatelm/PyTaskQ/blob/main/docs/RELEASING.md).
 
 ---
 
@@ -387,7 +390,7 @@ These are suggested next steps, roughly in order of impact.
 9. **Self-hosted font.** Bundle Inter with the dashboard so it looks the same on offline or locked-down networks.
 10. **Documentation site.** A short guide (MkDocs) with recipes for FastAPI, Django and Flask, deployment and scaling.
 
-See [docs/ROADMAP.md](docs/ROADMAP.md) for the full, living roadmap.
+See [docs/ROADMAP.md](https://github.com/vrajpatelm/PyTaskQ/blob/main/docs/ROADMAP.md) for the full, living roadmap.
 
 ---
 

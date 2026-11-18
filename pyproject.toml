@@ -1,0 +1,73 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pytaskq"
+dynamic = ["version"]
+description = "Background jobs for Python — simple to start, safe in production. Async-first task queue with a live dashboard, built on Redis."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.10"
+authors = [{ name = "Vraj Patel" }]
+keywords = ["task queue", "background jobs", "asyncio", "redis", "fastapi", "worker", "cron", "celery alternative"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Framework :: AsyncIO",
+    "Framework :: FastAPI",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: System :: Distributed Computing",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+
+# Everything needed to run workers, the API and the dashboard.
+dependencies = [
+    "fastapi>=0.100.0",
+    "uvicorn[standard]>=0.23.0",   # [standard] brings WebSocket support for the live dashboard
+    "redis>=5.0.0",
+    "pydantic>=2.0.0",
+    "pydantic-settings>=2.0.0",
+    "croniter>=2.0.0",
+    "python-dotenv>=1.0.0",
+    "opentelemetry-api>=1.20",
+]
+
+[project.optional-dependencies]
+tracing = ["opentelemetry-sdk>=1.20", "opentelemetry-exporter-otlp>=1.20"]
+demo = ["numpy>=1.26.0", "Pillow>=10.0.1"]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+    "fakeredis[lua]>=2.20.0",
+    "httpx>=0.26.0",
+    "ruff",
+    "build",
+    "twine",
+]
+
+[project.scripts]
+pytaskq = "pytaskq.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/vrajpatelm/PyTaskQ"
+Documentation = "https://github.com/vrajpatelm/PyTaskQ#readme"
+Issues = "https://github.com/vrajpatelm/PyTaskQ/issues"
+Changelog = "https://github.com/vrajpatelm/PyTaskQ#whats-new-in-03"
+
+[tool.setuptools.dynamic]
+version = { attr = "pytaskq.__version__" }
+
+[tool.setuptools.packages.find]
+include = ["pytaskq", "pytaskq.*"]
+
+[tool.setuptools.package-data]
+# The built dashboard ships inside the package so `pytaskq dashboard` works after pip install
+pytaskq = ["static/*", "static/assets/*"]
