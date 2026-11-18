@@ -40,15 +40,19 @@ def _num(value, cast=float, default=0):
         return default
 
 
-@router.get("/workers")
-async def get_active_workers():
+async def load_workers() -> list[dict]:
+    """Every live worker with its pool sizes and counters (two Redis round trips)."""
     workers_with_scores = await redis_client.r.zrange("active_workers", 0, -1, withscores=True)
+    async with redis_client.r.pipeline(transaction=False) as pipe:
+        for worker_id, _ in workers_with_scores:
+            pipe.hgetall(f"worker:{worker_id}")
+        infos = await pipe.execute() if workers_with_scores else []
     worker_list = []
     now = time.time()
-    for worker_id, expire_time in workers_with_scores:
+    for (worker_id, expire_time), info in zip(workers_with_scores, infos):
         last_hb = expire_time - 30
         seconds_ago = max(0, int(now - last_hb))
-        info = await redis_client.r.hgetall(f"worker:{worker_id}")
+        info = info or {}
         started_at = _num(info.get("started_at"), float, None)
         worker_list.append({
             "worker_id": worker_id,
@@ -64,5 +68,17 @@ async def get_active_workers():
             "last_heartbeat_seconds_ago": seconds_ago,
             "status": "healthy" if seconds_ago < 15 else ("degraded" if seconds_ago < 30 else "dead"),
         })
+    return worker_list
 
+
+@router.get("/workers")
+async def get_active_workers():
+    worker_list = await load_workers()
     return {"workers": worker_list, "count": len(worker_list)}
+
+
+@router.get("/performance")
+async def get_performance():
+    """Current tuning settings, recent refusals, and plain-language suggestions."""
+    from pytaskq.services.performance import build_report
+    return await build_report(await load_workers())

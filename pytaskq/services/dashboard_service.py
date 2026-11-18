@@ -6,26 +6,34 @@ from pytaskq.core.config import settings
 async def _notify_tenant(tenant_id: str, event_type: str) -> None:
     await redis_client.r.publish("events:global", event_type)
 
-async def _get_dashboard_data(tenant_id: str = "global") -> dict:
-    pending = max(0, int(await redis_client.r.get("stats:pending") or 0))
-    processing = max(0, int(await redis_client.r.get("stats:processing") or 0))
-    delayed = max(0, int(await redis_client.r.get("stats:delayed") or 0))
-    dlq_count = await redis_client.r.llen("dlq")
-    completed = int(await redis_client.r.get("stats:completed") or 0)
-    failed = int(await redis_client.r.get("stats:failed") or 0)
-    queue_high = await redis_client.r.llen("queue:high")
-    queue_default = await redis_client.r.llen("queue:default")
-    queue_low = await redis_client.r.llen("queue:low")
+async def _get_dashboard_data(tenant_id: str = "global", include_dlq: bool = True) -> dict:
+    """Every number the dashboard shows, fetched in a single Redis round trip."""
     current_minute = int(time.time() / 60)
-    rate_used = int(await redis_client.r.get(f"rate_limit:global:{current_minute}") or 0)
-    # Cap what we push to dashboards; the full list is at GET /dlq
-    dlq_tasks = [json.loads(t) for t in await redis_client.r.lrange("dlq", 0, 99)]
-    worker_count = await redis_client.r.zcount("active_workers", time.time(), "+inf")
+    async with redis_client.r.pipeline(transaction=False) as pipe:
+        pipe.mget("stats:pending", "stats:processing", "stats:delayed", "stats:completed", "stats:failed",
+                  f"rate_limit:global:{current_minute}")
+        pipe.llen("dlq")
+        pipe.llen("queue:high")
+        pipe.llen("queue:default")
+        pipe.llen("queue:low")
+        pipe.zcount("active_workers", time.time(), "+inf")
+        if include_dlq:   # capped; the full list is at GET /dlq
+            pipe.lrange("dlq", 0, 99)
+        counters, dlq_count, queue_high, queue_default, queue_low, worker_count, *rest = await pipe.execute()
+    dlq_raw = rest[0] if rest else []
+
+    pending, processing, delayed, completed, failed, rate_used = (int(v or 0) for v in counters)
+    dlq_tasks = []
+    for raw in dlq_raw:
+        try:
+            dlq_tasks.append(json.loads(raw))
+        except ValueError:
+            continue
     return {
         "metrics": {
-            "pending": pending,
-            "processing": processing,
-            "delayed": delayed,
+            "pending": max(0, pending),
+            "processing": max(0, processing),
+            "delayed": max(0, delayed),
             "dlq": dlq_count,
             "completed_total": completed,
             "failed_total": failed,

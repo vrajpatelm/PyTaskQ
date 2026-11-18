@@ -3,7 +3,7 @@ PyTaskQ command line
 ====================
 
     pytaskq worker    --app myapp.tasks:queue [--cpu-workers N] [--io-workers N] [--timeout S]
-    pytaskq dashboard [--app myapp.tasks:queue] [--host 127.0.0.1] [--port 8000]
+    pytaskq dashboard [--app myapp.tasks:queue] [--host 127.0.0.1] [--port 8000] [--workers N]
     pytaskq tasks     --app myapp.tasks:queue
     pytaskq ping
     pytaskq users list | create NAME | reset-password NAME | set-role NAME ROLE | delete NAME | setup-code
@@ -68,9 +68,19 @@ def cmd_dashboard(args):
     if args.app:
         os.environ["PYTASKQ_APP"] = args.app
         load_app(args.app)  # fail fast with a clear message
+    from pytaskq.core.config import settings
+    workers = args.workers if args.workers is not None else settings.WEB_WORKERS
+    if workers <= 0:
+        workers = os.cpu_count() or 1
+    if args.reload and workers > 1:
+        log.info("--reload runs a single process; ignoring --workers")
+        workers = 1
+    os.environ["PYTASKQ_WEB_PROCESSES"] = str(workers)   # shown in Settings → Performance
     url = f"http://{'localhost' if args.host in ('0.0.0.0', '127.0.0.1') else args.host}:{args.port}"
-    log.info(f"PyTaskQ dashboard → {url}   (API docs: {url}/docs)")
-    uvicorn.run("pytaskq.main:app", host=args.host, port=args.port, reload=args.reload, log_level="info")
+    log.info(f"PyTaskQ dashboard → {url}   (API docs: {url}/docs)"
+             + (f"   [{workers} API processes]" if workers > 1 else ""))
+    uvicorn.run("pytaskq.main:app", host=args.host, port=args.port, reload=args.reload,
+                workers=None if args.reload else workers, log_level="info")
 
 
 def cmd_tasks(args):
@@ -200,6 +210,8 @@ def build_parser() -> argparse.ArgumentParser:
     d.add_argument("--host", default="127.0.0.1")
     d.add_argument("--port", type=int, default=8000)
     d.add_argument("--reload", action="store_true", help="Auto-reload on code changes (development)")
+    d.add_argument("--workers", type=int, default=None,
+                   help="API processes to run (default: WEB_WORKERS setting, 1). 0 = one per CPU core")
     d.set_defaults(func=cmd_dashboard)
 
     t = sub.add_parser("tasks", help="List the tasks registered in an app")

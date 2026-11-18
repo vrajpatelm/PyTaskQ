@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   Play, ListChecks, Server, Skull, Search, X,
   RotateCcw, Trash2, Ban, Clock, Cpu, Zap, Waves, Terminal, ChevronRight,
-  Settings as SettingsIcon, UserRound,
+  Settings as SettingsIcon, UserRound, Pause, ArrowUp,
 } from 'lucide-react'
 import {
   api, WS_URL, STATUS, FINAL, CANCELLABLE, timeAgo, formatDuration, formatClock,
@@ -53,8 +53,10 @@ function Toasts({ toasts, dismiss }) {
 
 // ── lifecycle strip: where every job is right now ────────────────────────────
 
-function Lifecycle({ m }) {
+function Lifecycle({ m, onAdvice }) {
   const pct = Math.min(100, (m.queue_total / (m.queue_capacity || 1)) * 100);
+  const full = m.queue_capacity > 0 && m.queue_total >= m.queue_capacity;
+  const nearly = !full && pct >= 90;
   const capTone = pct >= 90 ? 'danger' : pct >= 70 ? 'warning' : 'ok';
   return (
     <section className="lifecycle" aria-label="Job lifecycle">
@@ -70,9 +72,15 @@ function Lifecycle({ m }) {
         <div className={`capacity cap-${capTone}`} title={`${m.queue_total} of ${m.queue_capacity} queue slots used`}>
           <div style={{ width: `${pct}%` }} />
         </div>
-        <div className="stage-note split">
-          <span>high {m.queue_high}</span><span>default {m.queue_default}</span><span>low {m.queue_low}</span>
-        </div>
+        {full || nearly ? (
+          <div className="stage-note queue-full" role="status">
+            {full ? 'Full: new jobs are refused.' : 'Nearly full.'} <button className="link" onClick={onAdvice}>What to change</button>
+          </div>
+        ) : (
+          <div className="stage-note split">
+            <span>high {m.queue_high}</span><span>default {m.queue_default}</span><span>low {m.queue_low}</span>
+          </div>
+        )}
       </div>
       <ChevronRight className="flow-arrow" aria-hidden="true" />
       <div className="stage stage-running">
@@ -122,21 +130,133 @@ const FILTERS = [
   { id: 'Cancelled', label: 'Cancelled' },
 ];
 
+// Consecutive jobs with the same task and status fold into one row, so a burst
+// of identical requests can't push everything else off the page.
+const GROUP_MIN = 3;
+
+function groupRuns(tasks) {
+  const out = [];
+  for (const t of tasks) {
+    const last = out[out.length - 1];
+    if (last && last.task_name === t.task_name && last.status === t.status) last.items.push(t);
+    else out.push({ task_name: t.task_name, status: t.status, items: [t] });
+  }
+  // Key by the oldest job: new arrivals join at the top without closing an open group
+  for (const g of out) g.key = g.items[g.items.length - 1].task_id;
+  return out;
+}
+
+function JobRow({ t, onOpen, nested }) {
+  return (
+    <tr className={nested ? 'nested' : undefined} onClick={() => onOpen(t.task_id)} tabIndex={0}
+      onKeyDown={e => { if (e.key === 'Enter') onOpen(t.task_id); }}>
+      <td><StatusBadge status={t.status} /></td>
+      <td>
+        <div className="task-name">{t.task_name}</div>
+        <div className="task-id">{t.task_id.slice(0, 8)}</div>
+      </td>
+      <td className="args">{formatArgs(t.args, t.kwargs) || <span className="muted">none</span>}</td>
+      <td title={formatClock(t.created_at)}>{timeAgo(t.created_at)}</td>
+      <td className="num">{formatDuration(t.duration_ms)}</td>
+      <td><span className={`prio prio-${t.priority}`}>{t.priority}</span></td>
+    </tr>
+  );
+}
+
+function GroupRow({ g, open, toggle }) {
+  const newest = g.items[0], oldest = g.items[g.items.length - 1];
+  const timed = g.items.filter(t => t.duration_ms !== undefined && t.duration_ms !== null && t.duration_ms !== '');
+  const avg = timed.length ? timed.reduce((a, t) => a + Number(t.duration_ms), 0) / timed.length : null;
+  return (
+    <tr className="group-row" onClick={toggle} tabIndex={0} aria-expanded={open}
+      onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggle(); } }}>
+      <td><StatusBadge status={g.status} /></td>
+      <td>
+        <div className="task-name group-name">
+          <ChevronRight size={14} className={`caret ${open ? 'open' : ''}`} aria-hidden="true" />
+          {g.task_name} <span className="times">×{g.items.length}</span>
+        </div>
+        <div className="task-id">{open ? 'hide these jobs' : 'show each job'}</div>
+      </td>
+      <td className="args">
+        {formatArgs(newest.args, newest.kwargs) || <span className="muted">none</span>}
+        <div className="task-id">and {g.items.length - 1} more like it</div>
+      </td>
+      <td title={`${formatClock(oldest.created_at)} – ${formatClock(newest.created_at)}`}>
+        {timeAgo(newest.created_at)}
+        <div className="task-id">oldest {timeAgo(oldest.created_at)}</div>
+      </td>
+      <td className="num">{avg === null ? '—' : <>{formatDuration(avg)}<div className="task-id">average</div></>}</td>
+      <td><span className={`prio prio-${newest.priority}`}>{newest.priority}</span></td>
+    </tr>
+  );
+}
+
 function JobsView({ tasks, filter, setFilter, nameFilter, setNameFilter, taskNames, onOpen, loading }) {
   const [lookup, setLookup] = useState('');
+  const [grouped, setGrouped] = useState(() => storage.get('groupRepeats', true));
+  const [paused, setPaused] = useState(false);
+  const [hovering, setHovering] = useState(false);
+  const [scrolled, setScrolled] = useState(false);
+  const [frozen, setFrozen] = useState(null);       // the rows on screen while the list is held
+  const [openGroups, setOpenGroups] = useState(() => new Set());
+  const tableRef = useRef(null);
+
+  useEffect(() => { storage.set('groupRepeats', grouped); }, [grouped]);
+
+  // Hold the list still while you're reading it: pointer over it, scrolled
+  // down into it, or paused. Held rows still update their status in place.
+  const hold = () => setFrozen(f => f ?? tasks);
+  const release = (still) => { if (!still) setFrozen(null); };
+  useEffect(() => {
+    const onScroll = () => {
+      const down = (tableRef.current?.getBoundingClientRect().top ?? 0) < 0;
+      setScrolled(down);
+      if (down) setFrozen(f => f ?? tasks);
+      else if (!paused && !hovering) setFrozen(null);
+    };
+    window.addEventListener('scroll', onScroll, { passive: true });
+    return () => window.removeEventListener('scroll', onScroll);
+  }, [tasks, paused, hovering]);
+  const held = frozen !== null;
+
+  const shown = useMemo(() => {
+    if (!frozen) return tasks;
+    const latest = new Map(tasks.map(t => [t.task_id, t]));
+    return frozen.map(t => latest.get(t.task_id) || t);
+  }, [frozen, tasks]);
+
+  // A new filter is a new list: show it right away.
+  const changeFilter = fn => v => { setFrozen(null); setPaused(false); setOpenGroups(new Set()); fn(v); };
+
+  const newest = shown[0]?.created_at ?? 0;
+  const shownIds = useMemo(() => new Set(shown.map(t => t.task_id)), [shown]);
+  const waiting = held ? tasks.filter(t => !shownIds.has(t.task_id) && t.created_at >= newest).length : 0;
+  const showNew = () => {
+    setPaused(false); setFrozen(null);
+    tableRef.current?.scrollIntoView({ block: 'start', behavior: 'smooth' });
+  };
+
+  const groups = useMemo(() => groupRuns(shown), [shown]);
+  const toggleGroup = key => setOpenGroups(s => {
+    const n = new Set(s);
+    if (n.has(key)) n.delete(key); else n.add(key);
+    return n;
+  });
+
   return (
     <div className="panel">
       <div className="toolbar">
         <div className="chips" role="tablist" aria-label="Filter by status">
           {FILTERS.map(f => (
             <button key={f.id || 'all'} role="tab" aria-selected={filter === f.id}
-              className={`chip ${filter === f.id ? 'active' : ''}`} onClick={() => setFilter(f.id)}>
+              className={`chip ${filter === f.id ? 'active' : ''}`} onClick={() => changeFilter(setFilter)(f.id)}>
               {f.label}
             </button>
           ))}
         </div>
         <div className="toolbar-right">
-          <select value={nameFilter} onChange={e => setNameFilter(e.target.value)} aria-label="Filter by task">
+          <select value={nameFilter} onChange={e => changeFilter(setNameFilter)(e.target.value)} aria-label="Filter by task">
             <option value="">All tasks</option>
             {taskNames.map(n => <option key={n} value={n}>{n}</option>)}
           </select>
@@ -147,33 +267,52 @@ function JobsView({ tasks, filter, setFilter, nameFilter, setNameFilter, taskNam
         </div>
       </div>
 
-      {tasks.length === 0 ? (
+      <div className="list-bar">
+        <label className="switch">
+          <input type="checkbox" checked={grouped} onChange={e => setGrouped(e.target.checked)} />
+          Group repeated jobs
+        </label>
+        <div className="list-bar-right">
+          {waiting > 0 && (
+            <button className="new-jobs" onClick={showNew}>
+              <ArrowUp size={14} /> {waiting}{waiting >= 100 ? '+' : ''} new job{waiting === 1 ? '' : 's'}
+            </button>
+          )}
+          <button className="btn btn-ghost btn-sm" onClick={() => (paused ? showNew() : (setPaused(true), hold()))}
+            aria-pressed={paused} title={paused ? 'Show new jobs as they arrive' : 'Keep this list still'}>
+            {paused ? <><Play size={13} /> Resume</> : <><Pause size={13} /> Pause</>}
+          </button>
+          <span className={`hold-state ${held ? 'held' : ''}`} aria-live="polite">
+            {held ? (paused ? 'Paused' : 'Held while you read') : 'Live'}
+          </span>
+        </div>
+      </div>
+
+      {shown.length === 0 ? (
         <div className="empty">
           {loading ? 'Loading jobs…' : filter || nameFilter
             ? 'No jobs match these filters.'
             : <>No jobs yet. Open <strong>Run a task</strong> to queue your first one.</>}
         </div>
       ) : (
-        <div className="table-wrap">
+        <div className="table-wrap" ref={tableRef}
+          onMouseEnter={() => { setHovering(true); hold(); }}
+          onMouseLeave={() => { setHovering(false); release(paused || scrolled); }}
+          onFocus={() => { setHovering(true); hold(); }}
+          onBlur={e => { if (!e.currentTarget.contains(e.relatedTarget)) { setHovering(false); release(paused || scrolled); } }}>
           <table className="jobs">
             <thead>
               <tr><th>Status</th><th>Task</th><th>Arguments</th><th>Queued</th><th className="num">Duration</th><th>Priority</th></tr>
             </thead>
             <tbody>
-              {tasks.map(t => (
-                <tr key={t.task_id} onClick={() => onOpen(t.task_id)} tabIndex={0}
-                  onKeyDown={e => { if (e.key === 'Enter') onOpen(t.task_id); }}>
-                  <td><StatusBadge status={t.status} /></td>
-                  <td>
-                    <div className="task-name">{t.task_name}</div>
-                    <div className="task-id">{t.task_id.slice(0, 8)}</div>
-                  </td>
-                  <td className="args">{formatArgs(t.args, t.kwargs) || <span className="muted">none</span>}</td>
-                  <td title={formatClock(t.created_at)}>{timeAgo(t.created_at)}</td>
-                  <td className="num">{formatDuration(t.duration_ms)}</td>
-                  <td><span className={`prio prio-${t.priority}`}>{t.priority}</span></td>
-                </tr>
-              ))}
+              {grouped
+                ? groups.map(g => (g.items.length < GROUP_MIN
+                  ? g.items.map(t => <JobRow key={t.task_id} t={t} onOpen={onOpen} />)
+                  : [
+                    <GroupRow key={`g-${g.key}`} g={g} open={openGroups.has(g.key)} toggle={() => toggleGroup(g.key)} />,
+                    ...(openGroups.has(g.key) ? g.items.map(t => <JobRow key={t.task_id} t={t} onOpen={onOpen} nested />) : []),
+                  ]))
+                : shown.map(t => <JobRow key={t.task_id} t={t} onOpen={onOpen} />)}
             </tbody>
           </table>
         </div>
@@ -629,8 +768,9 @@ function Dashboard({ me, authEnabled, onSignOut, theme, setTheme }) {
         </div>
       </header>
 
-      <Lifecycle m={{ ...metrics, worker_count: workerCount }} />
+      <Lifecycle m={{ ...metrics, worker_count: workerCount }} onAdvice={() => setTab('settings')} />
       {workerCount === 0 && tab !== 'workers' && <GettingStarted />}
+
 
       <nav className="tabs" aria-label="Sections">
         {tabs.map(t => {

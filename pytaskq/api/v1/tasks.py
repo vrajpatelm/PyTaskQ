@@ -1,3 +1,4 @@
+import json
 import logging
 from typing import Any, Dict, List, Literal, Optional
 
@@ -6,7 +7,8 @@ from pydantic import BaseModel, Field
 
 from pytaskq.core import queueing, redis_client
 from pytaskq.core import auth
-from pytaskq.core.dependencies import check_backpressure, require
+from pytaskq.core.config import settings
+from pytaskq.core.dependencies import QUEUE_KEYS, queue_full_error, require
 
 # Reading needs "viewer"; anything that changes jobs needs "operator".
 router = APIRouter(prefix="/task", tags=["tasks"], dependencies=[Depends(require("viewer"))])
@@ -24,10 +26,25 @@ class EnqueueRequest(BaseModel):
 
 
 async def _validated_payload(req: EnqueueRequest) -> dict:
-    registry = {t["name"]: t for t in await queueing.registered_tasks(redis_client.r)}
-    spec = registry.get(req.task_name)
-    if registry and spec is None:
-        available = sorted(n for n, t in registry.items() if not t.get("internal"))
+    """Check the queue has room and the task exists, in a single Redis round trip."""
+    async with redis_client.r.pipeline(transaction=False) as pipe:
+        for key in QUEUE_KEYS:
+            pipe.llen(key)
+        pipe.hget(queueing.REGISTRY_KEY, req.task_name)
+        pipe.hlen(queueing.REGISTRY_KEY)
+        *lengths, raw_spec, registry_size = await pipe.execute()
+    if sum(lengths) >= settings.QUEUE_CAPACITY:
+        raise queue_full_error()
+
+    spec = None
+    if raw_spec:
+        try:
+            spec = json.loads(raw_spec)
+        except ValueError:
+            spec = {}
+    elif registry_size:
+        registry = await queueing.registered_tasks(redis_client.r)
+        available = sorted(t["name"] for t in registry if not t.get("internal"))
         raise HTTPException(
             status_code=404,
             detail=f"Unknown task '{req.task_name}'. Available tasks: {', '.join(available) or 'none'}",
@@ -40,7 +57,7 @@ async def _validated_payload(req: EnqueueRequest) -> dict:
     )
 
 
-@router.post("/enqueue", dependencies=[Depends(check_backpressure)])
+@router.post("/enqueue")
 async def enqueue_task(req: EnqueueRequest, user: auth.User = Depends(require("operator"))):
     """Enqueue a task (immediately, or after `delay_seconds`)."""
     payload = await _validated_payload(req)
@@ -49,7 +66,7 @@ async def enqueue_task(req: EnqueueRequest, user: auth.User = Depends(require("o
     return result
 
 
-@router.post("/schedule", dependencies=[Depends(check_backpressure)])
+@router.post("/schedule")
 async def schedule_task(req: EnqueueRequest, delay_seconds: float = Query(60, ge=0),
                         user: auth.User = Depends(require("operator"))):
     """Schedule a task to run after `delay_seconds` (query parameter, default 60)."""

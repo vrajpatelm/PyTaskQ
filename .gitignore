@@ -51,3 +51,11 @@ build/
 # Production deployment: your settings and backups never go in git
 deploy/.env
 deploy/backups/
+
+# Load-test output (locust --html / --csv)
+report-*.html
+run-*.html
+*_stats.csv
+*_stats_history.csv
+*_failures.csv
+*_exceptions.csv

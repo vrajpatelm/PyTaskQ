@@ -2,6 +2,27 @@
 
 All notable changes to PyTaskQ. Versions follow [semantic versioning](https://semver.org/).
 
+## 0.3.2 — 2026-11-18
+
+Faster under load, with nothing cached that would weaken security. On a 2-core server with 500 simulated users, the "Redis unavailable" errors went from 14% of requests to none, and the typical response from 320 ms to 16 ms. Details in `docs/PERFORMANCE.md`.
+
+### Added
+- **Settings → Performance**: what the server turned away in the last 15 minutes, live load figures, and plain-language suggestions with the exact setting to copy into `.env`. Backed by `GET /system/performance`.
+- **Rename API tokens** from Settings (`PATCH /auth/me/tokens/{id}`). The secret doesn't change.
+- **Jobs list stays readable during bursts.** It holds still while your pointer is over it, you've scrolled down or you press Pause; new jobs wait behind a "new jobs" button, and statuses still update in place. Runs of the same task and status fold into one row you can expand ("Group repeated jobs").
+- The Queued box shows "Nearly full" / "Full: new jobs are refused" with a link to the advice, without moving the page.
+- `pytaskq dashboard --workers N` and the `WEB_WORKERS` setting to run several API processes.
+- New settings: `REDIS_MAX_CONNECTIONS` (200), `REDIS_POOL_TIMEOUT` (5 s), `WEB_WORKERS` (1), `LIVE_UPDATES_PER_SECOND` (2).
+- `docs/PERFORMANCE.md` and the load test in `loadtest/`.
+
+### Changed
+- Sign-in checks take one Redis call instead of three. Revoking a token, signing out, disabling a user or changing a role still applies on the next request. A token's "last used" time is now saved at most once a minute.
+- Queueing a job takes 3 Redis round trips instead of 8. `/metrics` takes 2 instead of 15. The job list reads only the rows it returns.
+- The Redis connection pool waits for a free connection (up to `REDIS_POOL_TIMEOUT`) instead of failing at once, and allows 200 connections per process instead of 100.
+- Live dashboards share one Redis subscription per API process and refresh at most twice a second, instead of re-reading everything on every job change.
+- 429 and 503 responses include `Retry-After`, and the log says why each was sent (at most once every 10 seconds per reason).
+- Both compose files raise the open-file limit for the web and worker containers.
+
 ## 0.3.1 — 2026-11-18
 
 ### Added

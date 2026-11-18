@@ -48,6 +48,9 @@ services:
           memory: 256M
 
   web:
+    # Each request and Redis connection uses a file handle; the usual default (1024) is too low under load
+    ulimits:
+      nofile: { soft: 65536, hard: 65536 }
     build:
       context: .
       dockerfile: Dockerfile
@@ -90,6 +93,9 @@ services:
         max-file: "3"
 
   worker:
+    # Each request and Redis connection uses a file handle; the usual default (1024) is too low under load
+    ulimits:
+      nofile: { soft: 65536, hard: 65536 }
     build:
       context: .
       dockerfile: Dockerfile

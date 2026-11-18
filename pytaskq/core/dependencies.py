@@ -10,17 +10,28 @@ def get_client_ip(req: Request) -> str:
         return forwarded.split(",")[0].strip()
     return req.client.host
 
-async def check_backpressure():
-    queue_len = (
-        await redis_client.r.llen("queue:high")
-        + await redis_client.r.llen("queue:default")
-        + await redis_client.r.llen("queue:low")
+QUEUE_KEYS = ("queue:high", "queue:default", "queue:low")
+RETRY_AFTER_SECONDS = 2
+
+
+def queue_full_error() -> HTTPException:
+    from pytaskq.core import pressure
+    pressure.record("queue_full")
+    return HTTPException(
+        status_code=429,
+        detail="Server is busy. Please retry after a few seconds.",
+        headers={"Retry-After": str(RETRY_AFTER_SECONDS)},
     )
+
+
+async def check_backpressure():
+    """Refuse new jobs (429) once the queues hold QUEUE_CAPACITY jobs. One Redis round trip."""
+    async with redis_client.r.pipeline(transaction=False) as pipe:
+        for key in QUEUE_KEYS:
+            pipe.llen(key)
+        queue_len = sum(await pipe.execute())
     if queue_len >= settings.QUEUE_CAPACITY:
-        raise HTTPException(
-            status_code=429,
-            detail="Server is busy. Please retry after a few seconds.",
-        )
+        raise queue_full_error()
 
 async def rate_limiter():
     """

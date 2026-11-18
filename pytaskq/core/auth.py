@@ -320,13 +320,7 @@ async def create_session(r, username: str) -> str:
 async def user_for_session(r, token: str) -> Optional[User]:
     if not token:
         return None
-    username = await r.get(f"auth:session:{_sha(token)}")
-    if not username:
-        return None
-    user = await get_user(r, username)
-    if not user or user.disabled:
-        return None
-    return user
+    return await _lookup(r, "session", f"auth:session:{_sha(token)}")
 
 
 async def end_session(r, token: str) -> None:
@@ -392,19 +386,73 @@ async def revoke_api_token(r, username: str, token_id: str) -> bool:
     return False
 
 
+async def rename_api_token(r, username: str, token_id: str, name: str) -> Optional[dict]:
+    """Change a token's label. The secret itself never changes."""
+    name = (name or "").strip()[:60]
+    if not name:
+        raise AuthError("Give the token a name.")
+    if len(token_id) < 8:
+        return None
+    for sha in await r.smembers(f"auth:user_tokens:{username}"):
+        if sha.startswith(token_id):
+            key = f"auth:token:{sha}"
+            if not await r.exists(key):
+                return None
+            await r.hset(key, "name", name)
+            return _token_view(await r.hgetall(key))
+    return None
+
+
 async def user_for_api_token(r, token: str) -> Optional[User]:
     if not token or not token.startswith(TOKEN_PREFIX):
         return None
-    sha = _sha(token)
-    h = await r.hgetall(f"auth:token:{sha}")
-    if not h:
-        return None
-    user = await get_user(r, h["username"])
-    if not user or user.disabled:
-        return None
-    await r.hset(f"auth:token:{sha}", "last_used_at", time.time())
-    user.via = "token"
+    user = await _lookup(r, "token", f"auth:token:{_sha(token)}")
+    if user:
+        user.via = "token"
     return user
+
+
+# Resolve a session or API token to its user in ONE Redis round trip.
+# Every authenticated request runs this, so it used to cost three sequential
+# calls (credential → user → "last used" write). Nothing is cached: revoking a
+# token, ending a session or disabling a user takes effect on the next request.
+# "last used" is written at most once per TOKEN_TOUCH_SECONDS, not on every call.
+# KEYS[1] credential key   ARGV: kind ("session"|"token"), now, touch interval
+LOOKUP_SCRIPT = """
+local username
+if ARGV[1] == 'token' then
+    local t = redis.call('HMGET', KEYS[1], 'username', 'last_used_at')
+    username = t[1]
+    if username and (tonumber(ARGV[2]) - (tonumber(t[2]) or 0)) >= tonumber(ARGV[3]) then
+        redis.call('HSET', KEYS[1], 'last_used_at', ARGV[2])
+    end
+else
+    username = redis.call('GET', KEYS[1])
+end
+if not username then
+    return false
+end
+return redis.call('HGETALL', 'auth:user:' .. username)
+"""
+TOKEN_TOUCH_SECONDS = 60
+_lookup_script = None
+
+
+async def _lookup(r, kind: str, key: str) -> Optional[User]:
+    global _lookup_script
+    if _lookup_script is None:
+        _lookup_script = r.register_script(LOOKUP_SCRIPT)
+    flat = await _lookup_script(keys=[key], args=[kind, time.time(), TOKEN_TOUCH_SECONDS], client=r)
+    if not flat:
+        return None
+    if isinstance(flat, dict):
+        h = flat
+    else:
+        h = dict(zip(flat[0::2], flat[1::2]))
+    if not h.get("username"):
+        return None
+    user = _user_from_hash(h)
+    return None if user.disabled else user
 
 
 # ── invites ──────────────────────────────────────────────────────────────────

@@ -4,7 +4,7 @@
 Public:   GET /auth/status, POST /auth/setup, POST /auth/login,
           GET /auth/invites/{token}, POST /auth/invites/{token}/accept
 Signed in: GET /auth/me, POST /auth/logout, POST /auth/me/password,
-          GET|POST /auth/me/tokens, DELETE /auth/me/tokens/{id}
+          GET|POST /auth/me/tokens, PATCH|DELETE /auth/me/tokens/{id}
 Admin:    GET /auth/users, PATCH|DELETE /auth/users/{username},
           GET|POST /auth/invites, DELETE /auth/invites/{id}
 """
@@ -171,6 +171,18 @@ async def create_token(body: TokenRequest, user: auth.User = Depends(current_use
     token, info = await auth.create_api_token(redis_client.r, user.username, body.name)
     return {"token": token, "info": info,
             "message": "Copy this token now — it won't be shown again."}
+
+
+@router.patch("/me/tokens/{token_id}")
+async def rename_token(token_id: str, body: TokenRequest, user: auth.User = Depends(current_user)):
+    _real_user(user)
+    try:
+        info = await auth.rename_api_token(redis_client.r, user.username, token_id, body.name)
+    except auth.AuthError as e:
+        _fail(e)
+    if not info:
+        raise HTTPException(status_code=404, detail="Token not found.")
+    return {"info": info}
 
 
 @router.delete("/me/tokens/{token_id}")

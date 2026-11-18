@@ -64,10 +64,17 @@ async def _prepare_auth():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    import asyncio
+    from pytaskq.core import pressure, redis_client
+    from pytaskq.services.live import broadcaster
+
     await _publish_app_registry()
     await _prepare_auth()
+    flusher = asyncio.create_task(pressure.flush_forever(redis_client.r), name="pytaskq-pressure")
     yield
-    from pytaskq.core import redis_client
+    flusher.cancel()
+    await pressure.flush(redis_client.r)
+    await broadcaster.stop()
     await redis_client.r.aclose()
 
     from opentelemetry import trace

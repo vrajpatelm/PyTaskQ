@@ -16,6 +16,8 @@ class Settings(BaseSettings):
     REDIS_PORT: int = 6379
     REDIS_DB: int = 0
     REDIS_PASSWORD: str = ""
+    REDIS_MAX_CONNECTIONS: int = 200   # per process; requests wait for a free one instead of failing
+    REDIS_POOL_TIMEOUT: float = 5      # seconds a request waits for a free connection before a 503
 
     # ── Queue behaviour ──────────────────────────────────────────────────────
     QUEUE_CAPACITY: int = 500
@@ -33,6 +35,8 @@ class Settings(BaseSettings):
     MASTER_KEY: str = ""               # optional: Bearer key with admin rights (automation)
 
     # ── API ──────────────────────────────────────────────────────────────────
+    WEB_WORKERS: int = 1               # API processes (`pytaskq dashboard --workers`); 0 = one per CPU core
+    LIVE_UPDATES_PER_SECOND: float = 2 # cap on dashboard refreshes pushed over the WebSocket
     ALLOWED_ORIGINS: str = "*"
     RATE_LIMIT_PER_MINUTE: int = 100
     IDEMPOTENCY_TTL: int = 86400

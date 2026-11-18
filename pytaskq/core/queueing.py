@@ -232,20 +232,30 @@ def public_view(meta: dict) -> dict:
 
 
 async def recent_tasks(r, limit: int = 50, status: Optional[str] = None, task_name: Optional[str] = None) -> list[dict]:
-    """Newest-first task history, optionally filtered by status / task name."""
+    """Newest-first task history, optionally filtered by status / task name.
+
+    Reads the history in small batches and stops as soon as `limit` rows are
+    found, so the common unfiltered case touches only the newest few jobs
+    (it used to read all HISTORY_LIMIT ids on every call).
+    """
     limit = max(1, min(limit, settings.HISTORY_LIMIT))
-    ids = await r.lrange(RECENT_KEY, 0, settings.HISTORY_LIMIT - 1)
+    history = max(1, settings.HISTORY_LIMIT)
     out: list[dict] = []
-    seen = set()
-    batch = 100
-    for start in range(0, len(ids), batch):
-        chunk = [i for i in ids[start:start + batch] if i not in seen]
+    seen: set = set()
+    batch = limit if not (status or task_name) else 100
+    start = 0
+    while start < history:
+        stop = min(start + batch, history) - 1
+        ids = await r.lrange(RECENT_KEY, start, stop)
+        if not ids:
+            break
+        chunk = [i for i in ids if i not in seen]
         seen.update(chunk)
         async with r.pipeline(transaction=False) as pipe:
             for tid in chunk:
                 pipe.hgetall(task_key(tid))
-            metas = await pipe.execute()
-        for meta in metas:
+            rows = await pipe.execute()
+        for meta in rows:
             if not meta:
                 continue  # expired
             if status and meta.get("status", "").lower() != status.lower():
@@ -255,6 +265,10 @@ async def recent_tasks(r, limit: int = 50, status: Optional[str] = None, task_na
             out.append(public_view(meta))
             if len(out) >= limit:
                 return out
+        if len(ids) < stop - start + 1:
+            break
+        start = stop + 1
+        batch = 100   # expired or filtered rows: keep reading in larger steps
     return out
 
 

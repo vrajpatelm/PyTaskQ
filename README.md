@@ -83,7 +83,7 @@ You can also queue jobs from the dashboard or over HTTP. Want to try it without 
 
 Live updates, light and dark themes, and a layout that works on phones.
 
-**Jobs.** The lifecycle strip shows where every job is: scheduled, queued, running, succeeded or dead. Below it, filter recent jobs by status or task, or search by ID.
+**Jobs.** The lifecycle strip shows where every job is: scheduled, queued, running, succeeded or dead. Below it, filter recent jobs by status or task, or search by ID. Runs of the same job fold into one row, and the list holds still while you read it, with new jobs waiting behind a button.
 
 <img src="https://raw.githubusercontent.com/vrajpatelm/PyTaskQ/main/docs/images/dashboard-dark.png" alt="Jobs view with the lifecycle strip and a live job list" width="100%" />
 
@@ -100,6 +100,8 @@ Live updates, light and dark themes, and a layout that works on phones.
 <img src="https://raw.githubusercontent.com/vrajpatelm/PyTaskQ/main/docs/images/dead-letters.png" alt="Dead letters with their errors and replay buttons" width="100%" />
 
 **Workers.** Host, load, jobs done and failed, pool sizes, uptime and heartbeat health.
+
+**Settings → Performance.** Whether the server is keeping up, what it turned away in the last 15 minutes, and which setting to change, ready to copy.
 
 <img src="https://raw.githubusercontent.com/vrajpatelm/PyTaskQ/main/docs/images/workers.png" alt="Worker fleet with health and throughput" width="100%" />
 
@@ -150,12 +152,12 @@ Lost it? Run `pytaskq users setup-code`. For automated installs, set `PYTASKQ_AD
 
 App-wide defaults: `PyTaskQ(default_priority="low", max_retries=5, timeout=60)`.
 
-Every server setting is an environment variable or a line in `.env`, and all of them are documented in [`.env.example`](https://github.com/vrajpatelm/PyTaskQ/blob/main/.env.example). The ones you'll most likely change are `REDIS_URL`, `MAX_RETRIES`, `TASK_TIMEOUT` and `QUEUE_CAPACITY`.
+Every server setting is an environment variable or a line in `.env`, and all of them are documented in [`.env.example`](https://github.com/vrajpatelm/PyTaskQ/blob/main/.env.example). The ones you'll most likely change are `REDIS_URL`, `MAX_RETRIES`, `TASK_TIMEOUT` and `QUEUE_CAPACITY`. For heavy traffic, [docs/PERFORMANCE.md](https://github.com/vrajpatelm/PyTaskQ/blob/main/docs/PERFORMANCE.md) explains which setting fixes what, with measurements from a 2-core server and a load test you can run on yours.
 
 | Command | Purpose |
 |---|---|
 | `pytaskq worker --app m:queue [--cpu-workers N --io-workers N]` | Run a worker |
-| `pytaskq dashboard [--app m:queue] [--port 8000]` | Dashboard and REST API |
+| `pytaskq dashboard [--app m:queue] [--port 8000] [--workers N]` | Dashboard and REST API |
 | `pytaskq tasks --app m:queue` | List tasks and their settings |
 | `pytaskq users …` | Manage accounts from the server |
 | `pytaskq ping` | Check Redis and count workers |

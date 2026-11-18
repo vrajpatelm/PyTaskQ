@@ -1,17 +1,20 @@
 import asyncio
 import logging
+import time
+
 from fastapi import APIRouter, Depends, HTTPException, Request, WebSocket, WebSocketDisconnect
 from pytaskq.core import redis_client
 from pytaskq.core.config import settings
 from pytaskq.core.dependencies import _same_origin, authenticate_request, require
 from pytaskq.services.dashboard_service import _get_dashboard_data
+from pytaskq.services.live import broadcaster, min_interval
 
 router = APIRouter(tags=["dashboard"])
 logger = logging.getLogger("api")
 
 @router.get("/metrics", dependencies=[Depends(require("viewer"))])
 async def metrics(req: Request):
-    data = await _get_dashboard_data("global")
+    data = await _get_dashboard_data("global", include_dlq=False)
     return data["metrics"]
 
 @router.websocket("/ws/dashboard")
@@ -35,21 +38,9 @@ async def dashboard_websocket(websocket: WebSocket):
     await websocket.accept()
     logger.info("[WS] Dashboard connected")
 
-    push_event = asyncio.Event()
+    changed = broadcaster.subscribe()
     stop_event = asyncio.Event()
     tracked_ids: list[str] = []
-
-    async def redis_listener():
-        pubsub = redis_client.r.pubsub()
-        await pubsub.subscribe("events:global")
-        try:
-            while not stop_event.is_set():
-                msg = await pubsub.get_message(ignore_subscribe_messages=True, timeout=1.0)
-                if msg:
-                    push_event.set()
-        finally:
-            await pubsub.unsubscribe("events:global")
-            await pubsub.aclose()
 
     async def client_listener():
         nonlocal tracked_ids
@@ -57,43 +48,46 @@ async def dashboard_websocket(websocket: WebSocket):
             while not stop_event.is_set():
                 msg = await websocket.receive_json()
                 if "track" in msg and isinstance(msg["track"], list):
-                    tracked_ids = msg["track"][:10]
-                    push_event.set()
+                    tracked_ids = [str(t) for t in msg["track"][:10]]
+                    changed.set()
         except (WebSocketDisconnect, Exception):
             stop_event.set()
+            changed.set()
 
     async def pusher():
-        push_event.set()
+        # At most LIVE_UPDATES_PER_SECOND pushes a second, however fast jobs change.
+        interval = min_interval()
+        last_push = 0.0
         while not stop_event.is_set():
             try:
-                await asyncio.wait_for(push_event.wait(), timeout=30)
+                await asyncio.wait_for(changed.wait(), timeout=30)
             except asyncio.TimeoutError:
                 pass
-            push_event.clear()
-
             if stop_event.is_set():
                 break
-
+            wait = interval - (time.monotonic() - last_push)
+            if wait > 0:
+                await asyncio.sleep(wait)
+            changed.clear()   # changes during the wait are covered by this push
             try:
-                data = await _get_dashboard_data("global")
-                task_statuses = {}
-                for tid in tracked_ids:
-                    res = await redis_client.r.hgetall(f"task:{tid}")
-                    if res:
-                        task_statuses[tid] = res.get("status", "Unknown")
-                data["task_statuses"] = task_statuses
+                data = await broadcaster.snapshot()
+                if tracked_ids:
+                    async with redis_client.r.pipeline(transaction=False) as pipe:
+                        for tid in tracked_ids:
+                            pipe.hget(f"task:{tid}", "status")
+                        statuses = await pipe.execute()
+                    data["task_statuses"] = {t: s for t, s in zip(tracked_ids, statuses) if s}
+                else:
+                    data["task_statuses"] = {}
                 await websocket.send_json(data)
+                last_push = time.monotonic()
             except Exception:
                 stop_event.set()
                 break
 
     try:
-        await asyncio.gather(
-            redis_listener(),
-            client_listener(),
-            pusher(),
-            return_exceptions=True,
-        )
+        await asyncio.gather(client_listener(), pusher(), return_exceptions=True)
     finally:
         stop_event.set()
+        broadcaster.unsubscribe(changed)
         logger.info("[WS] Dashboard disconnected")
