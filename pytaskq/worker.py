@@ -6,9 +6,11 @@ Start one (or many, on many machines) with:
 
     pytaskq worker --app myproject.tasks:queue
 
-Each worker pops tasks in strict priority order (high → default → low), runs
-them in a process pool (type="cpu"), a thread pool (type="io") or directly on
-the event loop (async def), and records status, timings and results in Redis.
+Each worker serves a set of named queues (by default, the queues its own tasks
+live on; or `--queues a,b`). It pops jobs in strict priority order (high →
+default → low), taking turns between its queues at the same priority, runs them
+in a process pool (type="cpu"), a thread pool (type="io") or directly on the
+event loop (async def), and records status, timings and results in Redis.
 Background loops (only on the elected leader) handle cron schedules, delayed
 retries and recovery of tasks from crashed workers.
 """
@@ -25,7 +27,7 @@ import socket
 import time
 import uuid
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
-from datetime import datetime
+from datetime import datetime, timezone
 
 import croniter
 from opentelemetry import trace
@@ -38,6 +40,9 @@ from pytaskq.tracing import extract_trace_context, init_tracer, inject_trace_con
 
 TASKS = {}
 APP_NAME = ""
+QUEUES: list[str] = []          # the queues this worker serves (set at startup)
+QUEUES_OVERRIDE = ""            # `pytaskq worker --queues a,b` (else WORKER_QUEUES, else its tasks' queues)
+HAND_BACK_FOR = 600             # seconds a job keeps being handed back for a worker that has its task
 
 
 def set_tasks(tasks_dict, app_name: str = ""):
@@ -79,6 +84,46 @@ class UnknownTaskError(Exception):
     """Raised when a payload names a task this worker does not know."""
 
 
+def resolve_queues(explicit: str = "") -> list[str]:
+    """
+    The queues this worker serves, in order.
+
+    `--queues` / WORKER_QUEUES when given; otherwise every queue one of this
+    worker's own tasks lives on (so it never takes jobs it can't run), or just
+    "default" for an app without tasks.
+    """
+    raw = explicit or settings.WORKER_QUEUES
+    if raw.strip():
+        names = [queueing.check_queue_name(n.strip()) for n in raw.split(",") if n.strip()]
+    else:
+        names = sorted({(entry.get("queue") or queueing.DEFAULT_QUEUE)
+                        for name, entry in TASKS.items() if not name.startswith("_")},
+                       key=lambda n: (n != queueing.DEFAULT_QUEUE, n)) or [queueing.DEFAULT_QUEUE]
+    return list(dict.fromkeys(names))
+
+
+def pop_keys(queues: list[str], turn: int = 0) -> list[str]:
+    """
+    The lists to pop from, in order: every queue's high list, then default, then low.
+
+    Within one priority the starting queue rotates with `turn`, so a busy queue
+    can't starve the others.
+    """
+    if not queues:
+        return []
+    start = turn % len(queues)
+    rotated = queues[start:] + queues[:start]
+    return [queueing.queue_key(p, q) for p in queueing.PRIORITIES for q in rotated]
+
+
+def cron_zone(name: str):
+    """A tzinfo for a cron time zone name ("UTC" works even without a time zone database)."""
+    if not name or name.strip().upper() == "UTC":
+        return timezone.utc
+    from zoneinfo import ZoneInfo
+    return ZoneInfo(name.strip())
+
+
 shutdown_event = asyncio.Event()
 active_tasks = set()
 tracer = init_tracer("pytaskq-worker")
@@ -107,22 +152,22 @@ end
 return -1
 """
 
+# Move one due job from the delayed set onto its queue list.  KEYS: delayed zset, list
 REQUEUE_SCRIPT = """
 local removed = redis.call('ZREM', KEYS[1], ARGV[1])
 if removed > 0 then
     redis.call('LPUSH', KEYS[2], ARGV[1])
-    redis.call('DECR', KEYS[3])
-    redis.call('INCR', KEYS[4])
     return 1
 end
 return 0
 """
 
+# Queue a cron job once per tick across the fleet.  KEYS: tick lock, list, queue-name set
 CRON_ENQUEUE_SCRIPT = """
 local acquired = redis.call('SET', KEYS[1], '1', 'NX', 'EX', 2592000)
 if acquired then
     redis.call('LPUSH', KEYS[2], ARGV[1])
-    redis.call('INCR', KEYS[3])
+    redis.call('SADD', KEYS[3], ARGV[2])
     return 1
 end
 return 0
@@ -163,33 +208,48 @@ async def cron_scheduler():
             await asyncio.sleep(10)
             continue
 
-        try:
-            now = datetime.now()
-            for task_name, task_info in list(TASKS.items()):
-                cron_expr = task_info.get("cron")
-                if not cron_expr:
-                    continue
-
-                itr = croniter.croniter(cron_expr, now)
-                prev_tick = itr.get_prev(datetime)
-                tick_ts = int(prev_tick.timestamp())
-
-                if (now.timestamp() - tick_ts) < 60:
-                    lock_key = f"cron_lock:{task_name}:{tick_ts}"
-                    payload = queueing.new_payload(task_name, priority=task_info.get("priority") or "default")
-                    enqueued = await redis_client.r.eval(
-                        CRON_ENQUEUE_SCRIPT, 3,
-                        lock_key, queueing.queue_key(payload["priority"]), "stats:pending",
-                        json.dumps(payload),
-                    )
-                    if enqueued:
-                        await queueing.record(redis_client.r, payload)
-                        logger.info(f"[Cron] Scheduled {task_name} for tick {tick_ts}")
-
-        except Exception as e:
-            logger.error(f"[Cron Scheduler] Error evaluating cron schedules: {e}")
+        await run_due_cron_jobs()
 
         await asyncio.sleep(10)
+
+
+async def run_due_cron_jobs(now: float = None) -> int:
+    """Queue every cron task whose latest tick was in the last minute (once per tick, fleet-wide).
+
+    Schedules are read in the task's `tz` (else CRON_TIMEZONE, UTC by default),
+    so "0 9 * * *" means 09:00 in that zone on every machine, whatever the
+    machine's own clock is set to, and every worker computes the same tick.
+    """
+    now = time.time() if now is None else now
+    queued = 0
+    for task_name, task_info in list(TASKS.items()):
+        cron_expr = task_info.get("cron")
+        if not cron_expr:
+            continue
+        try:
+            zone_name = task_info.get("tz") or settings.CRON_TIMEZONE
+            zone = cron_zone(zone_name)
+            local_now = datetime.fromtimestamp(now, zone)
+            prev_tick = croniter.croniter(cron_expr, local_now).get_prev(datetime)
+            if now - prev_tick.timestamp() >= 60:
+                continue
+            # One run per LOCAL clock time: when clocks go back, 01:30 happens twice,
+            # and the second one finds the first one's lock (standard cron runs once too).
+            lock = f"cron_lock:{task_name}:{zone_name}:{prev_tick.strftime('%Y-%m-%dT%H:%M')}"
+            queue = task_info.get("queue") or queueing.DEFAULT_QUEUE
+            payload = queueing.new_payload(task_name, priority=task_info.get("priority") or "default", queue=queue)
+            enqueued = await redis_client.r.eval(
+                CRON_ENQUEUE_SCRIPT, 3,
+                lock, queueing.queue_key(payload["priority"], queue), queueing.QUEUES_KEY,
+                queueing.dumps_payload(payload), queue,
+            )
+            if enqueued:
+                queued += 1
+                await queueing.record(redis_client.r, payload)
+                logger.info(f"[Cron] Queued {task_name} for {prev_tick.isoformat()}")
+        except Exception as e:
+            logger.error(f"[Cron] Could not schedule {task_name}: {e}")
+    return queued
 
 
 async def retry_scheduler():
@@ -216,9 +276,8 @@ async def _promote_due_tasks(now: float = None) -> int:
             task_data = json.loads(task_json)
             priority = task_data.get("priority", "default")
             requeued = await redis_client.r.eval(
-                REQUEUE_SCRIPT, 4,
-                "delayed_tasks", queueing.queue_key(priority),
-                "stats:delayed", "stats:pending",
+                REQUEUE_SCRIPT, 2,
+                "delayed_tasks", queueing.queue_key(priority, queueing.payload_queue(task_data)),
                 task_json,
             )
             if requeued:
@@ -246,6 +305,7 @@ def _worker_info() -> dict:
         "cpu_workers": CPU_WORKERS,
         "io_workers": IO_WORKERS,
         "tasks": len([t for t in TASKS if not t.startswith("_")]),
+        "queues": ",".join(QUEUES),
     }
 
 
@@ -262,12 +322,17 @@ async def heartbeat():
             now = time.time()
             async with redis_client.r.pipeline(transaction=True) as pipe:
                 pipe.zadd("active_workers", {WORKER_ID: now + HEARTBEAT_TTL})
-                pipe.hset(f"worker:{WORKER_ID}", mapping={"last_seen": now, "active": len(active_tasks)})
+                pipe.hset(f"worker:{WORKER_ID}", mapping={"last_seen": now, "active": len(active_tasks),
+                                                          "queues": ",".join(QUEUES)})
                 pipe.expire(f"worker:{WORKER_ID}", HEARTBEAT_TTL * 4)
+                if QUEUES:
+                    pipe.sadd(queueing.QUEUES_KEY, *QUEUES)
                 await pipe.execute()
             if now - last_registry > 60:
                 await _publish_registry()
                 last_registry = now
+            from pytaskq.core import pressure
+            await pressure.flush(redis_client.r)    # hand-backs counted here show in Settings → Performance
             await asyncio.sleep(10)
         except Exception as e:
             logger.warning(f"[Heartbeat] Redis unreachable: {e}. Retrying in 5s")
@@ -311,9 +376,7 @@ async def _sweep_dead_workers() -> int:
                 async with redis_client.r.pipeline(transaction=True) as pipe:
                     pipe.lrem(f"processing_queue:{worker_id}", count=1, value=task)
                     pipe.set(f"fence:{task_id}", task_data["fence_token"], ex=86400)
-                    pipe.lpush("queue:high", new_raw)
-                    pipe.incr("stats:pending")
-                    pipe.decr("stats:processing")
+                    pipe.lpush(queueing.queue_key("high", queueing.payload_queue(task_data)), new_raw)
                     if task_id and await redis_client.r.exists(queueing.task_key(task_id)):
                         pipe.hset(queueing.task_key(task_id), mapping={
                             "status": queueing.QUEUED, "priority": "high", "payload": new_raw,
@@ -373,7 +436,6 @@ async def _record_failure(r, tasks, task_json, task_id, error, max_retries) -> s
                 dlq_entry["error"] = error
                 dlq_entry["failed_at"] = finished_at
                 pipe.lpush("dlq", json.dumps(dlq_entry))
-                pipe.incr("stats:dlq")
                 pipe.hset(queueing.task_key(task_id), mapping={
                     "task_id": task_id,
                     "status": queueing.DEAD_LETTER,
@@ -388,7 +450,6 @@ async def _record_failure(r, tasks, task_json, task_id, error, max_retries) -> s
                 tasks.prev_delay = delay
                 retry_raw = json.dumps(tasks.model_dump())
                 pipe.zadd("delayed_tasks", {retry_raw: finished_at + delay})
-                pipe.incr("stats:delayed")
                 pipe.hset(queueing.task_key(task_id), mapping={
                     "task_id": task_id,
                     "status": queueing.RETRY_SCHEDULED,
@@ -409,13 +470,60 @@ async def _record_failure(r, tasks, task_json, task_id, error, max_retries) -> s
     return "RetryScheduled"
 
 
+def _storable_result(result) -> tuple[str, str]:
+    """(what to store as the result, why it was dropped or "").
+
+    Results over MAX_RESULT_BYTES aren't stored: a 50 MB return value would sit
+    in Redis for RESULT_TTL. The job still counts as a success (its work is done;
+    running it again would repeat that work), and the reason is recorded.
+    """
+    encoded = queueing.encode_result(result)
+    limit = settings.MAX_RESULT_BYTES
+    if limit and limit > 0:
+        size = len(encoded.encode("utf-8", "replace"))
+        if size > limit:
+            return "", (f"The result was {size:,} bytes, over MAX_RESULT_BYTES ({limit:,}), so it wasn't stored. "
+                        f"Save large output elsewhere (a file, S3) and return its location instead.")
+    return encoded, ""
+
+
+async def _hand_back(r, tasks, task_json, task_id) -> bool:
+    """
+    This worker doesn't have the job's task, but another live worker advertises it
+    (two apps sharing one queue). Put the job back on its queue for that worker,
+    without counting a retry. Whichever worker pops first gets the job, so it may
+    take several hand-backs; this keeps going for HAND_BACK_FOR seconds, then the
+    job fails normally (retries, then dead letters) so it can't loop forever.
+    Settings → Performance says to give each app its own queue.
+    """
+    now = time.time()
+    since = tasks.handed_back_since or now
+    if now - since > HAND_BACK_FOR:
+        return False
+    spec, _ = await queueing.registry_lookup(r, tasks.task_name)
+    if spec is None:
+        return False
+    payload = json.loads(task_json)
+    payload["bounces"] = tasks.bounces + 1
+    payload["handed_back_since"] = since
+    raw = json.dumps(payload)
+    due = now + random.uniform(0.5, 2.0)   # via the delayed set, so it doesn't bounce straight back here
+    async with r.pipeline(transaction=True) as pipe:
+        pipe.zadd("delayed_tasks", {raw: due})
+        pipe.hset(queueing.task_key(task_id), mapping={
+            "status": queueing.QUEUED, "payload": raw,
+            "note": f"Waiting for a worker that has task '{tasks.task_name}' (worker {WORKER_ID} doesn't). "
+                    f"Give each app its own queue to avoid this.",
+        })
+        await pipe.execute()
+    from pytaskq.core import pressure
+    pressure.record("handed_back", f"'{tasks.task_name}' on queue '{tasks.queue}' (worker {WORKER_ID} lacks it)")
+    return True
+
+
 async def handle_task(task_json, sem, loop, process_pool, thread_pool):
-    incr_done = False
     r = redis_client.r
     try:
-        # Immediately decrement pending since we pulled it from the queue
-        await r.decr("stats:pending")
-
         try:
             tasks = Taskloader.model_validate_json(task_json)
             task_id = tasks.task_id
@@ -457,6 +565,9 @@ async def handle_task(task_json, sem, loop, process_pool, thread_pool):
         ) as span:
             started_at = time.time()
             try:
+                if entry is None and await _hand_back(r, tasks, task_json, task_id):
+                    span.set_attribute("task.status", "HandedBack")
+                    return
                 if entry is None:
                     known = ", ".join(sorted(t for t in TASKS if not t.startswith("_"))) or "none"
                     raise UnknownTaskError(
@@ -468,7 +579,6 @@ async def handle_task(task_json, sem, loop, process_pool, thread_pool):
 
                 logger.info(f"Executing task {task_id} ({tasks.task_name})")
                 async with r.pipeline(transaction=True) as pipe:
-                    pipe.incr("stats:processing")
                     pipe.hset(queueing.task_key(task_id), mapping={
                         "task_id": task_id,
                         "task_name": tasks.task_name,
@@ -480,7 +590,6 @@ async def handle_task(task_json, sem, loop, process_pool, thread_pool):
                     pipe.expire(queueing.task_key(task_id), settings.RESULT_TTL)
                     pipe.publish(queueing.EVENTS_CHANNEL, "update")
                     await pipe.execute()
-                incr_done = True
 
                 args, kwargs = tasks.args, tasks.kwargs
                 if inspect.iscoroutinefunction(func):
@@ -506,10 +615,11 @@ async def handle_task(task_json, sem, loop, process_pool, thread_pool):
                 else:
                     result = await exec_future
 
+                encoded, dropped = _storable_result(result)
                 saved = await r.eval(
                     FENCE_SCRIPT, 2,
                     f"fence:{task_id}", queueing.task_key(task_id),
-                    str(my_token), task_id, queueing.SUCCESS, queueing.encode_result(result),
+                    str(my_token), task_id, queueing.SUCCESS, encoded,
                     int(settings.RESULT_TTL),
                 )
 
@@ -520,6 +630,7 @@ async def handle_task(task_json, sem, loop, process_pool, thread_pool):
                             "finished_at": finished_at,
                             "duration_ms": round((finished_at - started_at) * 1000, 1),
                             "error": "",
+                            **({"result_dropped": dropped} if dropped else {}),
                         })
                         pipe.expire(queueing.task_key(task_id), settings.RESULT_TTL)
                         pipe.incr("stats:completed")
@@ -530,10 +641,14 @@ async def handle_task(task_json, sem, loop, process_pool, thread_pool):
                     # ── Webhook delivery ──────────────────────────────────────
                     # Travels through the queue like any other task, so network
                     # blips are retried automatically.
+                    if dropped:
+                        logger.warning(f"Task {task_id} succeeded but its result wasn't stored: {dropped}")
                     if tasks.on_success_url:
                         webhook = queueing.new_payload(
                             "_deliver_webhook",
-                            [tasks.on_success_url, task_id, tasks.task_name, queueing.encode_result(result)],
+                            [tasks.on_success_url, task_id, tasks.task_name, encoded]
+                            + ([dropped] if dropped else []),
+                            queue=tasks.queue,   # a worker serving this queue certainly has the built-in task
                         )
                         await queueing.enqueue(r, webhook)
                         logger.info(f"Enqueued webhook delivery for task {task_id} → {tasks.on_success_url}")
@@ -555,8 +670,6 @@ async def handle_task(task_json, sem, loop, process_pool, thread_pool):
         try:
             async with r.pipeline(transaction=True) as pipe:
                 pipe.lrem(f"processing_queue:{WORKER_ID}", count=1, value=task_json)
-                if incr_done:
-                    pipe.decr("stats:processing")
                 pipe.publish(queueing.EVENTS_CHANNEL, "update")
                 await pipe.execute()
         except Exception as e:
@@ -566,24 +679,52 @@ async def handle_task(task_json, sem, loop, process_pool, thread_pool):
 
 
 async def _recover_own_tasks():
-    """On boot, put back anything this worker id left in its processing queue."""
+    """On boot, put back anything this worker id left in its processing queue (onto its own queue)."""
+    key = f"processing_queue:{WORKER_ID}"
     while True:
-        leftover = await redis_client.r.rpoplpush(f"processing_queue:{WORKER_ID}", "queue:high")
-        if not leftover:
+        leftovers = await redis_client.r.lrange(key, -1, -1)
+        if not leftovers:
             break
-        await redis_client.r.incr("stats:pending")
-        await redis_client.r.decr("stats:processing")
+        leftover = leftovers[0]
+        try:
+            target = queueing.queue_key("high", queueing.payload_queue(json.loads(leftover)))
+        except ValueError:
+            target = queueing.queue_key("high")
+        async with redis_client.r.pipeline(transaction=True) as pipe:
+            pipe.lrem(key, 1, leftover)
+            pipe.lpush(target, leftover)
+            await pipe.execute()
         logger.info(f"Recovered crashed task on startup: {leftover}")
 
 
+def check_cron_zones() -> None:
+    """Fail at startup (not silently every 10 s) when a cron time zone doesn't exist."""
+    names = {settings.CRON_TIMEZONE} | {e.get("tz") for e in TASKS.values() if e.get("cron") and e.get("tz")}
+    for name in names:
+        try:
+            cron_zone(name)
+        except Exception:
+            raise SystemExit(f"Unknown time zone {name!r} for cron schedules. Use a name like 'UTC', "
+                             f"'Europe/London' or 'Asia/Kolkata' (CRON_TIMEZONE or the task's tz=).") from None
+
+
 async def consumer_task():
+    global QUEUES
     concurrency = CPU_WORKERS + IO_WORKERS
+    QUEUES = resolve_queues(QUEUES_OVERRIDE)
+    check_cron_zones()
     logger.info(
         f"Worker {WORKER_ID}: {_TOTAL_CORES} CPU cores detected. "
         f"CPU processes={CPU_WORKERS}, IO threads={IO_WORKERS}, max concurrent tasks={concurrency}"
     )
     user_tasks = sorted(t for t in TASKS if not t.startswith("_"))
     logger.info(f"Registered tasks ({len(user_tasks)}): {', '.join(user_tasks) or 'none'}")
+    logger.info(f"Serving queues: {', '.join(QUEUES)}")
+    elsewhere = sorted({e.get("queue") or queueing.DEFAULT_QUEUE for n, e in TASKS.items()
+                        if not n.startswith("_")} - set(QUEUES))
+    if elsewhere:
+        logger.warning(f"This worker has tasks on queues it doesn't serve ({', '.join(elsewhere)}); "
+                       f"another worker must serve them, or their jobs will wait.")
 
     process_pool = ProcessPoolExecutor(max_workers=CPU_WORKERS)
     thread_pool = ThreadPoolExecutor(max_workers=IO_WORKERS)
@@ -605,6 +746,7 @@ async def consumer_task():
         try:
             await _recover_own_tasks()
             await redis_client.r.hset(f"worker:{WORKER_ID}", mapping={**_worker_info(), "started_at": time.time()})
+            await redis_client.r.sadd(queueing.QUEUES_KEY, *QUEUES)
             await _publish_registry()
             break
         except Exception as e:
@@ -622,6 +764,7 @@ async def consumer_task():
 
     idle_delay = 0.05
     max_idle_delay = 1.0
+    turn = 0
 
     while not shutdown_event.is_set():
         try:
@@ -629,13 +772,10 @@ async def consumer_task():
             if shutdown_event.is_set():     # stopping: don't start another job
                 sem.release()
                 break
+            keys = pop_keys(QUEUES, turn)
+            turn += 1
             task_json = await redis_client.r.eval(
-                PRIORITY_POP_SCRIPT,
-                4,
-                f"processing_queue:{WORKER_ID}",
-                "queue:high",
-                "queue:default",
-                "queue:low",
+                PRIORITY_POP_SCRIPT, 1 + len(keys), f"processing_queue:{WORKER_ID}", *keys,
             )
 
             if not task_json:

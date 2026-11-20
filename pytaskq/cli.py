@@ -2,7 +2,7 @@
 PyTaskQ command line
 ====================
 
-    pytaskq worker    --app myapp.tasks:queue [--cpu-workers N] [--io-workers N] [--timeout S]
+    pytaskq worker    --app myapp.tasks:queue [--cpu-workers N] [--io-workers N] [--timeout S] [--queues a,b]
     pytaskq dashboard [--app myapp.tasks:queue] [--host 127.0.0.1] [--port 8000] [--workers N]
     pytaskq tasks     --app myapp.tasks:queue
     pytaskq ping
@@ -58,6 +58,15 @@ def cmd_worker(args):
         worker.IO_WORKERS = args.io_workers
     if args.timeout is not None:
         worker.TASK_TIMEOUT = args.timeout
+    if args.queues:
+        from pytaskq.core import queueing
+        try:
+            for name in args.queues.split(","):
+                if name.strip():
+                    queueing.check_queue_name(name.strip())
+        except ValueError as e:
+            raise SystemExit(f"--queues: {e}") from None
+        worker.QUEUES_OVERRIDE = args.queues
     worker.set_tasks(app.TASKS, app_name=args.app)
     log.info(f"Starting PyTaskQ worker for app: {args.app}")
     asyncio.run(worker.consumer_task())
@@ -95,9 +104,10 @@ def cmd_tasks(args):
         params = ", ".join(
             p["name"] + ("" if p.get("required") else f"={p.get('default')!r}") for p in s["params"]
         )
-        extras = [s["type"], f"priority={s['priority']}", f"retries={s['max_retries']}", f"timeout={s['timeout']:g}s"]
+        extras = [s["type"], f"queue={s.get('queue', 'default')}", f"priority={s['priority']}",
+                  f"retries={s['max_retries']}", f"timeout={s['timeout']:g}s"]
         if s["cron"]:
-            extras.append(f"cron='{s['cron']}'")
+            extras.append(f"cron='{s['cron']}' ({s.get('tz') or 'UTC'})")
         print(f"  {name}({params})")
         print(f"      {' · '.join(extras)}")
         if s["doc"]:
@@ -219,6 +229,9 @@ def build_parser() -> argparse.ArgumentParser:
     w.add_argument("--cpu-workers", type=int, default=0, help="Processes for type='cpu' tasks (default: cores-1)")
     w.add_argument("--io-workers", type=int, default=0, help="Threads for type='io' tasks (default: cores*4)")
     w.add_argument("--timeout", type=float, default=None, help="Default task timeout in seconds (0 = none)")
+    w.add_argument("--queues", default="",
+                   help="Queues to serve, comma-separated, e.g. images,default "
+                        "(default: WORKER_QUEUES, else the queues of this app's tasks)")
     w.set_defaults(func=cmd_worker)
 
     d = sub.add_parser("dashboard", help="Start the web dashboard + REST API")

@@ -258,10 +258,10 @@ async def test_pressure_counts_reach_redis_and_survive_outages(r):
 
 # ── same data, fewer calls ──────────────────────────────────────────────────────
 
-async def test_dashboard_numbers_in_one_round_trip(r):
+async def test_dashboard_numbers_counted_from_redis(r):
     from pytaskq.services.dashboard_service import _get_dashboard_data
     with patch("pytaskq.core.redis_client.r", r):
-        await r.set("stats:pending", -3)   # counters can drift below zero; never shown negative
+        await r.set("stats:pending", -3)   # an old drifted counter is ignored: queues are counted
         await r.set("stats:completed", 7)
         await r.lpush("queue:high", "a")
         await r.lpush("queue:low", "b", "c")
@@ -270,7 +270,7 @@ async def test_dashboard_numbers_in_one_round_trip(r):
         data = await _get_dashboard_data()
         lean = await _get_dashboard_data(include_dlq=False)
     m = data["metrics"]
-    assert m["pending"] == 0 and m["completed_total"] == 7
+    assert m["pending"] == 3 and m["completed_total"] == 7, "waiting jobs are counted, the stale counter ignored"
     assert (m["queue_high"], m["queue_default"], m["queue_low"], m["queue_total"]) == (1, 0, 2, 3)
     assert m["dlq"] == 2 and m["worker_count"] == 1
     assert data["dlq"] == [{"task_id": "t1"}], "unreadable entries are skipped"
@@ -391,19 +391,23 @@ async def test_live_updates_are_throttled_and_share_one_subscription(r):
 
 # ── Settings → Performance ──────────────────────────────────────────────────────
 
+def _queues(waiting, workers=1):
+    return [{"name": "default", "high": 0, "default": waiting, "low": 0, "total": waiting, "workers": workers}]
+
+
 def _worker(active, io=8, cpu=1, status="healthy"):
     return {"active": active, "io_workers": io, "cpu_workers": cpu, "status": status}
 
 
 def test_suggestions_when_everything_is_fine():
     from pytaskq.services.performance import suggestions
-    out = suggestions(turned_away={}, workers=[_worker(1)], queue_total=0, cores=2, processes=1, pool_max=200)
+    out = suggestions(turned_away={}, workers=[_worker(1)], queues=_queues(0), cores=2, processes=1, pool_max=200)
     assert [s["level"] for s in out] == ["ok"]
 
 
 def test_suggestions_point_at_the_right_setting():
     from pytaskq.services.performance import suggestions
-    common = dict(queue_total=0, cores=2, processes=1, pool_max=200)
+    common = dict(queues=_queues(0), cores=2, processes=1, pool_max=200)
 
     busy = suggestions(turned_away={"redis_busy": 12}, workers=[_worker(1)], **common)
     assert busy[0]["level"] == "critical" and busy[0]["setting"] == "REDIS_MAX_CONNECTIONS=400"
@@ -417,11 +421,21 @@ def test_suggestions_point_at_the_right_setting():
     none = suggestions(turned_away={}, workers=[], **common)
     assert none[0]["title"] == "No workers are running"
 
-    many_cores = suggestions(turned_away={}, workers=[_worker(0)], queue_total=0, cores=8, processes=1, pool_max=200)
+    many_cores = suggestions(turned_away={}, workers=[_worker(0)], queues=_queues(0), cores=8, processes=1,
+                             pool_max=200)
     assert many_cores[0]["setting"] == "WEB_WORKERS=4"
 
-    filling = suggestions(turned_away={}, workers=[_worker(1)], queue_total=400, cores=2, processes=1, pool_max=200)
-    assert "80% full" in filling[0]["title"]
+    filling = suggestions(turned_away={}, workers=[_worker(1)], queues=_queues(400), cores=2, processes=1,
+                          pool_max=200)
+    assert filling[0]["title"] == "Queue 'default' is 80% full"
+
+    unserved = suggestions(turned_away={}, workers=[_worker(1)],
+                           queues=_queues(0) + [{"name": "images", "total": 12, "workers": 0}],
+                           cores=2, processes=1, pool_max=200)
+    assert unserved[0]["level"] == "critical"
+    assert unserved[0]["title"] == "12 jobs are waiting in queue 'images', but no worker serves it"
+    assert unserved[0]["setting"] == "", "no .env line: WORKER_QUEUES there would change every worker"
+    assert "--queues images" in unserved[0]["detail"]
 
 
 async def test_performance_endpoint(env):

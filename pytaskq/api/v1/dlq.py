@@ -18,29 +18,21 @@ _DLQ_ONLY_FIELDS = ("error", "failed_at")
 # Take one entry out of the dead-letter list and queue it again, atomically.
 # If someone else already took it (a second click, another admin, "Replay all"
 # at the same moment), LREM removes nothing and the job is NOT queued twice.
-# KEYS: dlq, target queue, stats:dlq, stats:pending, task hash
-# ARGV: dead-letter entry, new payload, task_id, task_name, priority, note, result TTL
+# KEYS: dlq, target queue list, task hash
+# ARGV: dead-letter entry, new payload, task_id, task_name, priority, note, result TTL, queue name
 REPLAY_SCRIPT = """
 if redis.call('LREM', KEYS[1], 1, ARGV[1]) == 0 then
     return 0
 end
-redis.call('DECR', KEYS[3])
 redis.call('RPUSH', KEYS[2], ARGV[2])
-redis.call('INCR', KEYS[4])
 if ARGV[3] ~= '' then
-    redis.call('HDEL', KEYS[5], 'started_at', 'finished_at', 'duration_ms', 'next_retry_at', 'result')
-    redis.call('HSET', KEYS[5], 'task_id', ARGV[3], 'task_name', ARGV[4], 'status', 'Queued',
-               'priority', ARGV[5], 'retry_count', 0, 'payload', ARGV[2], 'error', '', 'note', ARGV[6])
-    redis.call('EXPIRE', KEYS[5], ARGV[7])
+    redis.call('HDEL', KEYS[3], 'started_at', 'finished_at', 'duration_ms', 'next_retry_at', 'result',
+               'result_dropped')
+    redis.call('HSET', KEYS[3], 'task_id', ARGV[3], 'task_name', ARGV[4], 'status', 'Queued',
+               'priority', ARGV[5], 'queue', ARGV[8], 'retry_count', 0, 'payload', ARGV[2], 'error', '',
+               'note', ARGV[6])
+    redis.call('EXPIRE', KEYS[3], ARGV[7])
 end
-return 1
-"""
-
-PURGE_SCRIPT = """
-if redis.call('LREM', KEYS[1], 1, ARGV[1]) == 0 then
-    return 0
-end
-redis.call('DECR', KEYS[2])
 return 1
 """
 
@@ -76,6 +68,8 @@ async def _fresh_payload(item: dict) -> dict:
     task = {k: v for k, v in item.items() if k not in _DLQ_ONLY_FIELDS}
     task["retry_count"] = 0
     task["prev_delay"] = 1.0
+    task["bounces"] = 0
+    task.pop("handed_back_since", None)
     current_fence = await redis_client.r.get(f"fence:{task.get('task_id')}")
     if current_fence is not None:
         task["fence_token"] = int(current_fence)
@@ -87,10 +81,12 @@ async def _replay(raw: str, task: dict) -> bool:
     task_id = task.get("task_id") or ""
     priority = task.get("priority", "default")
     note = f"Replayed from dead letters at {time.strftime('%Y-%m-%d %H:%M:%S')}"
+    queue = queueing.payload_queue(task)
     done = await redis_client.r.eval(
-        REPLAY_SCRIPT, 5,
-        DLQ_KEY, queueing.queue_key(priority), "stats:dlq", "stats:pending", queueing.task_key(task_id),
+        REPLAY_SCRIPT, 3,
+        DLQ_KEY, queueing.queue_key(priority, queue), queueing.task_key(task_id),
         raw, json.dumps(task), task_id, task.get("task_name", ""), priority, note, int(settings.RESULT_TTL),
+        queue,
     )
     return bool(done)
 
@@ -108,7 +104,7 @@ async def replay_task(task_id: str):
 @router.post("/purge/{task_id}", dependencies=_operator)
 async def purge_task(task_id: str):
     raw, item = await _find(task_id)
-    if not await redis_client.r.eval(PURGE_SCRIPT, 2, DLQ_KEY, "stats:dlq", raw):
+    if not await redis_client.r.lrem(DLQ_KEY, 1, raw):
         raise HTTPException(status_code=409, detail="This job was already replayed or deleted by someone else.")
     await _notify_tenant("global", "dlq_updated")
     return {"message": "task is Deleted", "task": item}
@@ -116,10 +112,7 @@ async def purge_task(task_id: str):
 
 @router.post("/purge_all", dependencies=_operator)
 async def purge_all():
-    async with redis_client.r.pipeline(transaction=True) as pipe:
-        pipe.delete(DLQ_KEY)
-        pipe.set("stats:dlq", 0)
-        await pipe.execute()
+    await redis_client.r.delete(DLQ_KEY)
     await _notify_tenant("global", "dlq_updated")
     return {"message": "Entire dlq is cleared"}
 

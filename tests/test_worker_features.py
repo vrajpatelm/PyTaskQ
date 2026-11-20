@@ -38,7 +38,6 @@ async def run(r, tasks: dict, payload: dict):
     """Simulate a pop + handle_task for one payload."""
     raw = json.dumps(payload)
     await r.lpush(f"processing_queue:{worker.WORKER_ID}", raw)
-    await r.incr("stats:pending")
     pool = ThreadPoolExecutor(max_workers=2)
     sem = asyncio.Semaphore(1)
     await sem.acquire()
@@ -61,7 +60,6 @@ async def test_kwargs_and_success_timings(env):
     payload = queueing.new_payload("greet", ["ada"], {"punctuation": "!"})
     await queueing.enqueue(r, payload)
     await r.delete("queue:default")
-    await r.set("stats:pending", 0)
 
     meta = await run(r, q.TASKS, payload)
     assert meta["status"] == "Success"
@@ -69,8 +67,9 @@ async def test_kwargs_and_success_timings(env):
     assert float(meta["finished_at"]) >= float(meta["started_at"]) >= float(meta["created_at"])
     assert float(meta["duration_ms"]) >= 0
     assert meta["worker_id"] == "test-worker"
-    assert int(await r.get("stats:pending")) == 0
-    assert int(await r.get("stats:processing")) == 0
+    await r.zadd("active_workers", {"test-worker": time.time() + 30})
+    overview = await queueing.queue_overview(r)
+    assert (overview["waiting"], overview["processing"]) == (0, 0)
     assert int(await r.hget("worker:test-worker", "processed")) == 1
 
 
@@ -208,7 +207,7 @@ async def test_invalid_payload_keeps_task_id(env):
     assert int(await r.get("stats:failed")) == 1
 
 
-async def test_webhook_followup_keeps_pending_counter_consistent(env):
+async def test_webhook_followup_is_counted_as_waiting(env):
     r = env
     q = PyTaskQ()
 
@@ -217,10 +216,9 @@ async def test_webhook_followup_keeps_pending_counter_consistent(env):
         return 1
 
     payload = queueing.new_payload("ok", on_success_url="https://hooks.example.com/x")
-    await r.set("stats:pending", 0)
     await run(r, q.TASKS, payload)
     assert await r.llen("queue:default") == 1
-    assert int(await r.get("stats:pending")) == 1, "the queued webhook task must be counted as pending"
+    assert (await queueing.queue_overview(r))["waiting"] == 1, "the queued webhook task must be counted"
     hook = json.loads(await r.lindex("queue:default", 0))
     assert hook["task_name"] == "_deliver_webhook"
     assert (await r.hget(f"task:{hook['task_id']}", "status")) == "Queued"
@@ -246,8 +244,8 @@ async def test_scheduled_task_becomes_queued_when_due(env):
     assert await worker._promote_due_tasks(now=time.time()) == 0
     assert await worker._promote_due_tasks(now=time.time() + 11) == 1
     assert await r.hget(f"task:{payload['task_id']}", "status") == "Queued"
-    assert int(await r.get("stats:delayed")) == 0
-    assert int(await r.get("stats:pending")) == 1
+    overview = await queueing.queue_overview(r)
+    assert (overview["delayed"], overview["waiting"]) == (0, 1)
 
 
 async def test_sweeper_recovers_and_updates_status(env):

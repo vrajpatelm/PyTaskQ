@@ -26,7 +26,8 @@ Async-first, self-hosted, built on FastAPI and Redis.
 
 - **Plain Python.** One decorator. Sync, `async def`, CPU-heavy and I/O-bound tasks each run in the right pool automatically.
 - **See everything.** A live dashboard shows every job's arguments, timing, result and error, and lets you run, cancel and replay jobs.
-- **Built for failure.** Retries with backoff, a dead-letter queue, crash recovery, fencing tokens and graceful shutdown come built in.
+- **Built for failure.** Retries with backoff, a dead-letter queue, crash recovery, fencing tokens, safe retries with idempotency keys and graceful shutdown come built in.
+- **Fast on small servers.** On a 2-core server, 500 simultaneous users get a typical response in 16 ms, and the dashboard tells you which setting to change when it can't keep up.
 - **Self-hosted.** Accounts, roles, invite links, HTTPS and backups are included. Redis is the only thing you need to run.
 
 ## Quick start
@@ -54,8 +55,12 @@ def send_order_confirmation(order_id: int, email: str):
 async def sync_inventory(sku: str):
     ...
 
-@queue.task(cron="0 2 * * *")    # every night at 02:00, once across all workers
+@queue.task(cron="0 2 * * *", tz="Europe/London")   # 02:00 London time, once across all workers
 def nightly_sales_report():
+    ...
+
+@queue.task(queue="images", type="cpu")   # its own queue: run it on a bigger machine
+def make_thumbnail(path: str):
     ...
 ```
 
@@ -101,9 +106,9 @@ Live updates, light and dark themes, and a layout that works on phones.
 
 **Workers.** Host, load, jobs done and failed, pool sizes, uptime and heartbeat health.
 
-**Settings → Performance.** Whether the server is keeping up, what it turned away in the last 15 minutes, and which setting to change, ready to copy.
-
 <img src="https://raw.githubusercontent.com/vrajpatelm/PyTaskQ/main/docs/images/workers.png" alt="Worker fleet with health and throughput" width="100%" />
+
+**Settings.** Your account and API tokens, your team (for admins), and **Performance**: whether the server is keeping up, what it turned away in the last 15 minutes, and which setting to change, ready to copy.
 
 ## Accounts
 
@@ -136,7 +141,7 @@ Lost it? Run `pytaskq users setup-code`. For automated installs, set `PYTASKQ_AD
 
 - **Scripts** use a personal API token from *Settings → API tokens*: `Authorization: Bearer ptq_…`. The token has its owner's role.
 - **Locked out?** Run `pytaskq users reset-password NAME` on the server. `pytaskq users list | create | set-role | delete | setup-code` cover the rest.
-- **Security.** Passwords are hashed with scrypt. Only SHA-256 hashes of sessions, invites and tokens are stored. Cookies are `HttpOnly` and `SameSite`, cross-site writes are blocked, and failed sign-ins are throttled. Serve the dashboard over HTTPS in production.
+- **Security.** Passwords are hashed with scrypt. Only SHA-256 hashes of sessions, invites and tokens are stored. Cookies are `HttpOnly` and `SameSite`, other websites can't use them, and failed sign-ins are throttled per user and per IP. Serve the dashboard over HTTPS in production.
 - **Local development:** `PYTASKQ_AUTH=off` turns sign-in off. Never use it on a server others can reach.
 
 ## Configuration
@@ -144,19 +149,21 @@ Lost it? Run `pytaskq users setup-code`. For automated installs, set `PYTASKQ_AD
 | Task option | Default | What it does |
 |---|---|---|
 | `type` | `"async"` for `async def`, else `"cpu"` | `"cpu"` process pool · `"io"` thread pool · `"async"` event loop |
-| `priority` | `"default"` | `"high"`, `"default"` or `"low"` queue |
+| `priority` | `"default"` | `"high"`, `"default"` or `"low"`, within its queue |
+| `queue` | `"default"` | Named queue: only workers serving it run the task ([queues guide](https://github.com/vrajpatelm/PyTaskQ/blob/main/docs/QUEUES.md)) |
 | `max_retries` | `3` | Retries with jittered backoff before dead-lettering |
 | `timeout` | `300` s | Abandon and retry an attempt after this long |
 | `cron` | — | 5-field cron schedule |
+| `tz` | `CRON_TIMEZONE` (UTC) | Time zone the cron schedule is read in, e.g. `"Asia/Kolkata"` |
 | `name` | function name | Registered task name |
 
-App-wide defaults: `PyTaskQ(default_priority="low", max_retries=5, timeout=60)`.
+App-wide defaults: `PyTaskQ(default_priority="low", default_queue="emails", max_retries=5, timeout=60)`.
 
-Every server setting is an environment variable or a line in `.env`, and all of them are documented in [`.env.example`](https://github.com/vrajpatelm/PyTaskQ/blob/main/.env.example). The ones you'll most likely change are `REDIS_URL`, `MAX_RETRIES`, `TASK_TIMEOUT` and `QUEUE_CAPACITY`. For heavy traffic, [docs/PERFORMANCE.md](https://github.com/vrajpatelm/PyTaskQ/blob/main/docs/PERFORMANCE.md) explains which setting fixes what, with measurements from a 2-core server and a load test you can run on yours.
+Every server setting is an environment variable or a line in `.env`, and all of them are documented in [`.env.example`](https://github.com/vrajpatelm/PyTaskQ/blob/main/.env.example). The ones you'll most likely change are `REDIS_URL`, `MAX_RETRIES`, `TASK_TIMEOUT`, `QUEUE_CAPACITY` and `WORKER_IO_WORKERS`. For heavy traffic, [docs/PERFORMANCE.md](https://github.com/vrajpatelm/PyTaskQ/blob/main/docs/PERFORMANCE.md) explains which setting fixes what, with measurements from a 2-core server and a load test you can run on yours.
 
 | Command | Purpose |
 |---|---|
-| `pytaskq worker --app m:queue [--cpu-workers N --io-workers N]` | Run a worker |
+| `pytaskq worker --app m:queue [--queues a,b] [--cpu-workers N --io-workers N]` | Run a worker (serves its tasks' queues unless `--queues` says otherwise) |
 | `pytaskq dashboard [--app m:queue] [--port 8000] [--workers N]` | Dashboard and REST API |
 | `pytaskq tasks --app m:queue` | List tasks and their settings |
 | `pytaskq users …` | Manage accounts from the server |
@@ -174,6 +181,10 @@ Every server setting is an environment variable or a line in `.env`, and all of 
 6. **Safe outbound calls.** Webhooks (`on_success_url=`) are signed with HMAC and retried. Use `pytaskq.net.assert_safe_url` to block requests to private networks.
 7. **Safe retries.** Send an `Idempotency-Key` header (or `delay(..., idempotency_key=…)`) and a retried submission returns the original job instead of queueing a second one.
 8. **Tracing (optional).** Set `OTEL_EXPORTER_OTLP_ENDPOINT` and one OpenTelemetry trace follows each job from the request that queued it through every attempt, in Jaeger, Grafana Tempo, Honeycomb or Datadog.
+9. **Named queues.** Put a kind of work on its own queue (`queue="images"`) and give it its own workers (`--queues images`). Each queue has its own capacity, and the dashboard flags a queue no worker serves.
+10. **Polite under load.** When workers fall behind, new jobs get `429` with `Retry-After` instead of Redis filling up, and *Settings → Performance* says what to change.
+
+[docs/ARCHITECTURE.md](https://github.com/vrajpatelm/PyTaskQ/blob/main/docs/ARCHITECTURE.md) explains each part in detail: what's stored in Redis, the life of a job, and what happens when things go wrong.
 
 ## REST API
 
@@ -186,6 +197,7 @@ Interactive docs are served at `/docs`, and the full reference is in [docs/API.m
 | `POST` | `/task/{id}/cancel` | Cancel a waiting job |
 | `GET` | `/tasks` | Recent jobs, filterable by status and task |
 | `GET` | `/metrics`, `/system/workers`, `/dlq` | Queue, worker and dead-letter state |
+| `GET` | `/system/performance` | Refused requests and tuning suggestions |
 | `POST` | `/dlq/replay/{id}`, `/dlq/retry_all` | Replay dead letters |
 
 ## Self-hosting
@@ -204,7 +216,7 @@ docker compose -f docker-compose.prod.yml up -d
 For your own tasks, build a worker image on top of the official one:
 
 ```dockerfile
-FROM ghcr.io/vrajpatelm/pytaskq:0.3
+FROM ghcr.io/vrajpatelm/pytaskq:0.4
 COPY tasks.py .
 CMD ["pytaskq", "worker", "--app", "tasks:queue"]
 ```
@@ -218,11 +230,11 @@ pip install -e ".[dev,demo]"
 python -m pytest             # in-memory via fakeredis, no Redis needed
 
 cd frontend && npm install
-npm run dev                  # dashboard with hot reload
+npm run dev                  # dashboard with hot reload; talks to `pytaskq dashboard` on :8000
 npm run build                # writes the bundle into pytaskq/static/
 ```
 
-See [CONTRIBUTING](https://github.com/vrajpatelm/PyTaskQ/blob/main/docs/CONTRIBUTING.md), [RELEASING](https://github.com/vrajpatelm/PyTaskQ/blob/main/docs/RELEASING.md) and the [CHANGELOG](https://github.com/vrajpatelm/PyTaskQ/blob/main/CHANGELOG.md).
+See [QUEUES](https://github.com/vrajpatelm/PyTaskQ/blob/main/docs/QUEUES.md), [CONTRIBUTING](https://github.com/vrajpatelm/PyTaskQ/blob/main/docs/CONTRIBUTING.md), [ARCHITECTURE](https://github.com/vrajpatelm/PyTaskQ/blob/main/docs/ARCHITECTURE.md) and the [CHANGELOG](https://github.com/vrajpatelm/PyTaskQ/blob/main/CHANGELOG.md).
 
 ## License
 

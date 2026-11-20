@@ -1,46 +1,64 @@
-import time
+import asyncio
 import json
-from pytaskq.core import redis_client
+
+from pytaskq.core import queueing, redis_client
 from pytaskq.core.config import settings
+
 
 async def _notify_tenant(tenant_id: str, event_type: str) -> None:
     await redis_client.r.publish("events:global", event_type)
 
-async def _get_dashboard_data(tenant_id: str = "global", include_dlq: bool = True) -> dict:
-    """Every number the dashboard shows, fetched in a single Redis round trip."""
+
+def _reject_constant(name):
+    raise ValueError(name)
+
+
+async def _totals_and_dlq(include_dlq: bool):
     async with redis_client.r.pipeline(transaction=False) as pipe:
-        pipe.mget("stats:pending", "stats:processing", "stats:delayed", "stats:completed", "stats:failed")
-        pipe.llen("dlq")
-        pipe.llen("queue:high")
-        pipe.llen("queue:default")
-        pipe.llen("queue:low")
-        pipe.zcount("active_workers", time.time(), "+inf")
+        pipe.mget("stats:completed", "stats:failed")
         if include_dlq:   # capped; the full list is at GET /dlq
             pipe.lrange("dlq", 0, 99)
-        counters, dlq_count, queue_high, queue_default, queue_low, worker_count, *rest = await pipe.execute()
-    dlq_raw = rest[0] if rest else []
+        return await pipe.execute()
 
-    pending, processing, delayed, completed, failed = (int(v or 0) for v in counters)
+
+async def _get_dashboard_data(tenant_id: str = "global", include_dlq: bool = True) -> dict:
+    """
+    Every number the dashboard shows. Waiting, running, scheduled and
+    dead-lettered jobs are counted from Redis itself (see queueing.queue_overview);
+    only the all-time completed/failed totals are counters.
+    """
+    overview, (totals, *rest) = await asyncio.gather(
+        queueing.queue_overview(redis_client.r), _totals_and_dlq(include_dlq))
+    completed, failed = (int(v or 0) for v in totals)
     dlq_tasks = []
-    for raw in dlq_raw:
+    for raw in (rest[0] if rest else []):
         try:
-            dlq_tasks.append(json.loads(raw))
+            item = json.loads(raw, parse_constant=_reject_constant)
         except ValueError:
             continue
+        if isinstance(item, dict):
+            dlq_tasks.append(item)
+
+    queues = overview["queues"]
+    capacity = settings.QUEUE_CAPACITY
+    fullest = max(queues, key=lambda q: q["total"]) if queues else {"name": queueing.DEFAULT_QUEUE, "total": 0}
     return {
         "metrics": {
-            "pending": max(0, pending),
-            "processing": max(0, processing),
-            "delayed": max(0, delayed),
-            "dlq": dlq_count,
+            "pending": overview["waiting"],
+            "processing": overview["processing"],
+            "delayed": overview["delayed"],
+            "dlq": overview["dlq"],
             "completed_total": completed,
             "failed_total": failed,
-            "queue_high": queue_high,
-            "queue_default": queue_default,
-            "queue_low": queue_low,
-            "queue_total": queue_high + queue_default + queue_low,
-            "queue_capacity": settings.QUEUE_CAPACITY,
-            "worker_count": worker_count,
+            # Summed over every queue, by priority:
+            "queue_high": sum(q["high"] for q in queues),
+            "queue_default": sum(q["default"] for q in queues),
+            "queue_low": sum(q["low"] for q in queues),
+            "queue_total": overview["waiting"],
+            "queue_capacity": capacity,             # per queue
+            "queues": queues,                       # [{name, high, default, low, total, workers}]
+            "fullest_queue": {"name": fullest["name"], "total": fullest["total"]},
+            "worker_count": len(overview["live_workers"]),
         },
         "dlq": dlq_tasks,
     }

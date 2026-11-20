@@ -25,6 +25,8 @@ import asyncio
 import pytest
 import pytest_asyncio
 import fakeredis.aioredis as fakeredis
+
+from pytaskq.core import queueing
 from unittest.mock import patch, MagicMock
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 
@@ -188,8 +190,7 @@ async def test_handle_task_first_failure_schedules_retry(r):
     assert await r.zcard("delayed_tasks") == 1, "Task should be in delayed_tasks for retry"
     assert await r.llen("dlq") == 0, "Task must NOT go to DLQ on first failure"
 
-    delayed_stat = int(await r.get("stats:delayed") or 0)
-    assert delayed_stat == 1
+    assert (await queueing.queue_overview(r))["delayed"] == 1
 
     # Task hash should show RetryScheduled
     stored = await r.hgetall(f"task:{task_id}")
@@ -200,7 +201,7 @@ async def test_handle_task_first_failure_schedules_retry(r):
 async def test_handle_task_third_failure_sends_to_dlq(r):
     """
     SCENARIO: Task fails with retry_count=3 (at the limit).
-    EXPECT:   Task goes to dlq. stats:dlq incremented. Status=DeadLetter.
+    EXPECT:   Task goes to dlq (counted on the dashboard). Status=DeadLetter.
               delayed_tasks stays empty.
     """
     import pytaskq.worker as worker
@@ -232,8 +233,7 @@ async def test_handle_task_third_failure_sends_to_dlq(r):
     assert await r.llen("dlq") == 1, "Task must be in DLQ after max retries"
     assert await r.zcard("delayed_tasks") == 0, "Task must NOT be in delayed_tasks"
 
-    dlq_stat = int(await r.get("stats:dlq") or 0)
-    assert dlq_stat == 1
+    assert (await queueing.queue_overview(r))["dlq"] == 1
 
     stored = await r.hgetall(f"task:{task_id}")
     assert stored.get("status") == "DeadLetter"

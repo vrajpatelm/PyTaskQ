@@ -20,11 +20,14 @@ class Settings(BaseSettings):
     REDIS_POOL_TIMEOUT: float = 5      # seconds a request waits for a free connection before a 503
 
     # ── Queue behaviour ──────────────────────────────────────────────────────
-    QUEUE_CAPACITY: int = 500
+    QUEUE_CAPACITY: int = 500          # jobs that can wait in EACH queue before new ones get 429
     TASK_TIMEOUT: float = 300          # default per-task timeout (seconds, 0 = none)
     MAX_RETRIES: int = 3               # default retries before a task is dead-lettered
     RESULT_TTL: int = 86400            # how long task status/results are kept (seconds)
     HISTORY_LIMIT: int = 500           # how many recent tasks the dashboard can list
+    MAX_RESULT_BYTES: int = 1_000_000  # larger results aren't stored (the job still succeeds); 0 = no limit
+    CRON_TIMEZONE: str = "UTC"         # time zone for cron schedules (a task's own tz= wins)
+    WORKER_QUEUES: str = ""            # queues a worker serves, comma-separated (empty = its tasks' queues)
 
     # ── Authentication (self-hosting) ────────────────────────────────────────
     PYTASKQ_AUTH: str = "on"           # "off" disables login (local development only)

@@ -36,9 +36,14 @@ Returns live cluster-wide queue and worker statistics.
       "queue_low": 0,
       "queue_total": 0,
       "queue_capacity": 500,
+      "queues": [{"name": "default", "high": 0, "default": 0, "low": 0, "total": 0, "workers": 2},
+                 {"name": "images", "high": 0, "default": 4, "low": 0, "total": 4, "workers": 1}],
+      "fullest_queue": {"name": "images", "total": 4},
       "worker_count": 3
     }
     ```
+
+`pending`, `processing`, `delayed` and `dlq` are counted from Redis on every call. `queue_high`/`queue_default`/`queue_low`/`queue_total` add up every queue. `queue_capacity` applies to each queue separately, and `queues` breaks the numbers down per queue, with how many live workers serve each. `completed_total` and `failed_total` are all-time totals.
 
 ---
 
@@ -131,6 +136,7 @@ Delete all failed tasks permanently.
   "args": [1001],
   "kwargs": {"email": "ada@example.com"},
   "priority": "high",          // optional; defaults to the task's own priority
+  "queue": "emails",           // optional; defaults to the task's own queue (see docs/QUEUES.md)
   "delay_seconds": 0,          // optional; > 0 schedules the job
   "on_success_url": null       // optional webhook
 }
@@ -140,8 +146,8 @@ Response: `{"task_id": "…", "status": "queued"}` (or `"scheduled"` with `execu
 
 Errors:
 * `404` — the task name isn't advertised by any running worker. The message lists the available tasks.
-* `422` — invalid body: an unknown priority, a delay outside 0 to 1 year, `NaN`/`Infinity` in the arguments, a malformed `Idempotency-Key`, or a key already used for a different job.
-* `429` — the queues are at `QUEUE_CAPACITY`. Wait `Retry-After` seconds and try again.
+* `422` — invalid body: an unknown priority, an invalid queue name, a delay outside 0 to 1 year, `NaN`/`Infinity` in the arguments, a malformed `Idempotency-Key`, or a key already used for a different job.
+* `429` — the job's queue holds `QUEUE_CAPACITY` jobs (each queue has its own limit). Wait `Retry-After` seconds and try again.
 * `503` — the server couldn't reach Redis in time. Also carries `Retry-After`.
 
 `POST /task/schedule?delay_seconds=60` still works and takes the same body.
@@ -188,7 +194,7 @@ A job is visible from the moment it is queued:
 }
 ```
 
-Non-string results are stored as JSON.
+Non-string results are stored as JSON. Results over `MAX_RESULT_BYTES` (1 MB) aren't stored: the job is still `Success`, `result` is empty and `result_dropped` explains why. The record also has `queue`, and a `note` while a job waits for a worker that has its task.
 
 ### Cancel — `POST /task/{task_id}/cancel`
 
@@ -196,22 +202,22 @@ Works for `Queued`, `Scheduled` and `RetryScheduled` jobs. Returns `409` for job
 
 ### History — `GET /tasks`
 
-Query: `status`, `task_name`, `limit` (1–500). Newest first, drawn from the last `HISTORY_LIMIT` jobs.
+Query: `status`, `task_name`, `queue`, `limit` (1–500). Newest first, drawn from the last `HISTORY_LIMIT` jobs.
 
 ### Registered tasks — `GET /tasks/registered`
 
 What running workers (or `pytaskq dashboard --app …`) advertise, including each parameter. Workers running different apps are all listed; a task drops out about 5 minutes after nothing advertises it any more.
 
 ```json
-{"tasks": [{"name": "send_receipt", "type": "io", "priority": "high", "max_retries": 3, "timeout": 300,
-            "cron": null, "doc": "Email a receipt.",
+{"tasks": [{"name": "send_receipt", "type": "io", "queue": "default", "priority": "high", "max_retries": 3,
+            "timeout": 300, "cron": null, "tz": null, "doc": "Email a receipt.",
             "params": [{"name": "order_id", "required": true, "annotation": "int"},
                        {"name": "email", "required": false, "default": "customer@example.com", "annotation": "str"}]}]}
 ```
 
 ### Workers — `GET /system/workers`
 
-Each worker reports `hostname`, `pid`, `app`, `active`, `processed`, `failed`, `cpu_workers`, `io_workers`, `uptime_seconds`, `last_heartbeat_seconds_ago` and `status` (`healthy` / `degraded` / `dead`).
+Each worker reports `hostname`, `pid`, `app`, `queues` (the queues it serves), `active`, `processed`, `failed`, `cpu_workers`, `io_workers`, `uptime_seconds`, `last_heartbeat_seconds_ago` and `status` (`healthy` / `degraded` / `dead`).
 
 ### Dead letters
 

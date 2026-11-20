@@ -2,11 +2,21 @@
 
 All notable changes to PyTaskQ. Versions follow [semantic versioning](https://semver.org/).
 
-## 0.3.2 — 2026-11-18
+## 0.4.0 — 2026-11-20
 
-Faster under load, safer to retry, traceable end to end, and a set of bugs fixed after a close review. On a 2-core server with 500 simulated users, the "Redis unavailable" errors went from 14% of requests to none, and the typical response from 320 ms to 16 ms. Details in `docs/PERFORMANCE.md`.
+Named queues, cron time zones, and everything from the unreleased 0.3.2: faster under load, safer to retry, traceable end to end, and a set of bugs fixed after a close review. On a 2-core server with 500 simulated users, the "Redis unavailable" errors went from 14% of requests to none, and the typical response from 320 ms to 16 ms. Details in `docs/PERFORMANCE.md`.
+
+### Upgrading from 0.3
+- **Cron schedules now run in UTC** unless a task sets `tz=` or you set `CRON_TIMEZONE`. Before, they used each worker's local time. Servers in Docker were already on UTC.
+- Jobs already waiting in Redis keep working: the `default` queue keeps its key names.
+- `/metrics` lost `rate_limit_used` and `rate_limit_max` (the rate limit was never enforced), and gained `queues` and `fullest_queue`. `QUEUE_CAPACITY` now applies to each queue.
 
 ### Added
+- **Named queues.** `@queue.task(queue="images")` or `PyTaskQ(default_queue=…)` puts tasks on their own queue, and only workers serving it run them. Workers serve their own tasks' queues by default, or `--queues a,b` / `WORKER_QUEUES`. Priorities work within each queue, and a busy queue can't starve another. Each queue has its own `QUEUE_CAPACITY`. A single job can be routed elsewhere (`delay(..., queue=…)`, `"queue"` in the API). `/tasks?queue=` filters, `/system/workers` lists each worker's queues, and `pytaskq tasks` shows each task's queue. New guide: `docs/QUEUES.md`.
+- **Dashboard queues row**: waiting jobs and serving workers per queue (click one to filter the job list); queues with jobs but no worker are marked, and *Settings → Performance* says which worker to start. Job details show the queue.
+- **Cron time zones**: `tz="Asia/Kolkata"` per task, `CRON_TIMEZONE` for the default. Bad names are rejected when the task is defined (or when the worker starts). When clocks go back, a job runs once; when they go forward, a skipped time runs at the jump.
+- **`MAX_RESULT_BYTES`** (1 MB): larger results aren't stored. The job still succeeds, and `result_dropped` (also in webhooks and the dashboard) says why.
+- A worker that takes a job whose task it doesn't have (two apps sharing a queue) hands it back for a worker that has it, for up to 10 minutes, without using a retry; *Settings → Performance* suggests giving each app its own queue.
 - **Settings → Performance**: what the server turned away in the last 15 minutes, live load figures, and plain-language suggestions with the exact setting to copy into `.env`. Backed by `GET /system/performance`.
 - **Rename API tokens** from Settings (`PATCH /auth/me/tokens/{id}`). The secret doesn't change.
 - **Jobs list stays readable during bursts.** It holds still while your pointer is over it, you've scrolled down or you press Pause; new jobs wait behind a "new jobs" button, and statuses still update in place. Runs of the same task and status fold into one row you can expand ("Group repeated jobs").
@@ -18,6 +28,8 @@ Faster under load, safer to retry, traceable end to end, and a set of bugs fixed
 - **End-to-end tracing.** With `OTEL_EXPORTER_OTLP_ENDPOINT` set, one OpenTelemetry trace follows each job: the API request (continuing a caller's `traceparent`), the enqueue, every attempt, and follow-up webhook jobs. `task.delay()` inside your own app's span joins your trace. Spans never contain URLs, headers, bodies or job arguments. `https://` collectors use TLS, and `OTEL_SERVICE_NAME` is respected.
 
 ### Changed
+- The dashboard's Queued, Running, Scheduled and Dead-letter numbers are counted from Redis instead of hand-maintained counters, which drifted after crashes and could go negative.
+- Depends on `tzdata`, so time zone names work on Windows and slim images.
 - Sign-in checks take one Redis call instead of three. Revoking a token, signing out, disabling a user or changing a role still applies on the next request. A token's "last used" time is now saved at most once a minute.
 - Queueing a job takes 3 Redis round trips instead of 8. `/metrics` takes 2 instead of 15. The job list reads only the rows it returns.
 - The Redis connection pool waits for a free connection (up to `REDIS_POOL_TIMEOUT`) instead of failing at once, and allows 200 connections per process instead of 100.
@@ -29,6 +41,7 @@ Faster under load, safer to retry, traceable end to end, and a set of bugs fixed
 - `npm run dev` proxies the API through Vite, so the dashboard is same-origin in development too.
 
 ### Fixed
+- Cancelling a job that had been recovered from a crashed worker and later retried silently did nothing: cancel looked in the wrong priority list.
 - A job attempt that failed after the job had been handed to another worker (its worker looked dead) scheduled a second copy of the job or dead-lettered it. Stale attempts are now ignored, checked atomically.
 - Replaying the same dead letter twice at once (two clicks, two admins, "Replay all") queued the job several times. Each dead letter can now only be taken once; the loser gets `409`.
 - One unreadable dead-letter entry broke the whole dead-letters page.

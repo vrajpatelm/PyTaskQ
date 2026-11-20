@@ -64,6 +64,7 @@ async def load_workers() -> list[dict]:
             "failed": _num(info.get("failed"), int, 0),
             "cpu_workers": _num(info.get("cpu_workers"), int, None),
             "io_workers": _num(info.get("io_workers"), int, None),
+            "queues": [q for q in (info.get("queues") or "default").split(",") if q],
             "uptime_seconds": int(now - started_at) if started_at else None,
             "last_heartbeat_seconds_ago": seconds_ago,
             "status": "healthy" if seconds_ago < 15 else ("degraded" if seconds_ago < 30 else "dead"),

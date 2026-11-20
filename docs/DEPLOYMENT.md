@@ -38,7 +38,7 @@ PYTASKQ_DOMAIN=jobs.example.com
 REDIS_PASSWORD=<paste the output of: python3 -c "import secrets; print(secrets.token_urlsafe(32))">
 ```
 
-Pin the version too (`PYTASKQ_VERSION=0.3.2`), so upgrades only happen when you choose.
+Pin the version too (`PYTASKQ_VERSION=0.4.0`), so upgrades only happen when you choose.
 
 ## 3. Start
 
@@ -65,7 +65,7 @@ The image includes a small example app so you can try PyTaskQ immediately. For r
 
 ```dockerfile
 # Dockerfile.worker
-FROM ghcr.io/vrajpatelm/pytaskq:0.3
+FROM ghcr.io/vrajpatelm/pytaskq:0.4
 COPY requirements.txt .
 RUN pip install --user -r requirements.txt     # your task's own dependencies
 COPY tasks.py .
@@ -86,6 +86,17 @@ PYTASKQ_WORKER_APP=tasks:queue
 and run `docker compose -f docker-compose.prod.yml up -d` again. The dashboard shows your tasks as soon as the worker starts.
 
 To run more workers, use `docker compose -f docker-compose.prod.yml up -d --scale worker=3`.
+
+To give heavy tasks their own workers, put them on a queue (`@queue.task(queue="images")`) and add a second worker service in a `docker-compose.override.yml` next to the prod file:
+
+```yaml
+services:
+  worker-images:
+    extends: { file: docker-compose.prod.yml, service: worker }
+    command: ["pytaskq", "worker", "--app", "tasks:queue", "--queues", "images"]
+```
+
+The first worker keeps serving the other queues. [QUEUES.md](QUEUES.md) explains how queues and workers fit together.
 
 ## Backups
 
@@ -117,7 +128,7 @@ Why not just copy the file into Redis? Redis keeps an append-only log of every c
 ## Upgrading
 
 ```bash
-# in .env: PYTASKQ_VERSION=0.3.2
+# in .env: PYTASKQ_VERSION=0.4.1
 docker compose -f docker-compose.prod.yml exec backup sh /backup-loop.sh once   # backup first
 docker compose -f docker-compose.prod.yml pull
 docker compose -f docker-compose.prod.yml up -d

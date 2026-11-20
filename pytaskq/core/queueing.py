@@ -29,6 +29,17 @@ from pytaskq.core.config import settings
 
 PRIORITIES = ("high", "default", "low")
 
+# ── Named queues ───────────────────────────────────────────────────────────────
+# Every task lives on a queue ("default" unless it says otherwise) and every
+# worker serves a set of queues. A worker only takes jobs from queues it
+# serves, so an image worker never picks up email jobs it can't run.
+# Each queue has its own high/default/low lists. The "default" queue keeps the
+# key names PyTaskQ always used (queue:high, queue:default, queue:low), so jobs
+# already waiting in Redis keep working after an upgrade.
+DEFAULT_QUEUE = "default"
+QUEUE_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,49}$")
+QUEUES_KEY = "pytaskq:queues"    # SET of every queue name that has been used
+
 # Task lifecycle states stored in task:{id} → status
 QUEUED = "Queued"
 SCHEDULED = "Scheduled"
@@ -55,8 +66,32 @@ def task_key(task_id: str) -> str:
     return f"task:{task_id}"
 
 
-def queue_key(priority: str) -> str:
-    return f"queue:{priority if priority in PRIORITIES else 'default'}"
+def check_queue_name(name: Optional[str]) -> str:
+    """A valid queue name (lowercase letters, digits, - and _; up to 50) or ValueError."""
+    name = DEFAULT_QUEUE if name is None else name
+    if not isinstance(name, str) or not QUEUE_NAME_RE.match(name):
+        raise ValueError(f"queue name must be 1–50 lowercase letters, digits, '-' or '_' "
+                         f"(starting with a letter or digit), got {name!r}")
+    return name
+
+
+def payload_queue(payload: dict) -> str:
+    """The queue a stored job belongs to (old jobs and unreadable names → default)."""
+    name = payload.get("queue") if isinstance(payload, dict) else None
+    return name if isinstance(name, str) and QUEUE_NAME_RE.match(name) else DEFAULT_QUEUE
+
+
+def queue_key(priority: str, queue: str = DEFAULT_QUEUE) -> str:
+    """The Redis list for one priority of one queue."""
+    priority = priority if priority in PRIORITIES else "default"
+    if not queue or queue == DEFAULT_QUEUE:
+        return f"queue:{priority}"            # the original key names
+    return f"queue:{queue}:{priority}"
+
+
+def queue_keys(queue: str = DEFAULT_QUEUE) -> list[str]:
+    """The three lists of a queue, highest priority first."""
+    return [queue_key(p, queue) for p in PRIORITIES]
 
 
 def encode_result(result: Any) -> str:
@@ -80,6 +115,7 @@ def new_payload(
     kwargs: Optional[dict] = None,
     *,
     priority: str = "default",
+    queue: str = DEFAULT_QUEUE,
     on_success_url: Optional[str] = None,
     max_retries: Optional[int] = None,
     timeout: Optional[float] = None,
@@ -88,6 +124,7 @@ def new_payload(
 ) -> dict:
     if priority not in PRIORITIES:
         raise ValueError(f"priority must be one of {PRIORITIES}, got {priority!r}")
+    queue = check_queue_name(queue)
     payload = {
         "task_id": task_id or str(uuid.uuid4()),
         "task_name": task_name,
@@ -96,6 +133,7 @@ def new_payload(
         "retry_count": 0,
         "fence_token": 0,
         "priority": priority,
+        "queue": queue,
         "on_success_url": on_success_url,
     }
     if max_retries is not None:
@@ -121,6 +159,7 @@ def _meta(payload: dict, raw: str, status: str, now: float, delay_seconds: float
         "task_name": payload["task_name"],
         "status": status,
         "priority": payload.get("priority", "default"),
+        "queue": payload_queue(payload),
         "created_at": now,
         "scheduled_for": now + delay_seconds if delay_seconds > 0 else None,
         "args": json.dumps(payload.get("args", []), default=str),
@@ -158,7 +197,7 @@ def _idempotency_redis_key(key: str) -> str:
 
 def _fingerprint(payload: dict, delay_seconds: float) -> str:
     """What makes two requests 'the same job' (the random task_id and trace ids don't count)."""
-    same = {k: payload.get(k) for k in ("task_name", "args", "kwargs", "priority", "on_success_url",
+    same = {k: payload.get(k) for k in ("task_name", "args", "kwargs", "priority", "queue", "on_success_url",
                                         "max_retries", "timeout")}
     same["delay_seconds"] = delay_seconds
     return hashlib.sha256(json.dumps(same, sort_keys=True, default=str).encode()).hexdigest()
@@ -203,6 +242,7 @@ async def enqueue(r, payload: dict, delay_seconds: float = 0, created_by: Option
     with tracing.producer_span(payload):
         task_id = payload["task_id"]
         priority = payload.get("priority", "default")
+        queue = payload_queue(payload)
         raw = dumps_payload(payload)
         now = time.time()
         status = SCHEDULED if delay_seconds > 0 else QUEUED
@@ -216,10 +256,9 @@ async def enqueue(r, payload: dict, delay_seconds: float = 0, created_by: Option
         def queue_commands(pipe):
             if delay_seconds > 0:
                 pipe.zadd("delayed_tasks", {raw: now + delay_seconds})
-                pipe.incr("stats:delayed")
             else:
-                pipe.lpush(queue_key(priority), raw)
-                pipe.incr("stats:pending")
+                pipe.lpush(queue_key(priority, queue), raw)
+            pipe.sadd(QUEUES_KEY, queue)
             pipe.hset(task_key(task_id), mapping=meta)
             pipe.expire(task_key(task_id), int(settings.RESULT_TTL + delay_seconds))
             pipe.lpush(RECENT_KEY, task_id)
@@ -252,20 +291,22 @@ async def enqueue(r, payload: dict, delay_seconds: float = 0, created_by: Option
 
 
 # Atomically pull a waiting task out of its queue or the delayed set.
-# KEYS: queue list, delayed zset, task hash, stats:pending, stats:delayed
+# All three priority lists of the job's queue are checked: a job's recorded
+# priority can differ from the list it waits in (crash recovery puts jobs on
+# "high"; a later retry goes back to the original priority).
+# KEYS: the queue's 3 lists, delayed zset, task hash
 # ARGV: exact payload JSON, cancelled timestamp
 CANCEL_SCRIPT = """
-local removed = redis.call('LREM', KEYS[1], 1, ARGV[1])
-if removed > 0 then
-    redis.call('DECR', KEYS[4])
-else
-    removed = redis.call('ZREM', KEYS[2], ARGV[1])
-    if removed > 0 then
-        redis.call('DECR', KEYS[5])
-    end
+local removed = 0
+for i = 1, 3 do
+    removed = redis.call('LREM', KEYS[i], 1, ARGV[1])
+    if removed > 0 then break end
+end
+if removed == 0 then
+    removed = redis.call('ZREM', KEYS[4], ARGV[1])
 end
 if removed > 0 then
-    redis.call('HSET', KEYS[3], 'status', 'Cancelled', 'finished_at', ARGV[2])
+    redis.call('HSET', KEYS[5], 'status', 'Cancelled', 'finished_at', ARGV[2])
     return 1
 end
 return 0
@@ -286,8 +327,7 @@ async def cancel(r, task_id: str, by: Optional[str] = None) -> tuple[bool, str]:
         return False, status
     ok = await r.eval(
         CANCEL_SCRIPT, 5,
-        queue_key(meta.get("priority", "default")), "delayed_tasks", task_key(task_id),
-        "stats:pending", "stats:delayed",
+        *queue_keys(payload_queue(meta)), "delayed_tasks", task_key(task_id),
         payload, str(time.time()),
     )
     if ok:
@@ -326,7 +366,8 @@ def public_view(meta: dict) -> dict:
     return out
 
 
-async def recent_tasks(r, limit: int = 50, status: Optional[str] = None, task_name: Optional[str] = None) -> list[dict]:
+async def recent_tasks(r, limit: int = 50, status: Optional[str] = None, task_name: Optional[str] = None,
+                       queue: Optional[str] = None) -> list[dict]:
     """Newest-first task history, optionally filtered by status / task name.
 
     Reads the history in small batches and stops as soon as `limit` rows are
@@ -337,7 +378,7 @@ async def recent_tasks(r, limit: int = 50, status: Optional[str] = None, task_na
     history = max(1, settings.HISTORY_LIMIT)
     out: list[dict] = []
     seen: set = set()
-    batch = limit if not (status or task_name) else 100
+    batch = limit if not (status or task_name or queue) else 100
     start = 0
     while start < history:
         stop = min(start + batch, history) - 1
@@ -356,6 +397,8 @@ async def recent_tasks(r, limit: int = 50, status: Optional[str] = None, task_na
             if status and meta.get("status", "").lower() != status.lower():
                 continue
             if task_name and meta.get("task_name") != task_name:
+                continue
+            if queue and payload_queue(meta) != queue:
                 continue
             out.append(public_view(meta))
             if len(out) >= limit:
@@ -440,3 +483,59 @@ async def publish_registry(r, specs: dict[str, dict]) -> None:
         pipe.zadd(REGISTRY_SEEN_KEY, {k: now for k in specs})
         pipe.publish(EVENTS_CHANNEL, "update")
         await pipe.execute()
+
+
+async def queue_overview(r) -> dict:
+    """
+    How many jobs are where, counted from Redis itself (two round trips).
+
+    These used to be separate counters that every step incremented and
+    decremented by hand; they drifted (crashes, recoveries, cancellations) and
+    could even go negative. Counting the lists themselves is always right.
+    Each queue also reports how many live workers serve it.
+    """
+    now = time.time()
+    async with r.pipeline(transaction=False) as pipe:
+        pipe.smembers(QUEUES_KEY)
+        pipe.zrangebyscore("active_workers", now, "+inf")
+        pipe.zcard("delayed_tasks")
+        pipe.llen("dlq")
+        names, live_workers, delayed, dlq = await pipe.execute()
+    live_workers = list(live_workers)
+    async with r.pipeline(transaction=False) as pipe:
+        for worker in live_workers:
+            pipe.llen(f"processing_queue:{worker}")
+            pipe.hget(f"worker:{worker}", "queues")
+        known = sorted(set(names or ()) | {DEFAULT_QUEUE})
+        for name in known:
+            for key in queue_keys(name):
+                pipe.llen(key)
+        counts = await pipe.execute()
+
+    served: dict[str, int] = {}
+    processing = 0
+    for i, _worker in enumerate(live_workers):
+        processing += counts[2 * i]
+        # Workers older than 0.4 don't report queues: they serve the default queue.
+        for q in (counts[2 * i + 1] or DEFAULT_QUEUE).split(","):
+            if q:
+                served[q] = served.get(q, 0) + 1
+    lengths = counts[2 * len(live_workers):]
+    names = sorted(set(known) | set(served), key=lambda n: (n != DEFAULT_QUEUE, n))
+    queues = []
+    for name in names:
+        if name in known:
+            i = known.index(name)
+            high, default, low = lengths[i * 3: i * 3 + 3]
+        else:
+            high = default = low = 0
+        queues.append({"name": name, "high": high, "default": default, "low": low,
+                       "total": high + default + low, "workers": served.get(name, 0)})
+    return {
+        "queues": queues,
+        "waiting": sum(q["total"] for q in queues),
+        "processing": processing,
+        "delayed": delayed,
+        "dlq": dlq,
+        "live_workers": live_workers,
+    }

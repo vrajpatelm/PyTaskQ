@@ -12,28 +12,30 @@ def get_client_ip(req: Request) -> str:
     """
     return req.client.host if req.client else "unknown"
 
-QUEUE_KEYS = ("queue:high", "queue:default", "queue:low")
+QUEUE_KEYS = ("queue:high", "queue:default", "queue:low")   # the "default" queue's lists
 RETRY_AFTER_SECONDS = 2
 
 
-def queue_full_error() -> HTTPException:
+def queue_full_error(queue: str = "default") -> HTTPException:
     from pytaskq.core import pressure
-    pressure.record("queue_full")
+    pressure.record("queue_full", f"queue '{queue}'")
     return HTTPException(
         status_code=429,
-        detail="Server is busy. Please retry after a few seconds.",
+        detail=f"Server is busy: queue '{queue}' is full. Please retry after a few seconds.",
         headers={"Retry-After": str(RETRY_AFTER_SECONDS)},
     )
 
 
-async def check_backpressure():
-    """Refuse new jobs (429) once the queues hold QUEUE_CAPACITY jobs. One Redis round trip."""
+async def check_backpressure(queue: str = "default"):
+    """Refuse new jobs (429) once a queue holds QUEUE_CAPACITY jobs. One Redis round trip."""
+    from pytaskq.core import queueing
     async with redis_client.r.pipeline(transaction=False) as pipe:
-        for key in QUEUE_KEYS:
+        for key in queueing.queue_keys(queue):
             pipe.llen(key)
         queue_len = sum(await pipe.execute())
     if queue_len >= settings.QUEUE_CAPACITY:
-        raise queue_full_error()
+        raise queue_full_error(queue)
+
 
 # ── Authentication & roles ────────────────────────────────────────────────────
 from urllib.parse import urlparse
