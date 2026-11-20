@@ -5,7 +5,8 @@
 #
 # Uses PyPI Trusted Publishing (OIDC) and the built-in GITHUB_TOKEN for GHCR,
 # so no secret is stored anywhere.
-# One-time setup on pypi.org is described in docs/RELEASING.md.
+# One-time setup: add this repository as a Trusted Publisher on pypi.org
+# (workflow release.yml, environment pypi).
 name: Release
 
 on:

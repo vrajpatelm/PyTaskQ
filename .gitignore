@@ -59,3 +59,6 @@ run-*.html
 *_stats_history.csv
 *_failures.csv
 *_exceptions.csv
+
+# Maintainer notes kept locally
+docs/RELEASING.md
