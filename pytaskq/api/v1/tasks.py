@@ -7,7 +7,7 @@ from pydantic import BaseModel, Field
 from pytaskq.core import queueing, redis_client
 from pytaskq.core import auth
 from pytaskq.core.config import settings
-from pytaskq.core.dependencies import QUEUE_KEYS, queue_full_error, require
+from pytaskq.core.dependencies import queue_full_error, require
 
 # Reading needs "viewer"; anything that changes jobs needs "operator".
 router = APIRouter(prefix="/task", tags=["tasks"], dependencies=[Depends(require("viewer"))])
@@ -20,6 +20,8 @@ class EnqueueRequest(BaseModel):
     args: List[Any] = Field(default_factory=list, examples=[[100]])
     kwargs: Dict[str, Any] = Field(default_factory=dict)
     priority: Optional[Literal["high", "default", "low"]] = None
+    queue: Optional[str] = Field(None, pattern=queueing.QUEUE_NAME_RE.pattern,
+                                 description="Named queue (default: the task's own queue)")
     delay_seconds: float = Field(0, ge=0, le=queueing.MAX_DELAY_SECONDS, allow_inf_nan=False,
                                  description="Run after this many seconds (0 = now, at most a year)")
     on_success_url: Optional[str] = None
@@ -35,10 +37,13 @@ IdempotencyHeader = Header(
 async def _validated_payload(req: EnqueueRequest, delay_seconds: float, key: Optional[str]):
     """Returns (payload, None) to queue, or (None, original response) for a repeated Idempotency-Key.
 
-    The queue-full check, the task lookup and the idempotency lookup share one Redis round trip.
+    The queue-full check, the task lookup and the idempotency lookup share one
+    Redis round trip (a second one only when the task lives on another queue
+    than the one guessed, to measure that queue).
     """
+    guess = req.queue or queueing.DEFAULT_QUEUE
     async with redis_client.r.pipeline(transaction=False) as pipe:
-        for k in QUEUE_KEYS:
+        for k in queueing.queue_keys(guess):
             pipe.llen(k)
         cutoff = queueing.queue_registry_lookup(pipe, req.task_name)
         if key:
@@ -46,16 +51,23 @@ async def _validated_payload(req: EnqueueRequest, delay_seconds: float, key: Opt
         results = await pipe.execute()
     lengths, (raw_spec, seen, count) = results[:3], results[3:6]
     spec, advertised = queueing.parse_registry_lookup(raw_spec, seen, count, cutoff)
+    queue = req.queue or (spec or {}).get("queue") or queueing.DEFAULT_QUEUE
     payload = queueing.new_payload(
         req.task_name, req.args, req.kwargs,
         priority=req.priority or (spec or {}).get("priority") or "default",
+        queue=queueing.payload_queue({"queue": queue}),
         on_success_url=req.on_success_url,
     )
     if key and results[6]:
         # A retry of a request that already queued its job: answer it even if the queue is now full.
         return None, queueing._duplicate(results[6], queueing._fingerprint(payload, float(delay_seconds or 0)))
+    if payload["queue"] != guess:
+        async with redis_client.r.pipeline(transaction=False) as pipe:
+            for k in queueing.queue_keys(payload["queue"]):
+                pipe.llen(k)
+            lengths = await pipe.execute()
     if sum(lengths) >= settings.QUEUE_CAPACITY:
-        raise queue_full_error()
+        raise queue_full_error(payload["queue"])
     if spec is None and advertised:
         registry = await queueing.registered_tasks(redis_client.r)
         available = sorted(t["name"] for t in registry if not t.get("internal"))
@@ -125,10 +137,12 @@ async def cancel_task(task_id: str, user: auth.User = Depends(require("operator"
 async def list_tasks(
     status: Optional[str] = Query(None, description="Filter by status, e.g. Success, DeadLetter"),
     task_name: Optional[str] = None,
+    queue: Optional[str] = Query(None, description="Filter by named queue"),
     limit: int = Query(50, ge=1, le=500),
 ):
     """Recent tasks, newest first."""
-    tasks = await queueing.recent_tasks(redis_client.r, limit=limit, status=status, task_name=task_name)
+    tasks = await queueing.recent_tasks(redis_client.r, limit=limit, status=status, task_name=task_name,
+                                        queue=queue)
     return {"tasks": tasks, "count": len(tasks)}
 
 

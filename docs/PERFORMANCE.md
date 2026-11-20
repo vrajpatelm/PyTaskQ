@@ -8,7 +8,7 @@ PyTaskQ's defaults handle a few hundred requests a second on a small server. Thi
 
 Measured with the load test in [`loadtest/`](../loadtest) on 2 CPU cores, with sign-in on, the API, a worker and Redis on the same machine, and `WORKER_IO_WORKERS=32`. Each simulated user queues a job, checks it, and looks at the job list and metrics, with a pause of 0.5 to 2 seconds between actions. Every stage ran for 2 minutes.
 
-| 500 users at once | 0.3.1 | 0.3.2 |
+| 500 users at once | 0.3.1 | 0.4 |
 |---|---|---|
 | Requests answered per second | 282 | 350 |
 | Typical response (median) | 320 ms | 16 ms |
@@ -17,11 +17,11 @@ Measured with the load test in [`loadtest/`](../loadtest) on 2 CPU cores, with s
 | Refused: "queue full" (429) | 0% | 7.9% |
 | Jobs finished per second | 121 | 146 |
 
-The 429s in 0.3.2 are not an error. 500 users created about 175 jobs a second, more than one worker on 2 cores can finish (about 146 a second for this test job). The queue absorbed the difference until it was full, and then PyTaskQ told clients to retry instead of letting Redis fill up. In 0.3.1 the same overload showed up as 503 errors spread across *every* endpoint, including just looking at the dashboard.
+The 429s in 0.4 are not an error. 500 users created about 175 jobs a second, more than one worker on 2 cores can finish (about 146 a second for this test job). The queue absorbed the difference until it was full, and then PyTaskQ told clients to retry instead of letting Redis fill up. In 0.3.1 the same overload showed up as 503 errors spread across *every* endpoint, including just looking at the dashboard.
 
-At 400 users, who create jobs a little slower than the worker finishes them, 0.3.2 refused nothing: 291 requests a second, a median response of 8 ms, the slowest 5% under 60 ms, and only 13 jobs left waiting at the end. That's the sustained capacity of this setup. See [Sizing](#sizing) for what to add when you need more.
+At 400 users, who create jobs a little slower than the worker finishes them, 0.4 refused nothing: 291 requests a second, a median response of 8 ms, the slowest 5% under 60 ms, and only 13 jobs left waiting at the end. That's the sustained capacity of this setup. See [Sizing](#sizing) for what to add when you need more.
 
-## What changed in 0.3.2
+## What changed in 0.4
 
 Every request used to make several Redis calls one after another, and each call held one of only 100 connections while it waited. Under load the connections ran out, and requests failed with 503 instead of waiting.
 
@@ -41,7 +41,7 @@ Nothing is cached in a way that changes behaviour: revoking a token, ending a se
 
 | You see | It means | Fix |
 |---|---|---|
-| **429** "Server is busy" on `POST /task/enqueue` | The queue holds `QUEUE_CAPACITY` jobs. Workers are finishing jobs more slowly than they arrive. | Add workers, or raise `WORKER_IO_WORKERS`. Raise `QUEUE_CAPACITY` only to absorb short bursts. |
+| **429** "Server is busy: queue '…' is full" on `POST /task/enqueue` | That queue holds `QUEUE_CAPACITY` jobs. Workers serving it are finishing jobs more slowly than they arrive. | Add workers, or raise `WORKER_IO_WORKERS`. Raise `QUEUE_CAPACITY` only to absorb short bursts. |
 | **503** "Redis is unavailable", detail "The server is busy" | Every Redis connection stayed busy for `REDIS_POOL_TIMEOUT` seconds. | Raise `REDIS_MAX_CONNECTIONS`. If the server's CPU is at 100%, it needs more cores instead. |
 | **503** "Redis is unavailable", detail "temporarily down" | Redis couldn't be reached at all. | `docker compose logs redis`. Check `REDIS_URL` / `REDIS_HOST`. |
 
@@ -61,7 +61,9 @@ All of these go in `.env` (or the environment). Restart after changing them.
 |---|---|---|
 | `WORKER_IO_WORKERS` | cores × 4, at least 4 | Jobs each worker runs at once, besides CPU jobs. The biggest lever for jobs that mostly wait: HTTP calls, email, database queries, `async` tasks. Doesn't help CPU-heavy jobs. |
 | `WORKER_CPU_WORKERS` | cores − 1 | Processes for `type="cpu"` jobs. More than the number of cores doesn't help. |
-| `QUEUE_CAPACITY` | 500 | Jobs that can wait before new ones get 429. A bigger queue absorbs longer bursts but doesn't make workers faster. |
+| `QUEUE_CAPACITY` | 500 | Jobs that can wait in **each** queue before new ones for it get 429. A bigger queue absorbs longer bursts but doesn't make workers faster. |
+| `WORKER_QUEUES` | the worker's tasks' queues | Which queues a worker serves (`--queues`). See [QUEUES.md](QUEUES.md). |
+| `MAX_RESULT_BYTES` | 1,000,000 | Larger results aren't stored in Redis (the job still succeeds). `0` = no limit. |
 | `WEB_WORKERS` | 1 | API processes. `0` means one per CPU core. Same as `pytaskq dashboard --workers N`. |
 | `REDIS_MAX_CONNECTIONS` | 200 | Redis connections per process. Redis accepts 10,000 by default, so raising this is safe. A value in `REDIS_URL` (`?max_connections=1000`) also works. |
 | `REDIS_POOL_TIMEOUT` | 5 | Seconds a request waits for a free connection before a 503. |
@@ -72,6 +74,7 @@ In Docker, each container can open only 1024 files by default, and every client 
 
 ## Sizing
 
+- **Give heavy work its own queue.** Put slow or bursty tasks on their own queue (`@queue.task(queue="images")`) and run a worker for it with `--queues images`, on a bigger machine if needed. A flood of image jobs then can't delay emails, and each queue has its own `QUEUE_CAPACITY`. See [QUEUES.md](QUEUES.md).
 - **Workers do the work.** If jobs pile up (429s), add workers before anything else. Workers can run on any machine that reaches your Redis, and they share the queue automatically:
   ```bash
   docker compose up -d --scale worker=3          # more on the same machine

@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import os
 
-from pytaskq.core import pressure, redis_client
+from pytaskq.core import pressure, queueing, redis_client
 from pytaskq.core.config import settings
 
 WINDOW_MINUTES = 15
@@ -30,8 +30,9 @@ def _suggest(level: str, title: str, detail: str, setting: str = "") -> dict:
     return {"level": level, "title": title, "detail": detail, "setting": setting}
 
 
-def suggestions(*, turned_away: dict, workers: list[dict], queue_total: int, cores: int, processes: int,
+def suggestions(*, turned_away: dict, workers: list[dict], queues: list[dict], cores: int, processes: int,
                 pool_max: int) -> list[dict]:
+    """`queues` is queueing.queue_overview()["queues"]: [{name, total, workers, …}]."""
     out: list[dict] = []
     live = [w for w in workers if w.get("status") != "dead"]
     slots = sum((w.get("cpu_workers") or 0) + (w.get("io_workers") or 0) for w in live)
@@ -46,6 +47,16 @@ def suggestions(*, turned_away: dict, workers: list[dict], queue_total: int, cor
             "critical", "No workers are running",
             "Queued jobs wait until a worker starts. Start one with `pytaskq worker --app your_module:queue`.",
         ))
+    else:
+        for q in queues:
+            if q.get("total") and not q.get("workers"):
+                out.append(_suggest(
+                    "critical", f"{q['total']:,} jobs are waiting in queue '{q['name']}', but no worker serves it",
+                    "They'll wait until a worker takes that queue. Start a worker for it with "
+                    f"`pytaskq worker --app your_module:queue --queues {q['name']}`, or add it to an existing "
+                    f"worker's `--queues` list. A worker serves its own tasks' queues by default, so this usually "
+                    "means the worker for these tasks isn't running.",
+                ))
 
     if redis_down:
         out.append(_suggest(
@@ -83,11 +94,22 @@ def suggestions(*, turned_away: dict, workers: list[dict], queue_total: int, cor
                 "absorbs bursts like this; workers catch up afterwards.",
                 f"QUEUE_CAPACITY={capacity * 2}",
             ))
-    elif queue_total >= 0.7 * capacity:
+    else:
+        for q in queues:
+            if q.get("total", 0) >= 0.7 * capacity:
+                out.append(_suggest(
+                    "warning", f"Queue '{q['name']}' is {round(100 * q['total'] / capacity)}% full",
+                    f"{q['total']:,} of {capacity:,} slots are used. New jobs for it are refused (HTTP 429) once "
+                    "it is full. If it keeps growing, add a worker that serves it.",
+                ))
+
+    handed_back = turned_away.get("handed_back", 0)
+    if handed_back:
         out.append(_suggest(
-            "warning", f"The queue is {round(100 * queue_total / capacity)}% full",
-            f"{queue_total} of {capacity} slots are used. New jobs are refused (HTTP 429) once it is full. "
-            "If it keeps growing, add a worker.",
+            "warning", f"Workers handed back {handed_back:,} jobs they couldn't run",
+            "Two apps share a queue, so a worker sometimes takes a job whose task it doesn't have and has to "
+            "put it back. Those jobs still run, just later. Give each app its own queue: "
+            "`PyTaskQ(default_queue=\"emails\")` or `@queue.task(queue=\"emails\")`.",
         ))
 
     if cores >= 4 and processes < min(cores, 4):
@@ -109,10 +131,8 @@ def suggestions(*, turned_away: dict, workers: list[dict], queue_total: int, cor
 async def build_report(workers: list[dict]) -> dict:
     r = redis_client.r
     turned_away = await pressure.recent(r, WINDOW_MINUTES)
-    async with r.pipeline(transaction=False) as pipe:
-        for key in ("queue:high", "queue:default", "queue:low"):
-            pipe.llen(key)
-        queue_total = sum(await pipe.execute())
+    overview = await queueing.queue_overview(r)
+    queue_total = overview["waiting"]
     pool = redis_client.pool_stats()
     cores = os.cpu_count() or 1
     processes = api_processes()
@@ -123,6 +143,7 @@ async def build_report(workers: list[dict]) -> dict:
             "queue_full": turned_away.get("queue_full", 0),
             "redis_busy": turned_away.get("redis_busy", 0),
             "redis_down": turned_away.get("redis_down", 0),
+            "handed_back": turned_away.get("handed_back", 0),
         },
         "api": {
             "processes": processes,
@@ -130,14 +151,15 @@ async def build_report(workers: list[dict]) -> dict:
             "redis_connections": pool,
             "live_updates_per_second": settings.LIVE_UPDATES_PER_SECOND,
         },
-        "queue": {"total": queue_total, "capacity": settings.QUEUE_CAPACITY},
+        "queue": {"total": queue_total, "capacity": settings.QUEUE_CAPACITY},   # capacity is per queue
+        "queues": overview["queues"],
         "workers": {
             "count": len(live),
             "slots": sum((w.get("cpu_workers") or 0) + (w.get("io_workers") or 0) for w in live),
             "running": sum(w.get("active") or 0 for w in live),
         },
         "suggestions": suggestions(
-            turned_away=turned_away, workers=workers, queue_total=queue_total,
+            turned_away=turned_away, workers=workers, queues=overview["queues"],
             cores=cores, processes=processes, pool_max=pool["max_connections"],
         ),
     }

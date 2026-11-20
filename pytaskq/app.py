@@ -18,6 +18,12 @@ pytaskq.app — the PyTaskQ SDK
     @queue.task(cron="*/5 * * * *")              # runs every 5 minutes on the fleet
     def cleanup(): ...
 
+    @queue.task(cron="0 9 * * 1-5", tz="Asia/Kolkata")   # 09:00 India time (default: UTC)
+    def morning_digest(): ...
+
+    @queue.task(queue="images", type="cpu")      # only workers serving "images" run it
+    def resize(path): ...
+
     # Enqueue from async code
     await render_report.delay(42, fmt="csv")
     await render_report.delay(42, idempotency_key=f"report-42")   # safe to retry: queued once
@@ -50,7 +56,7 @@ TASK_TYPES = ("cpu", "io", "async")
 
 # Option names `delay()` treats as queue options rather than task kwargs —
 # unless the task function itself declares a parameter with that name.
-_DELAY_OPTIONS = ("priority", "on_success_url", "idempotency_key")
+_DELAY_OPTIONS = ("priority", "queue", "on_success_url", "idempotency_key")
 
 
 def _redis():
@@ -94,7 +100,9 @@ def describe_tasks(tasks: dict[str, dict]) -> dict[str, dict]:
         out[task_name] = {
             "type": entry.get("type", "cpu"),
             "cron": entry.get("cron"),
+            "tz": (entry.get("tz") or settings.CRON_TIMEZONE) if entry.get("cron") else None,
             "priority": entry.get("priority", "default"),
+            "queue": entry.get("queue") or queueing.DEFAULT_QUEUE,
             "max_retries": entry.get("max_retries") if entry.get("max_retries") is not None else settings.MAX_RETRIES,
             "timeout": entry.get("timeout") if entry.get("timeout") is not None else settings.TASK_TIMEOUT,
             "doc": doc.split("\n\n")[0].strip(),
@@ -112,6 +120,7 @@ class PyTaskQ:
         name: str = "pytaskq",
         *,
         default_priority: str = "default",
+        default_queue: str = queueing.DEFAULT_QUEUE,
         max_retries: Optional[int] = None,
         timeout: Optional[float] = None,
         include_builtins: bool = True,
@@ -120,6 +129,7 @@ class PyTaskQ:
             raise ValueError(f"default_priority must be one of {queueing.PRIORITIES}")
         self.name = name
         self.default_priority = default_priority
+        self.default_queue = queueing.check_queue_name(default_queue)
         self.max_retries = max_retries
         self.timeout = timeout
         self.TASKS: dict[str, dict] = {}
@@ -135,6 +145,8 @@ class PyTaskQ:
         type: Optional[str] = None,
         cron: Optional[str] = None,
         priority: Optional[str] = None,
+        queue: Optional[str] = None,
+        tz: Optional[str] = None,
         max_retries: Optional[int] = None,
         timeout: Optional[float] = None,
     ):
@@ -145,7 +157,12 @@ class PyTaskQ:
         type        "cpu" (process pool), "io" (thread pool) or "async" (event loop).
                     Defaults to "async" for `async def`, otherwise "cpu".
         cron        Standard 5-field cron expression; the fleet enqueues it on schedule.
-        priority    Default queue for this task: "high", "default" or "low".
+        tz          Time zone the cron expression is read in, e.g. "Europe/London"
+                    (default: the CRON_TIMEZONE setting, which is UTC).
+        priority    "high", "default" or "low" within its queue.
+        queue       Named queue (default "default", or the app's default_queue). Only
+                    workers serving this queue run the task: use it to give a kind of
+                    work its own workers (e.g. heavy jobs on a big machine).
         max_retries Attempts after the first failure before dead-lettering (default 3).
         timeout     Seconds before the attempt is abandoned (default TASK_TIMEOUT).
         """
@@ -169,6 +186,11 @@ class PyTaskQ:
                 import croniter
                 if not croniter.croniter.is_valid(cron):
                     raise ValueError(f"Invalid cron expression for {fn.__name__}: {cron!r}")
+            if tz is not None:
+                if cron is None:
+                    raise ValueError(f"{fn.__name__}: tz= only applies to cron tasks")
+                _check_time_zone(tz)
+            task_queue = queueing.check_queue_name(self.default_queue if queue is None else queue)
             if max_retries is not None and max_retries < 0:
                 raise ValueError("max_retries must be >= 0")
 
@@ -182,7 +204,9 @@ class PyTaskQ:
                 "handler": fn,
                 "type": task_type,
                 "cron": cron,
+                "tz": tz,
                 "priority": prio,
+                "queue": task_queue,
                 "max_retries": retries,
                 "timeout": limit,
             }
@@ -193,11 +217,13 @@ class PyTaskQ:
                 return kwargs, opts
 
             async def apply_async(args=None, kwargs=None, *, priority: Optional[str] = None,
+                                  queue: Optional[str] = None,
                                   countdown: float = 0, on_success_url: Optional[str] = None,
                                   task_id: Optional[str] = None, idempotency_key: Optional[str] = None) -> dict:
                 payload = queueing.new_payload(
                     task_name, args, kwargs,
                     priority=priority or prio,
+                    queue=task_queue if queue is None else queue,
                     on_success_url=on_success_url,
                     max_retries=retries,
                     timeout=limit,
@@ -220,6 +246,7 @@ class PyTaskQ:
                 return _run_sync(lambda r: queueing.enqueue(
                     r,
                     queueing.new_payload(task_name, args, kwargs, priority=opts.get("priority") or prio,
+                                         queue=opts.get("queue", task_queue),
                                          on_success_url=opts.get("on_success_url"),
                                          max_retries=retries, timeout=limit),
                     idempotency_key=opts.get("idempotency_key"),
@@ -230,6 +257,7 @@ class PyTaskQ:
             fn.apply_async = apply_async
             fn.delay_sync = delay_sync
             fn.task_name = task_name
+            fn.queue = task_queue
             return fn
 
         if func is not None and callable(func):
@@ -271,6 +299,19 @@ class PyTaskQ:
         return f"<PyTaskQ {self.name!r} tasks={sorted(self.TASKS)}>"
 
 
+def _check_time_zone(name: str) -> None:
+    if not isinstance(name, str) or not name.strip():
+        raise ValueError("tz must be a time zone name such as 'UTC' or 'Europe/London'")
+    if name.strip().upper() == "UTC":
+        return
+    try:
+        from zoneinfo import ZoneInfo
+        ZoneInfo(name.strip())
+    except Exception:
+        raise ValueError(f"Unknown time zone {name!r}. Use a name like 'UTC', 'Europe/London' "
+                         f"or 'Asia/Kolkata'.") from None
+
+
 def _run_sync(coro_factory):
     try:
         asyncio.get_running_loop()
@@ -293,16 +334,19 @@ def _run_sync(coro_factory):
 # ── Built-in task: reliable webhook delivery ────────────────────────────────────
 # Enqueued by the worker after a task with `on_success_url` succeeds. It goes
 # through the queue like any other task, so it gets retries and the DLQ.
-def _deliver_webhook(url: str, task_id: str, task_name: str, result: str):
+def _deliver_webhook(url: str, task_id: str, task_name: str, result: str, result_dropped: str = ""):
     """Deliver a signed POST to a task's on_success_url."""
     assert_safe_url(url)
 
-    payload = json.dumps({
+    body = {
         "event": "task.success",
         "task_id": task_id,
         "task_name": task_name,
         "result": result,
-    }).encode("utf-8")
+    }
+    if result_dropped:
+        body["result_dropped"] = result_dropped   # the result was over MAX_RESULT_BYTES
+    payload = json.dumps(body).encode("utf-8")
 
     # Optional HMAC-SHA256 signing if WEBHOOK_SECRET is set
     secret = os.environ.get("WEBHOOK_SECRET", "")

@@ -233,7 +233,8 @@ function PerformanceSection() {
           <div className="stats">
             <Stat label={`Turned away, last ${report.window_minutes} min`} value={n(refused)}
               note={refused ? `${n(away.queue_full)} queue full, ${n(away.redis_busy)} Redis busy, ${n(away.redis_down)} Redis down` : 'none'} />
-            <Stat label="Queue" value={`${report.queue.total} / ${report.queue.capacity}`} note="jobs waiting / QUEUE_CAPACITY" />
+            <Stat label="Waiting" value={n(report.queue.total)}
+              note={`across ${(report.queues || []).filter(q => q.total > 0 || q.workers > 0).length || 1} queue(s); each holds up to ${n(report.queue.capacity)}`} />
             <Stat label="Workers" value={`${report.workers.running} / ${report.workers.slots}`}
               note={`jobs running / job slots, on ${report.workers.count} worker${report.workers.count === 1 ? '' : 's'}`} />
             <Stat label="API" value={`${report.api.processes} of ${report.api.cpu_cores}`}

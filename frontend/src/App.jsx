@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   Play, ListChecks, Server, Skull, Search, X,
   RotateCcw, Trash2, Ban, Clock, Cpu, Zap, Waves, Terminal, ChevronRight,
-  Settings as SettingsIcon, UserRound, Pause, ArrowUp,
+  Settings as SettingsIcon, UserRound, Pause, ArrowUp, AlertTriangle, Layers,
 } from 'lucide-react'
 import {
   api, WS_URL, STATUS, FINAL, CANCELLABLE, timeAgo, formatDuration, formatClock,
@@ -23,6 +23,14 @@ const TABS = [
 const EMPTY_METRICS = {
   pending: 0, processing: 0, delayed: 0, dlq: 0, completed_total: 0, failed_total: 0,
   queue_high: 0, queue_default: 0, queue_low: 0, queue_total: 0, queue_capacity: 500, worker_count: 0,
+  queues: [], fullest_queue: { name: 'default', total: 0 },
+};
+
+// Queues that matter right now: they have jobs waiting or a worker serving them.
+const queuesInUse = m => (m.queues || []).filter(q => q.total > 0 || q.workers > 0);
+const showsQueues = m => {
+  const used = queuesInUse(m);
+  return used.length > 1 || (used.length === 1 && used[0].name !== 'default');
 };
 
 // ── small pieces ─────────────────────────────────────────────────────────────
@@ -54,9 +62,12 @@ function Toasts({ toasts, dismiss }) {
 // ── lifecycle strip: where every job is right now ────────────────────────────
 
 function Lifecycle({ m, onAdvice }) {
-  const pct = Math.min(100, (m.queue_total / (m.queue_capacity || 1)) * 100);
-  const full = m.queue_capacity > 0 && m.queue_total >= m.queue_capacity;
+  // Each queue has its own capacity: the bar shows the fullest one.
+  const fullest = m.fullest_queue || { name: 'default', total: m.queue_total };
+  const pct = Math.min(100, (fullest.total / (m.queue_capacity || 1)) * 100);
+  const full = m.queue_capacity > 0 && fullest.total >= m.queue_capacity;
   const nearly = !full && pct >= 90;
+  const which = showsQueues(m) ? `Queue '${fullest.name}'` : 'Queue';
   const capTone = pct >= 90 ? 'danger' : pct >= 70 ? 'warning' : 'ok';
   return (
     <section className="lifecycle" aria-label="Job lifecycle">
@@ -69,12 +80,14 @@ function Lifecycle({ m, onAdvice }) {
       <div className="stage">
         <div className="stage-name">Queued</div>
         <div className="stage-count">{m.queue_total}</div>
-        <div className={`capacity cap-${capTone}`} title={`${m.queue_total} of ${m.queue_capacity} queue slots used`}>
+        <div className={`capacity cap-${capTone}`}
+          title={`Fullest queue '${fullest.name}': ${fullest.total} of ${m.queue_capacity} slots used`}>
           <div style={{ width: `${pct}%` }} />
         </div>
         {full || nearly ? (
           <div className="stage-note queue-full" role="status">
-            {full ? 'Full: new jobs are refused.' : 'Nearly full.'} <button className="link" onClick={onAdvice}>What to change</button>
+            {full ? `${which} full: new jobs are refused.` : `${which} nearly full.`}{' '}
+            <button className="link" onClick={onAdvice}>What to change</button>
           </div>
         ) : (
           <div className="stage-note split">
@@ -99,6 +112,29 @@ function Lifecycle({ m, onAdvice }) {
           <div className={`stage-count ${m.dlq ? 'tone-text-danger' : ''}`}>{m.dlq}</div>
         </div>
       </div>
+    </section>
+  );
+}
+
+function QueueStrip({ m, active, onPick }) {
+  const queues = queuesInUse(m);
+  return (
+    <section className="queue-strip" aria-label="Queues">
+      <span className="queue-strip-label">Queues</span>
+      {queues.map(q => {
+        const stranded = q.total > 0 && q.workers === 0;
+        return (
+          <button key={q.name} className={`queue-chip ${stranded ? 'stranded' : ''} ${active === q.name ? 'active' : ''}`}
+            aria-pressed={active === q.name} onClick={() => onPick(active === q.name ? '' : q.name)}
+            title={stranded ? 'Jobs are waiting but no running worker serves this queue' : `Show jobs on queue '${q.name}'`}>
+            <span className="queue-chip-name">{q.name}</span>
+            <span className="queue-chip-count">{q.total} waiting</span>
+            <span className="queue-chip-workers">
+              {stranded ? <><AlertTriangle size={12} /> no worker</> : `${q.workers} worker${q.workers === 1 ? '' : 's'}`}
+            </span>
+          </button>
+        );
+      })}
     </section>
   );
 }
@@ -192,7 +228,8 @@ function GroupRow({ g, open, toggle }) {
   );
 }
 
-function JobsView({ tasks, filter, setFilter, nameFilter, setNameFilter, taskNames, onOpen, loading }) {
+function JobsView({ tasks, filter, setFilter, nameFilter, setNameFilter, queueFilter, setQueueFilter, queueNames,
+  taskNames, onOpen, loading }) {
   const [lookup, setLookup] = useState('');
   const [grouped, setGrouped] = useState(() => storage.get('groupRepeats', true));
   const [paused, setPaused] = useState(false);
@@ -256,6 +293,12 @@ function JobsView({ tasks, filter, setFilter, nameFilter, setNameFilter, taskNam
           ))}
         </div>
         <div className="toolbar-right">
+          {(queueNames.length > 1 || queueFilter) && (
+            <select value={queueFilter} onChange={e => changeFilter(setQueueFilter)(e.target.value)} aria-label="Filter by queue">
+              <option value="">All queues</option>
+              {queueNames.map(n => <option key={n} value={n}>{n}</option>)}
+            </select>
+          )}
           <select value={nameFilter} onChange={e => changeFilter(setNameFilter)(e.target.value)} aria-label="Filter by task">
             <option value="">All tasks</option>
             {taskNames.map(n => <option key={n} value={n}>{n}</option>)}
@@ -290,7 +333,7 @@ function JobsView({ tasks, filter, setFilter, nameFilter, setNameFilter, taskNam
 
       {shown.length === 0 ? (
         <div className="empty">
-          {loading ? 'Loading jobs…' : filter || nameFilter
+          {loading ? 'Loading jobs…' : filter || nameFilter || queueFilter
             ? 'No jobs match these filters.'
             : <>No jobs yet. Open <strong>Run a task</strong> to queue your first one.</>}
         </div>
@@ -373,6 +416,7 @@ function TaskDrawer({ taskId, onClose, notify, refreshKey, canOperate }) {
             </div>
             <dl className="facts">
               <Field label="Priority"><span className={`prio prio-${task.priority}`}>{task.priority || 'default'}</span></Field>
+              <Field label="Queue">{task.queue || 'default'}</Field>
               <Field label="Queued">{formatClock(task.created_at)}</Field>
               {task.scheduled_for && <Field label="Runs at">{formatClock(task.scheduled_for)}</Field>}
               {task.started_at && <Field label="Started">{formatClock(task.started_at)}</Field>}
@@ -390,6 +434,7 @@ function TaskDrawer({ taskId, onClose, notify, refreshKey, canOperate }) {
 
             {task.error && (<><h3>Error</h3><pre className="code code-error">{task.error}</pre></>)}
             {result && (<><h3>Result</h3><pre className="code">{result}</pre></>)}
+            {task.result_dropped && (<><h3>Result</h3><p className="callout-inline"><AlertTriangle size={14} /> {task.result_dropped}</p></>)}
 
             <div className="drawer-actions">
               <CopyButton text={taskId} />
@@ -480,7 +525,12 @@ function RunView({ registered, onQueued, notify }) {
                 <button className={`task-pick ${t.name === name ? 'active' : ''}`} onClick={() => { setName(t.name); setValues({}); }}>
                   <span className="task-pick-name"><TypeIcon type={t.type} /> {t.name}</span>
                   {t.doc && <span className="task-pick-doc">{t.doc}</span>}
-                  {t.cron && <span className="task-pick-cron"><Clock size={12} /> {t.cron}</span>}
+                  {(t.cron || (t.queue && t.queue !== 'default')) && (
+                    <span className="task-pick-meta">
+                      {t.queue && t.queue !== 'default' && <span className="task-pick-cron"><Layers size={12} /> {t.queue}</span>}
+                      {t.cron && <span className="task-pick-cron"><Clock size={12} /> {t.cron}{t.tz && t.tz !== 'UTC' ? ` (${t.tz})` : ' UTC'}</span>}
+                    </span>
+                  )}
                 </button>
               </li>
             ))}
@@ -495,6 +545,7 @@ function RunView({ registered, onQueued, notify }) {
             <p className="muted small">
               {spec.type === 'cpu' ? 'Runs in a separate process' : spec.type === 'async' ? 'Runs on the worker event loop' : 'Runs in a worker thread'}
               {' '}· retried up to {spec.max_retries}× · times out after {spec.timeout ? `${spec.timeout}s` : 'never'}
+              {spec.queue && spec.queue !== 'default' && <> · queue <strong>{spec.queue}</strong></>}
             </p>
             {params.length === 0 && <p className="muted">This task takes no arguments.</p>}
             {params.map(p => (
@@ -559,12 +610,13 @@ function WorkersView({ workers }) {
     <div className="panel">
       <div className="table-wrap">
         <table>
-          <thead><tr><th>Worker</th><th>App</th><th className="num">Running</th><th className="num">Done</th><th className="num">Failed</th><th>Pools</th><th>Up</th><th>Health</th></tr></thead>
+          <thead><tr><th>Worker</th><th>App</th><th>Queues</th><th className="num">Running</th><th className="num">Done</th><th className="num">Failed</th><th>Pools</th><th>Up</th><th>Health</th></tr></thead>
           <tbody>
             {workers.map(w => (
               <tr key={w.worker_id}>
                 <td><div className="task-name">{w.hostname || 'worker'}{w.pid ? ` · pid ${w.pid}` : ''}</div><div className="task-id">{w.worker_id}</div></td>
                 <td>{w.app || <span className="muted">—</span>}</td>
+                <td className="small">{(w.queues || ['default']).join(', ')}</td>
                 <td className="num">{w.active}</td>
                 <td className="num">{w.processed}</td>
                 <td className="num">{w.failed}</td>
@@ -671,6 +723,7 @@ function Dashboard({ me, authEnabled, onSignOut, theme, setTheme }) {
   const [loadingTasks, setLoadingTasks] = useState(true);
   const [filter, setFilter] = useState('');
   const [nameFilter, setNameFilter] = useState('');
+  const [queueFilter, setQueueFilter] = useState('');
   const [registered, setRegistered] = useState([]);
   const [workers, setWorkers] = useState([]);
   const [openId, setOpenId] = useState(null);
@@ -725,13 +778,14 @@ function Dashboard({ me, authEnabled, onSignOut, theme, setTheme }) {
       const q = new URLSearchParams({ limit: '100' });
       if (filter) q.set('status', filter);
       if (nameFilter) q.set('task_name', nameFilter);
+      if (queueFilter) q.set('queue', queueFilter);
       api(`/tasks?${q}`).then(d => setTasks(d.tasks || [])).catch(() => {}).finally(() => setLoadingTasks(false));
     };
     const wait = Math.max(0, 1000 - (Date.now() - lastFetch.current));
     clearTimeout(pending.current);
     pending.current = setTimeout(run, wait);
     return () => clearTimeout(pending.current);
-  }, [tick, filter, nameFilter]);
+  }, [tick, filter, nameFilter, queueFilter]);
 
   useEffect(() => {
     const load = () => {
@@ -750,6 +804,11 @@ function Dashboard({ me, authEnabled, onSignOut, theme, setTheme }) {
   }, [registered, tasks]);
 
   const workerCount = Math.max(metrics.worker_count || 0, workers.length);
+  const queueNames = useMemo(() => {
+    const s = new Set((metrics.queues || []).map(q => q.name));
+    registered.forEach(t => t.queue && s.add(t.queue));
+    return [...s].sort((a, b) => (a === 'default' ? -1 : b === 'default' ? 1 : a.localeCompare(b)));
+  }, [metrics.queues, registered]);
 
   return (
     <div className="shell">
@@ -769,6 +828,9 @@ function Dashboard({ me, authEnabled, onSignOut, theme, setTheme }) {
       </header>
 
       <Lifecycle m={{ ...metrics, worker_count: workerCount }} onAdvice={() => setTab('settings')} />
+      {showsQueues(metrics) && (
+        <QueueStrip m={metrics} active={queueFilter} onPick={q => { setQueueFilter(q); setTab('jobs'); }} />
+      )}
       {workerCount === 0 && tab !== 'workers' && <GettingStarted />}
 
 
@@ -789,7 +851,8 @@ function Dashboard({ me, authEnabled, onSignOut, theme, setTheme }) {
       <main>
         {tab === 'jobs' && (
           <JobsView tasks={tasks} filter={filter} setFilter={setFilter} nameFilter={nameFilter}
-            setNameFilter={setNameFilter} taskNames={taskNames} onOpen={setOpenId} loading={loadingTasks} />
+            setNameFilter={setNameFilter} queueFilter={queueFilter} setQueueFilter={setQueueFilter}
+            queueNames={queueNames} taskNames={taskNames} onOpen={setOpenId} loading={loadingTasks} />
         )}
         {tab === 'run' && (
           <RunView registered={registered} notify={notify} onQueued={() => {}} />

@@ -426,3 +426,22 @@ tr:hover .name-cell .icon-btn, .name-cell .icon-btn:focus-visible { opacity: 1; 
 .stat-note { font-size: 0.75rem; color: var(--text-secondary); }
 .perf-foot { display: flex; align-items: center; gap: 0.35rem; flex-wrap: wrap; margin: 0.9rem 0 0; }
 .perf-foot a { color: var(--accent-color); font-weight: 600; }
+
+/* ── Named queues ───────────────────────────────────────────────────────── */
+.queue-strip { display: flex; flex-wrap: wrap; align-items: center; gap: 0.5rem; margin: -0.5rem 0 1.25rem; }
+.queue-strip-label { font-size: 0.78rem; font-weight: 600; color: var(--text-secondary); margin-right: 0.15rem; }
+.queue-chip {
+  display: inline-flex; align-items: baseline; gap: 0.5rem; font: inherit; cursor: pointer;
+  padding: 0.35rem 0.75rem; border-radius: 8px; border: 1px solid var(--border-color);
+  background: var(--surface-color); color: var(--text-primary);
+}
+.queue-chip:hover { border-color: var(--accent-color); }
+.queue-chip.active { border-color: var(--accent-color); box-shadow: inset 0 0 0 1px var(--accent-color); }
+.queue-chip-name { font-weight: 650; font-size: 0.85rem; }
+.queue-chip-count { font-size: 0.8rem; font-variant-numeric: tabular-nums; }
+.queue-chip-workers { font-size: 0.74rem; color: var(--text-secondary); display: inline-flex; align-items: center; gap: 0.2rem; }
+.queue-chip.stranded { border-color: var(--status-warning-border); background: var(--status-warning-bg); }
+.queue-chip.stranded .queue-chip-workers { color: var(--warning-color); font-weight: 600; }
+.task-pick-meta { display: flex; flex-wrap: wrap; gap: 0.6rem; }
+.callout-inline { display: flex; gap: 0.4rem; align-items: flex-start; font-size: 0.86rem; color: var(--text-secondary); margin: 0; }
+.callout-inline svg { flex-shrink: 0; margin-top: 2px; color: var(--warning-color); }

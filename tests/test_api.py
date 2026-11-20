@@ -116,8 +116,8 @@ async def test_cancel_queued_and_scheduled(client, r):
 
     assert await r.llen("queue:default") == 0
     assert await r.zcard("delayed_tasks") == 0
-    assert int(await r.get("stats:pending")) == 0
-    assert int(await r.get("stats:delayed")) == 0
+    m = (await client.get("/metrics")).json()
+    assert (m["pending"], m["delayed"]) == (0, 0)
     assert (await client.post(f"/task/{a}/cancel")).status_code == 409
 
 
@@ -130,12 +130,14 @@ async def test_cancel_running_task_is_409(client, r):
 
 
 async def test_cancel_after_worker_popped_it(client, r):
-    """Race: the payload left the queue just before cancel → refuse, don't corrupt counters."""
+    """Race: the payload left the queue just before cancel → refuse, and the job is still counted."""
     tid = (await client.post("/task/enqueue", json={"task_name": "x"})).json()["task_id"]
     await r.rpoplpush("queue:default", "processing_queue:w")
     res = await client.post(f"/task/{tid}/cancel")
     assert res.status_code == 409
-    assert int(await r.get("stats:pending")) == 1
+    await r.zadd("active_workers", {"w": time.time() + 30})
+    m = (await client.get("/metrics")).json()
+    assert (m["pending"], m["processing"]) == (0, 1), "running on worker w, not waiting"
 
 
 async def test_cancel_missing_is_404(client):
@@ -186,7 +188,6 @@ async def _dead(r, task_id, priority="default", fence=None):
     item = {**queueing.new_payload("job", [1], priority=priority, task_id=task_id),
             "retry_count": 3, "error": "ValueError: bad", "failed_at": time.time()}
     await r.lpush("dlq", json.dumps(item))
-    await r.incr("stats:dlq")
     await r.hset(f"task:{task_id}", mapping={"task_id": task_id, "status": "DeadLetter", "error": "x"})
     if fence is not None:
         await r.set(f"fence:{task_id}", fence)
@@ -211,8 +212,8 @@ async def test_retry_all_keeps_priority_and_fence(client, r):
     for t in (high, low):
         assert t["retry_count"] == 0 and "error" not in t and "failed_at" not in t
     assert await r.llen("dlq") == 0
-    assert int(await r.get("stats:dlq")) == 0
-    assert int(await r.get("stats:pending")) == 2
+    m = (await client.get("/metrics")).json()
+    assert (m["dlq"], m["pending"]) == (0, 2)
     assert await r.hget("task:d1", "status") == "Queued"
     assert await r.hget("task:d1", "error") == ""
 
@@ -255,7 +256,7 @@ async def test_workers_endpoint_includes_metadata(client, r):
 
 
 async def test_metrics_and_stats_never_negative(client, r):
-    await r.set("stats:pending", -3)
+    await r.set("stats:pending", -3)   # a drifted counter from an older version is ignored now
     assert (await client.get("/metrics")).json()["pending"] == 0
     assert (await client.get("/system/stats")).json()["pending"] == 0
 

@@ -140,7 +140,7 @@ async def test_delay_records_status_and_history(patched):
     assert meta["task_name"] == "job"
     assert float(meta["created_at"]) > 0
     assert await r.lrange("tasks:recent", 0, -1) == [res["task_id"]]
-    assert int(await r.get("stats:pending")) == 1
+    assert (await queueing.queue_overview(r))["waiting"] == 0, "counted from the queue (this test popped it)"
 
 
 async def test_delay_priority_option_vs_task_parameter(patched):
@@ -177,7 +177,7 @@ async def test_schedule_and_apply_async_countdown(patched):
     assert a["task_id"] == "my-id"
     assert await r.zcard("delayed_tasks") == 2
     assert (await r.hget("task:my-id", "status")) == "Scheduled"
-    assert int(await r.get("stats:delayed")) == 2
+    assert (await queueing.queue_overview(r))["delayed"] == 2
 
 
 async def test_bad_priority_at_enqueue(patched):
@@ -207,7 +207,7 @@ async def test_status_wait_and_cancel_helpers(patched):
 
     assert await q.cancel(tid) is True
     assert await r.llen("queue:default") == 0
-    assert int(await r.get("stats:pending")) == 0
+    assert (await queueing.queue_overview(r))["waiting"] == 0
     done = await q.wait(tid, timeout=1)
     assert done["status"] == "Cancelled"
     assert await q.cancel(tid) is False, "cannot cancel twice"

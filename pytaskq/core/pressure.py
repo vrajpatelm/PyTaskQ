@@ -8,6 +8,10 @@ Two kinds of "no" matter for tuning:
   * 503 redis_busy      no free Redis connection within REDIS_POOL_TIMEOUT
   * 503 redis_down      Redis could not be reached at all
 
+and one thing that isn't a refusal but wastes work:
+
+  * handed_back         a worker popped a job whose task it doesn't have
+
 Counting happens in memory (it must work exactly when Redis is struggling) and
 a background task adds the counts to Redis every few seconds, so the
 Settings → Performance page sees the total across every API process.
@@ -43,7 +47,8 @@ def record(reason: str, detail: str = "") -> None:
     now = time.monotonic()
     if now - _last_log.get(reason, 0) >= LOG_EVERY_SECONDS:
         extra = f" (+{_suppressed[reason]} more since the last message)" if _suppressed[reason] else ""
-        logger.warning(f"Turned a request away: {MESSAGES.get(reason, reason)}{': ' + detail if detail else ''}{extra}")
+        prefix = "Handed a job back" if reason == "handed_back" else "Turned a request away"
+        logger.warning(f"{prefix}: {MESSAGES.get(reason, reason)}{': ' + detail if detail else ''}{extra}")
         _last_log[reason] = now
         _suppressed[reason] = 0
     else:
@@ -54,6 +59,8 @@ MESSAGES = {
     "queue_full": "429 queue full, workers are not keeping up (raise QUEUE_CAPACITY or add workers)",
     "redis_busy": "503 every Redis connection was busy (raise REDIS_MAX_CONNECTIONS or REDIS_POOL_TIMEOUT)",
     "redis_down": "503 Redis could not be reached",
+    "handed_back": "a worker took a job whose task it doesn't have and handed it back "
+                   "(two apps share a queue: give each app its own queue)",
 }
 
 
