@@ -81,7 +81,7 @@ async def test_unknown_task_is_rejected_with_suggestions(client, registry):
 async def test_registry_default_priority_is_used(client, registry, r):
     await client.post("/task/enqueue", json={"task_name": "send_email", "args": ["a@b.c"]})
     assert await r.llen("queue:high") == 1
-    await client.post("/task/enqueue", json={"task_name": "send_email", "priority": "low"})
+    await client.post("/task/enqueue", json={"task_name": "send_email", "args": ["a@b.c"], "priority": "low"})
     assert await r.llen("queue:low") == 1
 
 

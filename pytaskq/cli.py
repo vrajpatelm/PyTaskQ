@@ -67,9 +67,16 @@ def cmd_worker(args):
         except ValueError as e:
             raise SystemExit(f"--queues: {e}") from None
         worker.QUEUES_OVERRIDE = args.queues
+    if args.name:
+        worker.worker_name(args.name)       # checked before anything starts
+        worker.NAME_OVERRIDE = args.name
     worker.set_tasks(app.TASKS, app_name=args.app)
     log.info(f"Starting PyTaskQ worker for app: {args.app}")
     asyncio.run(worker.consumer_task())
+    if worker.EXIT_CODE or worker.THREADS_LEFT_RUNNING:
+        # Python would wait for IO threads still stuck in task code forever; don't.
+        logging.shutdown()
+        os._exit(worker.EXIT_CODE)
 
 
 def cmd_dashboard(args):
@@ -138,8 +145,8 @@ def cmd_ping(args):
         client = make_client()
         try:
             await client.ping()
-            import time
-            return await client.zcount("active_workers", time.time(), "+inf")   # alive ones only
+            seconds, micros = await client.time()      # Redis's clock: heartbeats are written with it
+            return await client.zcount("active_workers", seconds + micros / 1e6, "+inf")   # alive ones only
         finally:
             await client.aclose()
 
@@ -232,6 +239,9 @@ def build_parser() -> argparse.ArgumentParser:
     w.add_argument("--queues", default="",
                    help="Queues to serve, comma-separated, e.g. images,default "
                         "(default: WORKER_QUEUES, else the queues of this app's tasks)")
+    w.add_argument("--name", default="",
+                   help="A stable, unique name for this worker (default: WORKER_NAME, else random). With a name, a "
+                        "restarted worker puts back the jobs it was running at once. \"{hostname}\" is allowed")
     w.set_defaults(func=cmd_worker)
 
     d = sub.add_parser("dashboard", help="Start the web dashboard + REST API")

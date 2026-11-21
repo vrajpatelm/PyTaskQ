@@ -40,6 +40,16 @@ def make_client() -> "redis.Redis":
     return redis.Redis(connection_pool=pool)
 
 
+def make_sync_client():
+    """A small blocking client, for threads that must keep working while the event loop is busy (heartbeats)."""
+    import redis as redis_sync
+    options = dict(decode_responses=True, socket_timeout=5, socket_connect_timeout=5, health_check_interval=30)
+    if settings.REDIS_URL:
+        return redis_sync.Redis.from_url(settings.REDIS_URL, **options)
+    return redis_sync.Redis(host=settings.REDIS_HOST, port=settings.REDIS_PORT, db=settings.REDIS_DB,
+                            password=settings.REDIS_PASSWORD or None, **options)
+
+
 def pool_stats(client=None) -> dict:
     """How many connections this process has open and how many are in use right now."""
     pool = (client or r).connection_pool

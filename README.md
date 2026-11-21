@@ -152,7 +152,7 @@ Lost it? Run `pytaskq users setup-code`. For automated installs, set `PYTASKQ_AD
 | `priority` | `"default"` | `"high"`, `"default"` or `"low"`, within its queue |
 | `queue` | `"default"` | Named queue: only workers serving it run the task ([queues guide](https://github.com/vrajpatelm/PyTaskQ/blob/main/docs/QUEUES.md)) |
 | `max_retries` | `3` | Retries with jittered backoff before dead-lettering |
-| `timeout` | `300` s | Abandon and retry an attempt after this long |
+| `timeout` | `300` s | Stop and retry an attempt after this long, counted from when it starts ([how each task type is stopped](https://github.com/vrajpatelm/PyTaskQ/blob/main/docs/WORKERS.md)) |
 | `cron` | — | 5-field cron schedule |
 | `tz` | `CRON_TIMEZONE` (UTC) | Time zone the cron schedule is read in, e.g. `"Asia/Kolkata"` |
 | `name` | function name | Registered task name |
@@ -163,7 +163,7 @@ Every server setting is an environment variable or a line in `.env`, and all of 
 
 | Command | Purpose |
 |---|---|
-| `pytaskq worker --app m:queue [--queues a,b] [--cpu-workers N --io-workers N]` | Run a worker (serves its tasks' queues unless `--queues` says otherwise) |
+| `pytaskq worker --app m:queue [--queues a,b] [--cpu-workers N --io-workers N] [--name w1]` | Run a worker (serves its tasks' queues unless `--queues` says otherwise) |
 | `pytaskq dashboard [--app m:queue] [--port 8000] [--workers N]` | Dashboard and REST API |
 | `pytaskq tasks --app m:queue` | List tasks and their settings |
 | `pytaskq users …` | Manage accounts from the server |
@@ -174,17 +174,17 @@ Every server setting is an environment variable or a line in `.env`, and all of 
 <img src="https://raw.githubusercontent.com/vrajpatelm/PyTaskQ/main/docs/images/architecture.svg" alt="PyTaskQ architecture" width="100%" />
 
 1. **Reliable pop.** A worker atomically moves a job into its own processing list, so a crash never loses it.
-2. **Crash recovery.** Workers send a heartbeat every 10 s. An elected leader re-queues work from any worker that has been silent for 30 s.
+2. **Crash recovery.** Workers send a heartbeat every 10 s from a thread of their own. An elected leader re-queues work from any worker that has been silent for 30 s; a worker with a `WORKER_NAME` re-queues its own unfinished work the moment it restarts. A CPU task whose process dies (say, out of memory) fails on its own, and a fresh process takes its place.
 3. **Fencing tokens.** A Lua script only accepts results carrying the current token, so a late result from a hung worker can't overwrite a newer one.
 4. **Retries, then dead letters.** Failures back off with jitter. After `max_retries`, the job is dead-lettered with its last error.
-5. **Graceful shutdown.** Ctrl+C finishes running jobs before exiting.
+5. **Graceful shutdown.** Ctrl+C gives running jobs 30 s to finish, then puts any that are still running back at the front of their queue.
 6. **Safe outbound calls.** Webhooks (`on_success_url=`) are signed with HMAC and retried. Use `pytaskq.net.assert_safe_url` to block requests to private networks.
 7. **Safe retries.** Send an `Idempotency-Key` header (or `delay(..., idempotency_key=…)`) and a retried submission returns the original job instead of queueing a second one.
 8. **Tracing (optional).** Set `OTEL_EXPORTER_OTLP_ENDPOINT` and one OpenTelemetry trace follows each job from the request that queued it through every attempt, in Jaeger, Grafana Tempo, Honeycomb or Datadog.
 9. **Named queues.** Put a kind of work on its own queue (`queue="images"`) and give it its own workers (`--queues images`). Each queue has its own capacity, and the dashboard flags a queue no worker serves.
 10. **Polite under load.** When workers fall behind, new jobs get `429` with `Retry-After` instead of Redis filling up, and *Settings → Performance* says what to change.
 
-[docs/ARCHITECTURE.md](https://github.com/vrajpatelm/PyTaskQ/blob/main/docs/ARCHITECTURE.md) explains each part in detail: what's stored in Redis, the life of a job, and what happens when things go wrong.
+[docs/ARCHITECTURE.md](https://github.com/vrajpatelm/PyTaskQ/blob/main/docs/ARCHITECTURE.md) explains each part in detail: what's stored in Redis, the life of a job, and what happens when things go wrong. [docs/WORKERS.md](https://github.com/vrajpatelm/PyTaskQ/blob/main/docs/WORKERS.md) covers what a worker does with your task code: timeouts for each task type, crashes, stopping, and a checklist for tasks that behave well.
 
 ## REST API
 
@@ -234,7 +234,7 @@ npm run dev                  # dashboard with hot reload; talks to `pytaskq dash
 npm run build                # writes the bundle into pytaskq/static/
 ```
 
-See [QUEUES](https://github.com/vrajpatelm/PyTaskQ/blob/main/docs/QUEUES.md), [CONTRIBUTING](https://github.com/vrajpatelm/PyTaskQ/blob/main/docs/CONTRIBUTING.md), [ARCHITECTURE](https://github.com/vrajpatelm/PyTaskQ/blob/main/docs/ARCHITECTURE.md) and the [CHANGELOG](https://github.com/vrajpatelm/PyTaskQ/blob/main/CHANGELOG.md).
+See [QUEUES](https://github.com/vrajpatelm/PyTaskQ/blob/main/docs/QUEUES.md), [WORKERS](https://github.com/vrajpatelm/PyTaskQ/blob/main/docs/WORKERS.md), [CONTRIBUTING](https://github.com/vrajpatelm/PyTaskQ/blob/main/docs/CONTRIBUTING.md), [ARCHITECTURE](https://github.com/vrajpatelm/PyTaskQ/blob/main/docs/ARCHITECTURE.md) and the [CHANGELOG](https://github.com/vrajpatelm/PyTaskQ/blob/main/CHANGELOG.md).
 
 ## License
 

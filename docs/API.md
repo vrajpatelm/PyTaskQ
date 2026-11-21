@@ -145,12 +145,16 @@ Delete all failed tasks permanently.
 Response: `{"task_id": "…", "status": "queued"}` (or `"scheduled"` with `execute_in_seconds`).
 
 Errors:
+* `403` — the task name starts with `_`: those are PyTaskQ's internal tasks (such as webhook delivery) and can't be queued through the API.
 * `404` — the task name isn't advertised by any running worker. The message lists the available tasks.
-* `422` — invalid body: an unknown priority, an invalid queue name, a delay outside 0 to 1 year, `NaN`/`Infinity` in the arguments, a malformed `Idempotency-Key`, or a key already used for a different job.
-* `429` — the job's queue holds `QUEUE_CAPACITY` jobs (each queue has its own limit). Wait `Retry-After` seconds and try again.
+* `413` — the job is over `MAX_PAYLOAD_BYTES` (1 MB) once encoded. Put large data in storage and pass its location.
+* `422` — invalid body: a task name over 200 characters, an unknown priority, an invalid queue name, a delay outside 0 to 1 year, `NaN`/`Infinity` in the arguments, a malformed `Idempotency-Key`, or a key already used for a different job. Also **arguments the task doesn't accept** (a missing required argument, an unknown keyword, too many positional ones), checked against the parameters the workers advertise: `"Wrong arguments for task 'send_receipt': missing a required argument: 'order_id'"`. Long rejected values are shortened in the reply.
+* `429` — the job's queue already holds `QUEUE_CAPACITY` jobs (each queue has its own limit). The check and the push are one step, so the limit is exact under any load. Scheduled jobs (`delay_seconds` > 0) are refused too while their queue is full. Wait `Retry-After` seconds and try again.
 * `503` — the server couldn't reach Redis in time. Also carries `Retry-After`.
 
 `POST /task/schedule?delay_seconds=60` still works and takes the same body.
+
+Only the API checks `QUEUE_CAPACITY`. Jobs queued by your app's code (`.delay()`), cron, retries and dead-letter replays are never refused, since refusing them would lose work your app already decided to do.
 
 #### Safe retries with `Idempotency-Key`
 
@@ -217,11 +221,11 @@ What running workers (or `pytaskq dashboard --app …`) advertise, including eac
 
 ### Workers — `GET /system/workers`
 
-Each worker reports `hostname`, `pid`, `app`, `queues` (the queues it serves), `active`, `processed`, `failed`, `cpu_workers`, `io_workers`, `uptime_seconds`, `last_heartbeat_seconds_ago` and `status` (`healthy` / `degraded` / `dead`).
+Each worker reports `hostname`, `pid`, `app`, `queues` (the queues it serves), `active`, `processed`, `failed`, `cpu_workers`, `io_workers`, `uptime_seconds`, `last_heartbeat_seconds_ago`, `stuck_io` (IO threads still running timed-out tasks), `cpu_restarts` (CPU processes replaced after a timeout or crash), `loop_blocked_seconds` (how long an async task has blocked it right now, 0 if not) and `status` (`healthy` / `degraded` / `dead`).
 
 ### Dead letters
 
-Each `GET /dlq` entry includes `error` (the last exception) and `failed_at`. `replay` and `retry_all` put jobs back on their **original priority queue** with a valid fence token. Each dead letter can only be taken once: if two people replay (or delete) the same job at the same moment, the second gets `409` and the job runs once.
+Each `GET /dlq` entry includes `error` (the last exception) and `failed_at`. Entries with `"invalid": true` (task name `"(invalid job)"`) weren't valid jobs at all, such as text pushed onto a queue by hand; they carry `raw` (the first 64 KB of what was sent) and `found_in`, and can't be replayed (`409`), only deleted. At most `DLQ_LIMIT` (10,000) dead letters are kept; beyond that the oldest are dropped. `replay` and `retry_all` put jobs back on their **original priority queue** with a valid fence token. Each dead letter can only be taken once: if two people replay (or delete) the same job at the same moment, the second gets `409` and the job runs once.
 
 ---
 

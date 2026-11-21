@@ -41,6 +41,29 @@ def _json_safe(value):
     return value
 
 
+ECHO_LIMIT = 200      # characters of a rejected value repeated back in a 422
+
+
+def _short(value):
+    """A rejected input, shortened: a 2 MB value must not come back as a 2 MB error."""
+    text = value if isinstance(value, str) else None
+    if text is None:
+        try:
+            import json
+            text = json.dumps(value, default=str)
+        except (TypeError, ValueError):
+            text = str(value)
+        if len(text) <= ECHO_LIMIT:
+            return value
+    if len(text) <= ECHO_LIMIT:
+        return value
+    return f"{text[:ECHO_LIMIT]}… ({len(text):,} characters)"
+
+
 async def validation_error_handler(request: Request, exc: RequestValidationError):
-    """FastAPI's 422, except that echoing an input of Infinity/NaN can't crash it."""
-    return JSONResponse(status_code=422, content={"detail": _json_safe(jsonable_encoder(exc.errors()))})
+    """FastAPI's 422, except that echoing an input of Infinity/NaN can't crash it, and long inputs are cut."""
+    errors = jsonable_encoder(exc.errors())
+    for err in errors:
+        if isinstance(err, dict) and "input" in err:
+            err["input"] = _short(err["input"])
+    return JSONResponse(status_code=422, content={"detail": _json_safe(errors)})

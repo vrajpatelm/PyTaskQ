@@ -1,8 +1,7 @@
-import time
 
 from fastapi import APIRouter, Depends
 
-from pytaskq.core import redis_client
+from pytaskq.core import clock, redis_client
 from pytaskq.core.dependencies import require
 
 router = APIRouter(prefix="/system", tags=["system"], dependencies=[Depends(require("viewer"))])
@@ -20,7 +19,7 @@ async def get_system_stats():
     )
 
     stats = [max(0, int(s)) if s else 0 for s in stats]
-    workers = await redis_client.r.zcount("active_workers", time.time(), "+inf")
+    workers = await redis_client.r.zcount("active_workers", await clock.sync(redis_client.r), "+inf")
 
     return {
         "pending": stats[0],
@@ -42,17 +41,22 @@ def _num(value, cast=float, default=0):
 
 async def load_workers() -> list[dict]:
     """Every live worker with its pool sizes and counters (two Redis round trips)."""
-    workers_with_scores = await redis_client.r.zrange("active_workers", 0, -1, withscores=True)
+    async with redis_client.r.pipeline(transaction=False) as pipe:
+        pipe.time()
+        pipe.zrange("active_workers", 0, -1, withscores=True)
+        redis_time, workers_with_scores = await pipe.execute()
     async with redis_client.r.pipeline(transaction=False) as pipe:
         for worker_id, _ in workers_with_scores:
             pipe.hgetall(f"worker:{worker_id}")
         infos = await pipe.execute() if workers_with_scores else []
     worker_list = []
-    now = time.time()
+    clock.update(redis_time)
+    now = clock.now()      # heartbeats use Redis's clock, so compare with it (not this machine's)
     for (worker_id, expire_time), info in zip(workers_with_scores, infos):
-        last_hb = expire_time - 30
-        seconds_ago = max(0, int(now - last_hb))
         info = info or {}
+        ttl = _num(info.get("heartbeat_ttl"), float, 30) or 30
+        last_hb = expire_time - ttl
+        seconds_ago = max(0, int(now - last_hb))
         started_at = _num(info.get("started_at"), float, None)
         worker_list.append({
             "worker_id": worker_id,
@@ -67,7 +71,10 @@ async def load_workers() -> list[dict]:
             "queues": [q for q in (info.get("queues") or "default").split(",") if q],
             "uptime_seconds": int(now - started_at) if started_at else None,
             "last_heartbeat_seconds_ago": seconds_ago,
-            "status": "healthy" if seconds_ago < 15 else ("degraded" if seconds_ago < 30 else "dead"),
+            "stuck_io": _num(info.get("stuck_io"), int, 0),
+            "cpu_restarts": _num(info.get("cpu_restarts"), int, 0),
+            "loop_blocked_seconds": _num(info.get("loop_blocked_seconds"), int, 0),
+            "status": "healthy" if seconds_ago < ttl / 2 else ("degraded" if seconds_ago < ttl else "dead"),
         })
     return worker_list
 

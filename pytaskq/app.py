@@ -78,6 +78,10 @@ def _describe_params(func: Callable) -> list[dict]:
                            "required": False})
             continue
         info: dict[str, Any] = {"name": p.name, "required": p.default is p.empty}
+        if p.kind == p.POSITIONAL_ONLY:
+            info["kind"] = "positional_only"
+        elif p.kind == p.KEYWORD_ONLY:
+            info["kind"] = "keyword_only"
         if p.default is not p.empty:
             try:
                 json.dumps(p.default)
@@ -89,6 +93,41 @@ def _describe_params(func: Callable) -> list[dict]:
             info["annotation"] = ann if isinstance(ann, str) else getattr(ann, "__name__", str(ann))
         params.append(info)
     return params
+
+
+_KINDS = {
+    "positional_only": inspect.Parameter.POSITIONAL_ONLY,
+    "keyword_only": inspect.Parameter.KEYWORD_ONLY,
+    "var_positional": inspect.Parameter.VAR_POSITIONAL,
+    "var_keyword": inspect.Parameter.VAR_KEYWORD,
+}
+
+
+def argument_error(params: list, args: list, kwargs: dict) -> Optional[str]:
+    """
+    Why these arguments can't call a task described by `params` (from the
+    registry), or None if they can, or if the description isn't enough to tell.
+    Lets the API refuse a bad call at once (422) instead of the job failing
+    every retry in a worker.
+    """
+    if not isinstance(params, list):
+        return None
+    try:
+        sig = inspect.Signature([
+            inspect.Parameter(
+                p["name"], _KINDS.get(p.get("kind"), inspect.Parameter.POSITIONAL_OR_KEYWORD),
+                **({} if p.get("required") or p.get("kind") in ("var_positional", "var_keyword")
+                   else {"default": None}),
+            )
+            for p in params
+        ])
+    except (KeyError, TypeError, ValueError):
+        return None       # a description from an older worker that can't be rebuilt: don't guess
+    try:
+        sig.bind(*args, **kwargs)
+    except TypeError as e:
+        return str(e)
+    return None
 
 
 def describe_tasks(tasks: dict[str, dict]) -> dict[str, dict]:

@@ -210,15 +210,18 @@ async def test_retry_goes_back_to_the_same_queue(env):
 
 
 async def test_crash_recovery_and_cancel_after_a_later_retry(env):
-    """Recovery marks the job "high"; a later retry goes back to "low". Cancel must still find it."""
+    """Recovery puts the job first in line on its own list (it keeps its priority). Cancel must still find it."""
     r = env
     p = queueing.new_payload("job", queue="images", priority="low", task_id="t1")
     await queueing.enqueue(r, p)
+    await queueing.enqueue(r, queueing.new_payload("job", queue="images", priority="low", task_id="t2"))
     await r.eval(worker.PRIORITY_POP_SCRIPT, 2, "processing_queue:dead", "queue:images:low")
     await r.zadd("active_workers", {"dead": time.time() - 100})
     assert await worker._sweep_dead_workers() == 1
-    assert await r.llen("queue:images:high") == 1, "recovered onto its own queue"
-    assert await r.hget("task:t1", "priority") == "high"
+    assert await r.llen("queue:images:low") == 2, "recovered onto its own queue and priority"
+    assert json.loads(await r.lindex("queue:images:low", -1))["task_id"] == "t1", "first in line"
+    assert await r.hget("task:t1", "priority") == "low"
+    await queueing.cancel(r, "t2")
 
     # It fails once on the next worker and its retry is promoted: back on the low list.
     raw = await pop(r, ["images"])
@@ -345,7 +348,7 @@ async def test_api_uses_the_tasks_queue_and_allows_an_override(client, r):
     a = await client.post("/task/enqueue", json={"task_name": "resize", "args": ["x.png"]})
     assert a.status_code == 200, a.text
     assert await r.llen("queue:images:default") == 1
-    b = await client.post("/task/enqueue", json={"task_name": "resize", "queue": "bulk"})
+    b = await client.post("/task/enqueue", json={"task_name": "resize", "args": ["y.png"], "queue": "bulk"})
     assert b.status_code == 200 and await r.llen("queue:bulk:default") == 1
     bad = await client.post("/task/enqueue", json={"task_name": "resize", "queue": "Not OK"})
     assert bad.status_code == 422
@@ -361,10 +364,10 @@ async def test_each_queue_has_its_own_capacity(client, r):
         await app.publish()
     with patch.object(settings, "QUEUE_CAPACITY", 2):
         for _ in range(2):
-            assert (await client.post("/task/enqueue", json={"task_name": "resize"})).status_code == 200
-        full = await client.post("/task/enqueue", json={"task_name": "resize"})
+            assert (await client.post("/task/enqueue", json={"task_name": "resize", "args": ["a"]})).status_code == 200
+        full = await client.post("/task/enqueue", json={"task_name": "resize", "args": ["a"]})
         assert full.status_code == 429 and "queue 'images' is full" in full.json()["detail"]
-        ok = await client.post("/task/enqueue", json={"task_name": "send_email"})
+        ok = await client.post("/task/enqueue", json={"task_name": "send_email", "args": ["a@b.c"]})
         assert ok.status_code == 200, "a full images queue doesn't block the default queue"
 
 

@@ -33,7 +33,7 @@ async def check_backpressure(queue: str = "default"):
         for key in queueing.queue_keys(queue):
             pipe.llen(key)
         queue_len = sum(await pipe.execute())
-    if queue_len >= settings.QUEUE_CAPACITY:
+    if 0 < settings.QUEUE_CAPACITY <= queue_len:
         raise queue_full_error(queue)
 
 

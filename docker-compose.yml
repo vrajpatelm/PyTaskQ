@@ -114,6 +114,10 @@ services:
       - REDIS_PORT=6379
       - PYTHONUNBUFFERED=1
       - OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4317
+      # A stable name per container: a restarted worker puts back its unfinished jobs at once.
+      - WORKER_NAME={hostname}
+    # Running jobs get WORKER_SHUTDOWN_GRACE (30 s) to finish; Docker kills after 10 s otherwise.
+    stop_grace_period: 40s
     depends_on:
       redis:
         condition: service_healthy

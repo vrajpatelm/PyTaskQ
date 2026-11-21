@@ -4,6 +4,7 @@ from typing import Any, Dict, List, Literal, Optional
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from pydantic import BaseModel, Field
 
+from pytaskq.app import argument_error
 from pytaskq.core import queueing, redis_client
 from pytaskq.core import auth
 from pytaskq.core.config import settings
@@ -16,7 +17,7 @@ logger = logging.getLogger("api")
 
 
 class EnqueueRequest(BaseModel):
-    task_name: str = Field(..., examples=["generate_csv_report"])
+    task_name: str = Field(..., min_length=1, max_length=200, examples=["generate_csv_report"])
     args: List[Any] = Field(default_factory=list, examples=[[100]])
     kwargs: Dict[str, Any] = Field(default_factory=dict)
     priority: Optional[Literal["high", "default", "low"]] = None
@@ -34,40 +35,19 @@ IdempotencyHeader = Header(
 )
 
 
-async def _validated_payload(req: EnqueueRequest, delay_seconds: float, key: Optional[str]):
-    """Returns (payload, None) to queue, or (None, original response) for a repeated Idempotency-Key.
+async def _validated_payload(req: EnqueueRequest):
+    """The job to queue, after checking it can run: a known task, called with arguments it accepts.
 
-    The queue-full check, the task lookup and the idempotency lookup share one
-    Redis round trip (a second one only when the task lives on another queue
-    than the one guessed, to measure that queue).
+    One Redis round trip. The queue-full check, the idempotency check and the
+    push happen afterwards in one atomic step (queueing.enqueue).
     """
-    guess = req.queue or queueing.DEFAULT_QUEUE
+    if req.task_name.startswith("_"):
+        raise HTTPException(status_code=403, detail="Tasks whose name starts with '_' are internal to PyTaskQ "
+                                                    "and can't be queued through the API.")
     async with redis_client.r.pipeline(transaction=False) as pipe:
-        for k in queueing.queue_keys(guess):
-            pipe.llen(k)
         cutoff = queueing.queue_registry_lookup(pipe, req.task_name)
-        if key:
-            pipe.get(queueing._idempotency_redis_key(key))
-        results = await pipe.execute()
-    lengths, (raw_spec, seen, count) = results[:3], results[3:6]
+        raw_spec, seen, count = await pipe.execute()
     spec, advertised = queueing.parse_registry_lookup(raw_spec, seen, count, cutoff)
-    queue = req.queue or (spec or {}).get("queue") or queueing.DEFAULT_QUEUE
-    payload = queueing.new_payload(
-        req.task_name, req.args, req.kwargs,
-        priority=req.priority or (spec or {}).get("priority") or "default",
-        queue=queueing.payload_queue({"queue": queue}),
-        on_success_url=req.on_success_url,
-    )
-    if key and results[6]:
-        # A retry of a request that already queued its job: answer it even if the queue is now full.
-        return None, queueing._duplicate(results[6], queueing._fingerprint(payload, float(delay_seconds or 0)))
-    if payload["queue"] != guess:
-        async with redis_client.r.pipeline(transaction=False) as pipe:
-            for k in queueing.queue_keys(payload["queue"]):
-                pipe.llen(k)
-            lengths = await pipe.execute()
-    if sum(lengths) >= settings.QUEUE_CAPACITY:
-        raise queue_full_error(payload["queue"])
     if spec is None and advertised:
         registry = await queueing.registered_tasks(redis_client.r)
         available = sorted(t["name"] for t in registry if not t.get("internal"))
@@ -75,16 +55,29 @@ async def _validated_payload(req: EnqueueRequest, delay_seconds: float, key: Opt
             status_code=404,
             detail=f"Unknown task '{req.task_name}'. Available tasks: {', '.join(available) or 'none'}",
         )
-    return payload, None
+    if spec:
+        problem = argument_error(spec.get("params"), req.args, req.kwargs)
+        if problem:
+            raise HTTPException(status_code=422, detail=f"Wrong arguments for task '{req.task_name}': {problem}")
+    queue = req.queue or (spec or {}).get("queue") or queueing.DEFAULT_QUEUE
+    return queueing.new_payload(
+        req.task_name, req.args, req.kwargs,
+        priority=req.priority or (spec or {}).get("priority") or "default",
+        queue=queueing.payload_queue({"queue": queue}),
+        on_success_url=req.on_success_url,
+    )
 
 
 async def _submit(req: EnqueueRequest, delay_seconds: float, user: auth.User, key: Optional[str]) -> dict:
+    payload = await _validated_payload(req)
     try:
-        payload, duplicate = await _validated_payload(req, delay_seconds, key)
-        if duplicate:
-            return duplicate
         result = await queueing.enqueue(redis_client.r, payload, delay_seconds=delay_seconds,
-                                        created_by=user.username, idempotency_key=key)
+                                        created_by=user.username, idempotency_key=key,
+                                        capacity=max(0, settings.QUEUE_CAPACITY))
+    except queueing.QueueFull as e:
+        raise queue_full_error(e.queue) from None
+    except queueing.PayloadTooLarge as e:
+        raise HTTPException(status_code=413, detail=str(e)) from None
     except ValueError as e:   # NaN in the arguments, a bad or reused Idempotency-Key
         raise HTTPException(status_code=422, detail=str(e)) from None
     if not result.get("duplicate"):
