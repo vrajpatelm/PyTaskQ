@@ -296,7 +296,7 @@ def test_4_no_unprefixed_key_names_in_the_code():
     import re
     fam = (r'(?:queue:|processing_queue:|delayed_tasks|dlq"|task:|tasks:recent|fence:|active_workers|worker:|'
            r'pytaskq:|cron_lock:|stats:|idempotency:|auth:|events:global)')
-    py_lit = re.compile(r'(?<![\w.(])f?"' + fam)
+    py_lit = re.compile(r'(?<![\w.(\[])f?"' + fam)        # not d["dlq"] (a dict key)
     lua_lit = re.compile(r"'" + fam.replace('dlq"', "dlq'"))
     root = pathlib.Path(worker.__file__).parent
     found = []
