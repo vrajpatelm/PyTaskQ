@@ -45,6 +45,7 @@ import hmac
 import inspect
 import json
 import os
+import re
 import time
 from typing import Any, Callable, Optional
 
@@ -144,6 +145,8 @@ def describe_tasks(tasks: dict[str, dict]) -> dict[str, dict]:
             "queue": entry.get("queue") or queueing.DEFAULT_QUEUE,
             "max_retries": entry.get("max_retries") if entry.get("max_retries") is not None else settings.MAX_RETRIES,
             "timeout": entry.get("timeout") if entry.get("timeout") is not None else settings.TASK_TIMEOUT,
+            "max_concurrency": entry.get("max_concurrency"),
+            "rate_limit": entry.get("rate_limit"),
             "doc": doc.split("\n\n")[0].strip(),
             "params": _describe_params(fn),
             "internal": task_name.startswith("_"),
@@ -189,6 +192,8 @@ class PyTaskQ:
         catch_up: Optional[bool] = None,
         max_retries: Optional[int] = None,
         timeout: Optional[float] = None,
+        max_concurrency: Optional[int] = None,
+        rate_limit: Optional[str] = None,
     ):
         """
         Register a function as a background task. Usable as `@queue.task` or
@@ -208,6 +213,12 @@ class PyTaskQ:
                     work its own workers (e.g. heavy jobs on a big machine).
         max_retries Attempts after the first failure before dead-lettering (default 3).
         timeout     Seconds before the attempt is abandoned (default TASK_TIMEOUT).
+        max_concurrency  At most this many jobs of this task run at once, across every
+                    worker (e.g. 2 for a task that logs in to an account that allows two
+                    sessions). Extra jobs wait, without using retries.
+        rate_limit  At most this many starts per second/minute/hour across every worker,
+                    e.g. "10/s", "100/m", "1000/h". Starts are spread evenly ("60/m" =
+                    one a second). Extra jobs wait for their turn, without using retries.
         """
 
         if isinstance(func, str):  # legacy positional form: @queue.task("io")
@@ -238,6 +249,10 @@ class PyTaskQ:
             task_queue = queueing.check_queue_name(self.default_queue if queue is None else queue)
             if max_retries is not None and max_retries < 0:
                 raise ValueError("max_retries must be >= 0")
+            if max_concurrency is not None and (isinstance(max_concurrency, bool)
+                                                or not isinstance(max_concurrency, int) or max_concurrency < 1):
+                raise ValueError(f"{fn.__name__}: max_concurrency must be a whole number >= 1")
+            rate_interval = parse_rate_limit(rate_limit) if rate_limit is not None else None
 
             task_name = name or fn.__name__
             if task_name in self.TASKS and self.TASKS[task_name]["handler"] is not fn:
@@ -255,6 +270,9 @@ class PyTaskQ:
                 "queue": task_queue,
                 "max_retries": retries,
                 "timeout": limit,
+                "max_concurrency": max_concurrency,
+                "rate_limit": rate_limit.strip() if rate_limit else None,
+                "rate_interval": rate_interval,
             }
             own_params = set(inspect.signature(fn).parameters)
 
@@ -350,6 +368,26 @@ class PyTaskQ:
 
     def __repr__(self) -> str:
         return f"<PyTaskQ {self.name!r} tasks={sorted(self.TASKS)}>"
+
+
+_RATE_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*/\s*(\d*(?:\.\d+)?)\s*"
+                      r"(s|sec|secs|second|seconds|m|min|mins|minute|minutes|h|hr|hour|hours)\s*$", re.I)
+_RATE_UNITS = {"s": 1, "m": 60, "h": 3600}
+
+
+def parse_rate_limit(text: str) -> float:
+    """
+    Seconds between two starts for a rate limit like "10/s", "100/m", "1000/h"
+    or "5/10s" (5 every 10 seconds). Raises ValueError otherwise.
+    """
+    m = _RATE_RE.match(text) if isinstance(text, str) else None
+    if not m:
+        raise ValueError(f"rate_limit {text!r} isn't valid: use a count per second, minute or hour, "
+                         f"like '10/s', '100/m' or '1000/h'")
+    count, every, unit = float(m.group(1)), float(m.group(2) or 1), m.group(3)[0].lower()
+    if count <= 0 or every <= 0:
+        raise ValueError(f"rate_limit {text!r} must allow at least some jobs")
+    return every * _RATE_UNITS[unit] / count
 
 
 def _check_time_zone(name: str) -> None:

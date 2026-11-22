@@ -546,6 +546,8 @@ function RunView({ registered, onQueued, notify }) {
               {spec.type === 'cpu' ? 'Runs in a separate process' : spec.type === 'async' ? 'Runs on the worker event loop' : 'Runs in a worker thread'}
               {' '}· retried up to {spec.max_retries}× · times out after {spec.timeout ? `${spec.timeout}s` : 'never'}
               {spec.queue && spec.queue !== 'default' && <> · queue <strong>{spec.queue}</strong></>}
+              {spec.max_concurrency && <> · at most <strong>{spec.max_concurrency}</strong> running at once</>}
+              {spec.rate_limit && <> · starts limited to <strong>{spec.rate_limit}</strong></>}
             </p>
             {params.length === 0 && <p className="muted">This task takes no arguments.</p>}
             {params.map(p => (

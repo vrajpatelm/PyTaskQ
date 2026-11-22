@@ -496,3 +496,143 @@ async def test_6_missed_runs_show_in_settings_performance(env, client):
     with patch.object(time, "time", lambda: _utc(22, 13, 30)):
         perf = (await client.get("/system/performance")).json()["suggestions"]
     assert any(s["title"] == "Scheduled task report missed 4 run(s)" for s in perf)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 7. Task features
+# ═════════════════════════════════════════════════════════════════════════════
+
+# ── 7a. max_concurrency ──────────────────────────────────────────────────────
+
+async def _start(r, tasks, queues=("default",)):
+    """Pop one job and start handling it in the background (like the worker's main loop)."""
+    raw = await pop(r, queues)
+    assert raw, "nothing to pop"
+    sem = asyncio.Semaphore(1)
+    await sem.acquire()
+
+    async def go():
+        with patch.object(worker, "TASKS", tasks):
+            await worker.handle_task(raw, sem, asyncio.get_running_loop(), None, ThreadPoolExecutor(2))
+    job = asyncio.create_task(go())
+    await asyncio.sleep(0.05)
+    return json.loads(raw)["task_id"], job
+
+
+async def test_7a_max_concurrency_holds_across_workers_and_waiting_uses_no_retries(env):
+    r = env
+    gate = asyncio.Event()
+
+    async def login(n):
+        await gate.wait()
+        return n
+
+    tasks = {"login": {"handler": login, "type": "async", "max_retries": 0, "max_concurrency": 2}}
+    for i in range(3):
+        await queueing.enqueue(r, queueing.new_payload("login", [i], task_id=f"l{i}"))
+    _, a = await _start(r, tasks)
+    worker.WORKER_ID = "other-worker"                    # the limit counts every worker's jobs
+    _, b = await _start(r, tasks)
+    _, c = await _start(r, tasks)
+    assert c.done(), "the third job doesn't wait inside the worker: it goes back to the delayed set"
+    assert [await r.hget(f"task:l{i}", "status") for i in range(3)] == ["Processing", "Processing", "Queued"]
+    assert "2 'login' job(s) are already running (max_concurrency=2)" in await r.hget("task:l2", "note")
+    assert await r.zcard("delayed_tasks") == 1 and await r.zcard(worker.limit_key("running", "login")) == 2
+    gate.set()
+    await asyncio.gather(a, b)
+    assert await r.zcard(worker.limit_key("running", "login")) == 0, "finished jobs give their place back"
+    await worker._promote_due_tasks(now=time.time() + 60)
+    _, c = await _start(r, tasks)
+    await c
+    info = await r.hgetall("task:l2")
+    assert info["status"] == "Success" and info.get("retry_count", "0") == "0"
+
+
+async def test_7a_a_dead_workers_places_free_up_and_live_ones_are_renewed(env):
+    import fakeredis
+    r = env
+    key = worker.limit_key("running", "login")
+    await r.zadd(key, {"crashed-1": time.time() - 1, "crashed-2": time.time() - 1})
+    gate = asyncio.Event()
+
+    async def login():
+        await gate.wait()
+
+    tasks = {"login": {"handler": login, "type": "async", "max_retries": 0, "max_concurrency": 2}}
+    await queueing.enqueue(r, queueing.new_payload("login", [], task_id="l0"))
+    _, job = await _start(r, tasks)
+    assert await r.hget("task:l0", "status") == "Processing", "expired leases don't count"
+    assert worker._leases == {"l0": key}
+    sync = fakeredis.FakeRedis(decode_responses=True)
+    sync.zadd(key, {"l0": 1})
+    worker._renew_leases(sync, 1000.0)
+    assert sync.zscore(key, "l0") == 1000.0 + worker.LEASE_TTL and sync.pttl(key) > 0
+    sync.zadd(key, {"l0": 1})
+    with patch.object(worker.redis_client, "make_sync_client", lambda: sync):
+        worker._Heartbeat().beat()                    # the heartbeat thread does it every few seconds
+    assert sync.zscore(key, "l0") > time.time()
+    sync.delete(key)
+    worker._renew_leases(sync, 1000.0)
+    assert not sync.exists(key), "renewing never re-creates a lease that's gone"
+    gate.set()
+    await job
+    assert worker._leases == {}
+
+
+# ── 7b. rate_limit ───────────────────────────────────────────────────────────
+
+async def test_7b_rate_limit_reserves_one_start_time_per_job(env):
+    r = env
+    t0 = 1_800_000_000.0
+    tasks = {"call": {"handler": lambda n: n, "type": "io", "max_retries": 0,
+                      "rate_limit": "2/s", "rate_interval": 0.5}}
+    for i in range(3):
+        await queueing.enqueue(r, queueing.new_payload("call", [i], task_id=f"c{i}"))
+    with patch.object(clock, "now", lambda: t0):
+        for _ in range(3):
+            await run_one(r, tasks)
+    assert await r.hget("task:c0", "status") == "Success"
+    slots = sorted(score for _, score in await r.zrange("delayed_tasks", 0, -1, withscores=True))
+    assert slots == [t0 + 0.5, t0 + 1.0], "evenly spread, reserved once"
+    assert "Waiting for its turn under rate_limit=2/s" in await r.hget("task:c1", "note")
+    # At its time the job runs without reserving another turn.
+    await worker._promote_due_tasks(now=t0 + 0.6)
+    with patch.object(clock, "now", lambda: t0 + 0.6):
+        await run_one(r, tasks)
+    assert await r.hget("task:c1", "status") == "Success"
+    assert float(await r.get(worker.limit_key("rate", "call"))) == t0 + 1.5
+
+
+async def test_7b_a_retry_takes_a_new_turn(env):
+    r = env
+    t0 = 1_800_000_000.0
+    tasks = {"call": {"handler": lambda: 1 / 0, "type": "io", "max_retries": 1,
+                      "rate_limit": "1/m", "rate_interval": 60.0}}
+    payload = queueing.new_payload("call", [], task_id="c0", max_retries=1)
+    payload.update(rate_slot=t0 - 1, waits=3)             # it already waited for its turn once
+    await queueing.enqueue(r, payload)
+    with patch.object(clock, "now", lambda: t0):
+        await run_one(r, tasks)
+    assert await r.hget("task:c0", "status") == "RetryScheduled"
+    assert await r.get(worker.limit_key("rate", "call")) is None, "its reserved turn was used"
+    retry = json.loads((await r.zrange("delayed_tasks", 0, -1))[0])
+    assert retry["rate_slot"] is None and retry["waits"] == 0
+
+
+def test_7_limits_are_checked_when_the_task_is_registered():
+    from pytaskq.app import describe_tasks
+    q = PyTaskQ()
+    for bad in (0, -1, 1.5, True):
+        with pytest.raises(ValueError, match="max_concurrency"):
+            q.task(max_concurrency=bad)(lambda: None)
+    for bad in ("fast", "0/s", "10/day", "10"):
+        with pytest.raises(ValueError, match="rate_limit"):
+            q.task(rate_limit=bad)(lambda: None)
+
+    @q.task(type="io", max_concurrency=3, rate_limit="100/m")
+    def sync_crm():
+        pass
+    entry = q.TASKS["sync_crm"]
+    assert entry["max_concurrency"] == 3 and entry["rate_interval"] == pytest.approx(0.6)
+    spec = describe_tasks(q.TASKS)["sync_crm"]
+    assert spec["max_concurrency"] == 3 and spec["rate_limit"] == "100/m"

@@ -374,6 +374,29 @@ redis.call('PERSIST', KEYS[3])
 return 1
 """
 
+# max_concurrency: a fleet-wide count of running jobs per task, as leases that run out if a worker
+# dies (its heartbeat renews them while the job runs). KEYS: the task's lease set
+# ARGV: task id, now, lease expiry, limit, key ttl (ms).   Returns 1 (go) or 0 (full).
+LEASE_SCRIPT = """
+redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', ARGV[2])
+if not redis.call('ZSCORE', KEYS[1], ARGV[1]) and redis.call('ZCARD', KEYS[1]) >= tonumber(ARGV[4]) then
+  return 0
+end
+redis.call('ZADD', KEYS[1], ARGV[3], ARGV[1])
+redis.call('PEXPIRE', KEYS[1], ARGV[5])
+return 1
+"""
+
+# rate_limit: starts are spread evenly. Each job reserves the next free start time ("slot");
+# a job whose slot is in the future waits in the delayed set until then (once, no polling).
+# KEYS: the task's rate key   ARGV: now, seconds between starts.   Returns the slot.
+RATE_SCRIPT = """
+local now, gap = tonumber(ARGV[1]), tonumber(ARGV[2])
+local slot = math.max(tonumber(redis.call('GET', KEYS[1]) or '0'), now)
+redis.call('SET', KEYS[1], string.format('%.6f', slot + gap), 'PX', math.ceil((slot - now + 2 * gap) * 1000) + 60000)
+return string.format('%.6f', slot)
+"""
+
 # Move a batch of due jobs from the delayed set onto their queues, only while a
 # queue has room (QUEUE_CAPACITY), so a big backlog can't flood one queue.
 # KEYS: delayed set, queue-name set, each queue's 3 lists, each queue's wake list, then per job: target list,
@@ -874,6 +897,7 @@ class _Heartbeat(threading.Thread):
         info = {**_worker_info(), **_health(), "last_seen": now, "started_at": _started_at or now,
                 "loop_blocked_seconds": round(self.blocked_for) if self.blocked_for >= LOOP_BLOCKED_WARN else 0}
         fields = [str(x) for kv in info.items() for x in kv]
+        _renew_leases(c, now)
         c.eval(HEARTBEAT_SCRIPT, 4, rkey("active_workers"), rkey(f"worker:{WORKER_ID}"), WORKERS_KEY, queueing.QUEUES_KEY,
                WORKER_ID, repr(now + HEARTBEAT_TTL), HEARTBEAT_TTL * 4, len(QUEUES), *QUEUES, *fields)
 
@@ -1020,6 +1044,7 @@ async def _record_failure(r, tasks, task_json, task_id, error, max_retries) -> s
         target = rkey("dlq")
     else:
         tasks.retry_count += 1
+        tasks.rate_slot, tasks.waits = None, 0     # the retry takes a new turn under the task's limits
         base, max_delay = 1.0, 30.0
         delay = min(max_delay, random.uniform(base, (tasks.prev_delay or base) * 3))
         tasks.prev_delay = delay
@@ -1101,6 +1126,92 @@ async def _hand_back(r, tasks, task_json, task_id) -> bool:
     from pytaskq.core import pressure
     pressure.record("handed_back", f"'{tasks.task_name}' on queue '{tasks.queue}' (worker {WORKER_ID} lacks it)")
     return True
+
+
+LEASE_TTL = HEARTBEAT_TTL * 2      # seconds a max_concurrency lease lasts; the heartbeat renews it while the job runs
+WAIT_MAX = 10.0                    # longest wait between two max_concurrency checks of one job
+_leases: dict[str, str] = {}       # task id → lease set key, for this worker's running jobs that hold one
+
+
+def limit_key(kind: str, task_name: str) -> str:
+    """Redis key of a task's max_concurrency leases ("running") or rate_limit slot ("rate")."""
+    return rkey(f"limit:{kind}:{task_name}")
+
+
+async def _wait_in_delayed_set(r, tasks, task_json, due: float, changes: dict, note: str) -> None:
+    """Put a popped job back in the delayed set until `due`, without counting a retry."""
+    payload = json.loads(task_json)
+    payload.update(changes)
+    raw = json.dumps(payload)
+    await _with_retries(lambda _: r.eval(HAND_BACK_SCRIPT, 3, _processing_key(), rkey("delayed_tasks"),
+                                         queueing.task_key(tasks.task_id), task_json, raw, repr(due), note),
+                        "put a job back to wait", tasks.task_id)
+
+
+async def _within_limits(r, tasks, task_json, entry: dict) -> bool:
+    """
+    The task's rate_limit and max_concurrency, which hold across every worker.
+
+    True: the job may start now (holding a max_concurrency lease if the task has
+    one). False: it went back to the delayed set to wait for its turn. Waiting
+    never uses up a retry. A rate-limited job reserves its start time once and
+    waits until then; a job over max_concurrency checks again after a short,
+    growing wait (up to WAIT_MAX seconds).
+    """
+    gap, cap = entry.get("rate_interval"), entry.get("max_concurrency")
+    if not gap and not cap:
+        return True
+    task_id, name = tasks.task_id, tasks.task_name
+    now = clock.now()
+    slot = tasks.rate_slot
+    if gap:
+        if slot is None:
+            slot = float(await _with_retries(
+                lambda _: r.eval(RATE_SCRIPT, 1, limit_key("rate", name), repr(now), repr(float(gap))),
+                "check a rate limit", task_id))
+        if slot > now + 0.05:
+            when = datetime.fromtimestamp(slot, timezone.utc).strftime("%H:%M:%S UTC")
+            await _wait_in_delayed_set(r, tasks, task_json, slot, {"rate_slot": slot},
+                                       f"Waiting for its turn under rate_limit={entry.get('rate_limit')}: "
+                                       f"starts at {when}.")
+            return False
+    if cap:
+        key = limit_key("running", name)
+        _leases[task_id] = key        # before asking, so a lease granted just as Redis fails is still renewed
+        got = int(await _with_retries(
+            lambda _: r.eval(LEASE_SCRIPT, 1, key, task_id, repr(now), repr(now + LEASE_TTL), int(cap),
+                             int(LEASE_TTL * 2000)),
+            "check max_concurrency", task_id))
+        if not got:
+            _leases.pop(task_id, None)
+            waits = tasks.waits + 1
+            due = now + min(WAIT_MAX, 0.5 * 1.5 ** min(waits, 20)) * random.uniform(0.8, 1.2)
+            await _wait_in_delayed_set(r, tasks, task_json, due, {"waits": waits, "rate_slot": slot},
+                                       f"Waiting: {cap} '{name}' job(s) are already running "
+                                       f"(max_concurrency={cap}).")
+            return False
+    return True
+
+
+async def _release_lease(r, task_id: str) -> None:
+    key = _leases.pop(task_id, None)
+    if key:
+        try:
+            await r.zrem(key, task_id)
+        except Exception:
+            pass                       # it runs out by itself within LEASE_TTL seconds
+
+
+def _renew_leases(c, now: float) -> None:
+    """Heartbeat thread: keep the leases of jobs still running here alive."""
+    held = list(_leases.items())
+    if not held:
+        return
+    pipe = c.pipeline(transaction=False)
+    for task_id, key in held:
+        pipe.zadd(key, {task_id: now + LEASE_TTL}, xx=True)
+        pipe.pexpire(key, int(LEASE_TTL * 2000))
+    pipe.execute()
 
 
 _last_stuck_warning = 0.0
@@ -1191,6 +1302,7 @@ async def handle_task(task_json, sem, loop, process_pool, thread_pool):
             await _run(r, tasks, task_json, process_pool, thread_pool)
         finally:
             _running.pop(tasks.task_id, None)
+            await _release_lease(r, tasks.task_id)
     except asyncio.CancelledError:
         # The shutdown grace period ran out. The job stays in this worker's
         # processing list, and the shutdown puts it back on its queue.
@@ -1249,6 +1361,9 @@ async def _run(r, tasks, task_json, process_pool, thread_pool) -> None:
                     f"Task '{tasks.task_name}' is not registered on worker {WORKER_ID}. "
                     f"Registered tasks: {known}"
                 )
+            if not await _within_limits(r, tasks, task_json, entry):
+                span.set_attribute("task.status", "Waiting")
+                return
             func = entry["handler"]
             task_type = entry.get("type", "cpu")
             args, kwargs = tasks.args, tasks.kwargs

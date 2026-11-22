@@ -21,6 +21,8 @@ class Taskloader(BaseModel):
     queue: str = "default"             # named queue; preserved across retries (older jobs have none)
     bounces: int = Field(0, ge=0)      # times handed back because the worker that took it lacked the task
     handed_back_since: Optional[float] = None   # when the first hand-back happened (gives up after a while)
+    waits: int = Field(0, ge=0)        # times it waited for its task's max_concurrency (backs off a little more each time)
+    rate_slot: Optional[float] = Field(None, allow_inf_nan=False)   # start time reserved under its task's rate_limit
     max_retries: Optional[int] = Field(None, ge=0)                     # per-task override (else registry / settings)
     timeout: Optional[float] = Field(None, ge=0, allow_inf_nan=False)  # per-task override (else registry / settings)
     trace_carrier: dict = Field(default_factory=dict)
