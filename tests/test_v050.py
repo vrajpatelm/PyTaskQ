@@ -891,3 +891,109 @@ async def test_7d_finished_jobs_cant_be_cancelled_and_app_cancel_reports_it(env)
         await pop(r)
         await r.hset("task:d2", "status", "Processing")
         assert await q.cancel("d2") is True
+
+
+# ── 7e. pausing queues ───────────────────────────────────────────────────────
+
+@pytest.fixture
+async def twin():
+    """The code under test and the worker's heartbeat thread on one fake Redis server."""
+    import fakeredis
+    server = fakeredis.FakeServer()
+    r = fakeredis.aioredis.FakeRedis(server=server, decode_responses=True)
+    bak_id = worker.WORKER_ID
+    worker.WORKER_ID = "test-worker"
+    worker._scanned_legacy = True
+
+    async def keep_open():
+        return None
+    with patch.object(worker.redis_client, "r", r), patch("pytaskq.core.redis_client.r", r), \
+         patch.object(worker.redis_client, "make_sync_client",
+                      lambda: fakeredis.FakeRedis(server=server, decode_responses=True)), \
+         patch.object(r, "aclose", keep_open):
+        yield r
+    worker.WORKER_ID = bak_id
+
+
+async def _statuses(r, ids):
+    return [await r.hget(f"task:{t}", "status") for t in ids]
+
+
+async def test_7e_a_paused_queue_keeps_its_jobs_until_resumed(twin):
+    r = twin
+    app = PyTaskQ()
+
+    @app.task(type="io", queue="mail")
+    def send(n):
+        return n
+
+    @app.task(type="io")
+    def other(n):
+        return n
+
+    assert await queueing.pause_queue(r, "mail", by="ops") is True
+    assert await queueing.pause_queue(r, "mail") is False, "already paused"
+    mail = [(await send.delay(i))["task_id"] for i in range(2)]
+    plain = (await other.delay(9))["task_id"]
+    with patch.object(worker, "TASKS", dict(app.TASKS)), patch.object(queueing, "PAUSE_CHECK", 0.2), \
+         patch.object(worker, "IO_WORKERS", 2), patch.object(worker, "CPU_WORKERS", 1), \
+         patch.object(worker, "QUEUES_OVERRIDE", "default,mail"):
+        runner = asyncio.create_task(worker.consumer_task())
+        try:
+            for _ in range(40):
+                if await r.hget(f"task:{plain}", "status") == "Success":
+                    break
+                await asyncio.sleep(0.05)
+            await asyncio.sleep(0.6)
+            assert await r.hget(f"task:{plain}", "status") == "Success", "other queues keep running"
+            assert await _statuses(r, mail) == ["Queued", "Queued"], "paused: not started"
+            began = time.monotonic()
+            assert await queueing.resume_queue(r, "mail") is True
+            while await _statuses(r, mail) != ["Success", "Success"]:
+                assert time.monotonic() - began < 3, await _statuses(r, mail)
+                await asyncio.sleep(0.05)
+            # Pausing every queue a worker serves leaves it idle, not spinning.
+            await queueing.pause_queue(r, "mail")
+            await queueing.pause_queue(r, "default")
+            await asyncio.sleep(0.5)
+            job = (await other.delay(1))["task_id"]
+            await asyncio.sleep(0.6)
+            assert await r.hget(f"task:{job}", "status") == "Queued"
+            await queueing.resume_queue(r, "default")
+            for _ in range(60):
+                if await r.hget(f"task:{job}", "status") == "Success":
+                    break
+                await asyncio.sleep(0.05)
+            assert await r.hget(f"task:{job}", "status") == "Success"
+        finally:
+            worker.shutdown_event.set()
+            await asyncio.wait_for(runner, 10)
+
+
+async def test_7e_pause_and_resume_through_the_api(client, r):
+    res = await client.post("/queues/emails/pause")
+    assert res.status_code == 200 and res.json()["changed"] is True
+    queues = {q["name"]: q for q in (await client.get("/queues")).json()["queues"]}
+    assert queues["emails"]["paused"] is True and queues["emails"]["paused_by"]
+    assert queues["default"]["paused"] is False
+    assert any(q["name"] == "emails" and q["paused"] for q in (await client.get("/metrics")).json()["queues"])
+    assert await queueing.prune_queues(r) == [], "a paused queue stays listed so it can be resumed"
+    res = await client.post("/queues/emails/resume")
+    assert res.json() == {"queue": "emails", "paused": False, "changed": True}
+    assert await r.llen(queueing.wake_key("emails")) > 0, "idle workers are woken"
+    assert (await client.post("/queues/emails/resume")).json()["changed"] is False
+    assert (await client.post("/queues/Bad Name!/pause")).status_code == 422
+
+
+async def test_7e_the_worker_logs_pauses_of_its_own_queues(env, caplog):
+    import logging
+    caplog.set_level(logging.INFO, logger="worker")
+    r = env
+    worker.QUEUES = ["default", "mail"]
+    await queueing.pause_queue(r, "other-app")
+    assert await worker._refresh_paused() is False, "not one of this worker's queues"
+    await queueing.pause_queue(r, "mail")
+    assert await worker._refresh_paused() is True and worker._pause_changed.is_set()
+    assert "Queue 'mail' was paused" in caplog.text
+    await queueing.resume_queue(r, "mail")
+    assert await worker._refresh_paused() is True and "Queue 'mail' was resumed" in caplog.text

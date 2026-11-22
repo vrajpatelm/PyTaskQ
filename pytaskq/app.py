@@ -370,6 +370,17 @@ class PyTaskQ:
         ok, _ = await queueing.cancel(_redis(), task_id)
         return ok
 
+    async def pause_queue(self, queue: str) -> bool:
+        """
+        Stop workers from starting new jobs from `queue` (within about 2 seconds).
+        Running jobs finish; new jobs still queue up. False if it was already paused.
+        """
+        return await queueing.pause_queue(_redis(), queue)
+
+    async def resume_queue(self, queue: str) -> bool:
+        """Let workers take jobs from `queue` again. False if it wasn't paused."""
+        return await queueing.resume_queue(_redis(), queue)
+
     def __repr__(self) -> str:
         return f"<PyTaskQ {self.name!r} tasks={sorted(self.TASKS)}>"
 

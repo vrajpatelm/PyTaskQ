@@ -1744,6 +1744,10 @@ async def _startup(named: str) -> bool:
                      f"anyway: taking and finishing waiting jobs frees memory. New jobs are refused meanwhile.")
     await _check_redis_setup(r)
     await _check_fleet(r)
+    try:
+        await _refresh_paused()
+    except Exception:
+        pass                                   # the pause watcher tries again in a moment
     return True
 
 
@@ -1776,8 +1780,9 @@ def _cpu_modules() -> tuple:
 
 
 async def consumer_task():
-    global QUEUES, WORKER_ID, EXIT_CODE, THREADS_LEFT_RUNNING, _started_at, _loop_tick
+    global QUEUES, WORKER_ID, EXIT_CODE, THREADS_LEFT_RUNNING, _started_at, _loop_tick, _pause_changed, _paused
     EXIT_CODE = THREADS_LEFT_RUNNING = 0
+    _pause_changed, _paused = asyncio.Event(), set()
     _hard_stop.clear()
     concurrency = CPU_WORKERS + IO_WORKERS
     global _SCHEDULE
@@ -1857,6 +1862,7 @@ async def consumer_task():
         asyncio.create_task(_periodic()),
         asyncio.create_task(_progress_writer()),
         asyncio.create_task(_cancel_watcher()),
+        asyncio.create_task(_pause_watcher()),
     ]
     if cpu_pool is not None:
         background.append(asyncio.create_task(_watch_cpu_pool(cpu_pool)))
@@ -1879,7 +1885,12 @@ async def consumer_task():
                 except asyncio.TimeoutError:
                     pass
                 continue
-            keys = pop_keys(QUEUES, turn)
+            serving = [q for q in QUEUES if q not in _paused] if _paused else QUEUES
+            if not serving:                 # every queue this worker serves is paused
+                sem.release()
+                await _wait_for_work([])
+                continue
+            keys = pop_keys(serving, turn)
             turn += 1
             task_json = await redis_client.r.eval(
                 PRIORITY_POP_SCRIPT, 1 + len(keys), _processing_key(), *keys,
@@ -1887,7 +1898,7 @@ async def consumer_task():
 
             if not task_json:
                 sem.release()
-                await _wait_for_work(QUEUES)
+                await _wait_for_work(serving)
                 continue
         except Exception as e:
             sem.release()
@@ -1917,17 +1928,49 @@ async def _wait_for_work(queues: list[str]) -> None:
     a growing delay, which took up to a second to notice a new job.
     """
     keys = [queueing.wake_key(q) for q in queues]
-    waiting = asyncio.ensure_future(redis_client.r.blpop(keys, timeout=IDLE_WAIT))
+    if keys:
+        waiting = asyncio.ensure_future(redis_client.r.blpop(keys, timeout=IDLE_WAIT))
+    else:
+        waiting = asyncio.ensure_future(asyncio.sleep(IDLE_WAIT))
     stopping = asyncio.ensure_future(shutdown_event.wait())
+    paused_or_resumed = asyncio.ensure_future(_pause_changed.wait())
     try:
-        await asyncio.wait({waiting, stopping}, return_when=asyncio.FIRST_COMPLETED)
+        await asyncio.wait({waiting, stopping, paused_or_resumed}, return_when=asyncio.FIRST_COMPLETED)
     finally:
         stopping.cancel()
+        paused_or_resumed.cancel()
+        _pause_changed.clear()
         if not waiting.done():
             waiting.cancel()                   # stopping: redis-py drops that connection
             await asyncio.gather(waiting, return_exceptions=True)
     if waiting.done() and not waiting.cancelled():
         waiting.result()                       # a Redis error: the main loop backs off
+
+
+_paused: set = set()                    # paused queues (refreshed every PAUSE_CHECK seconds)
+_pause_changed = asyncio.Event()        # set when a queue was paused or resumed: an idle wait ends at once
+
+
+async def _refresh_paused() -> bool:
+    """Read which queues are paused; True if that changed for a queue this worker serves."""
+    global _paused
+    now = set(await redis_client.r.hkeys(queueing.PAUSED_KEY))
+    changed = (now ^ _paused) & set(QUEUES)
+    for q in sorted(changed):
+        logger.info(f"Queue '{q}' was {'paused: no new jobs are started from it' if q in now else 'resumed'}.")
+    _paused = now
+    if changed:
+        _pause_changed.set()
+    return bool(changed)
+
+
+async def _pause_watcher():
+    while True:
+        await asyncio.sleep(queueing.PAUSE_CHECK)
+        try:
+            await _refresh_paused()
+        except Exception as e:
+            logger.debug(f"[Pause] Couldn't read paused queues ({e})")
 
 
 async def _shutdown(background, heart, cpu_pool, io_pool):

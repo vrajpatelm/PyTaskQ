@@ -27,7 +27,7 @@ const EMPTY_METRICS = {
 };
 
 // Queues that matter right now: they have jobs waiting or a worker serving them.
-const queuesInUse = m => (m.queues || []).filter(q => q.total > 0 || q.workers > 0);
+const queuesInUse = m => (m.queues || []).filter(q => q.total > 0 || q.workers > 0 || q.paused);
 const showsQueues = m => {
   const used = queuesInUse(m);
   return used.length > 1 || (used.length === 1 && used[0].name !== 'default');
@@ -130,23 +130,44 @@ function Lifecycle({ m, onAdvice }) {
   );
 }
 
-function QueueStrip({ m, active, onPick }) {
+function QueueStrip({ m, active, onPick, canOperate, notify }) {
   const queues = queuesInUse(m);
+  const [busy, setBusy] = useState('');
+  const toggle = async q => {
+    setBusy(q.name);
+    try {
+      await api(`/queues/${encodeURIComponent(q.name)}/${q.paused ? 'resume' : 'pause'}`, { method: 'POST' });
+      notify('success', q.paused ? `Queue '${q.name}' resumed.`
+        : `Queue '${q.name}' paused. Running jobs finish; new jobs wait until you resume it.`);
+    } catch (e) { notify('error', e.message); }
+    finally { setBusy(''); }
+  };
   return (
     <section className="queue-strip" aria-label="Queues">
       <span className="queue-strip-label">Queues</span>
       {queues.map(q => {
-        const stranded = q.total > 0 && q.workers === 0;
+        const stranded = q.total > 0 && q.workers === 0 && !q.paused;
         return (
-          <button key={q.name} className={`queue-chip ${stranded ? 'stranded' : ''} ${active === q.name ? 'active' : ''}`}
-            aria-pressed={active === q.name} onClick={() => onPick(active === q.name ? '' : q.name)}
-            title={stranded ? 'Jobs are waiting but no running worker serves this queue' : `Show jobs on queue '${q.name}'`}>
-            <span className="queue-chip-name">{q.name}</span>
-            <span className="queue-chip-count">{q.total} waiting</span>
-            <span className="queue-chip-workers">
-              {stranded ? <><AlertTriangle size={12} /> no worker</> : `${q.workers} worker${q.workers === 1 ? '' : 's'}`}
-            </span>
-          </button>
+          <div key={q.name} className={`queue-chip-wrap ${q.paused ? 'paused' : ''}`}>
+            <button className={`queue-chip ${stranded ? 'stranded' : ''} ${q.paused ? 'paused' : ''} ${active === q.name ? 'active' : ''}`}
+              aria-pressed={active === q.name} onClick={() => onPick(active === q.name ? '' : q.name)}
+              title={q.paused ? `Paused: workers don't start new jobs from '${q.name}'`
+                : stranded ? 'Jobs are waiting but no running worker serves this queue' : `Show jobs on queue '${q.name}'`}>
+              <span className="queue-chip-name">{q.name}</span>
+              <span className="queue-chip-count">{q.total} waiting</span>
+              <span className="queue-chip-workers">
+                {q.paused ? <><Pause size={12} /> paused</>
+                  : stranded ? <><AlertTriangle size={12} /> no worker</> : `${q.workers} worker${q.workers === 1 ? '' : 's'}`}
+              </span>
+            </button>
+            {canOperate && (
+              <button className="icon-btn queue-pause" onClick={() => toggle(q)} disabled={busy === q.name}
+                aria-label={q.paused ? `Resume queue ${q.name}` : `Pause queue ${q.name}`}
+                title={q.paused ? 'Resume: workers take jobs from this queue again' : 'Pause: stop starting new jobs from this queue'}>
+                {q.paused ? <Play size={14} /> : <Pause size={14} />}
+              </button>
+            )}
+          </div>
         );
       })}
     </section>
@@ -858,8 +879,9 @@ function Dashboard({ me, authEnabled, onSignOut, theme, setTheme }) {
       </header>
 
       <Lifecycle m={{ ...metrics, worker_count: workerCount }} onAdvice={() => setTab('settings')} />
-      {showsQueues(metrics) && (
-        <QueueStrip m={metrics} active={queueFilter} onPick={q => { setQueueFilter(q); setTab('jobs'); }} />
+      {(showsQueues(metrics) || canOperate || queuesInUse(metrics).some(q => q.paused)) && queuesInUse(metrics).length > 0 && (
+        <QueueStrip m={metrics} active={queueFilter} onPick={q => { setQueueFilter(q); setTab('jobs'); }}
+          canOperate={canOperate} notify={notify} />
       )}
       {workerCount === 0 && tab !== 'workers' && <GettingStarted />}
 

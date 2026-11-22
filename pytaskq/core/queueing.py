@@ -700,6 +700,44 @@ return redis.call('SREM', KEYS[1], ARGV[1])
 """
 
 
+# ── Pausing queues ───────────────────────────────────────────────────────────
+# HASH queue name → JSON {"by", "at"}. Workers read it every PAUSE_CHECK seconds and
+# don't start new jobs from a paused queue; running jobs finish, new jobs still queue up.
+PAUSED_KEY = rkey("pytaskq:paused")
+PAUSE_CHECK = 2.0
+
+
+async def paused_queues(r) -> dict[str, dict]:
+    """Paused queues: name → {"by": who, "at": when}."""
+    out = {}
+    for name, raw in (await r.hgetall(PAUSED_KEY)).items():
+        try:
+            out[name] = json.loads(raw)
+        except ValueError:
+            out[name] = {}
+    return out
+
+
+async def pause_queue(r, name: str, by: Optional[str] = None) -> bool:
+    """Stop workers from starting new jobs from `name` (within PAUSE_CHECK seconds). False if already paused."""
+    check_queue_name(name)
+    added = await r.hsetnx(PAUSED_KEY, name, json.dumps({"by": by or "app", "at": clock.now()}))
+    await r.publish(EVENTS_CHANNEL, "update")
+    return bool(added)
+
+
+async def resume_queue(r, name: str) -> bool:
+    """Let workers take jobs from `name` again, and wake them. False if it wasn't paused."""
+    check_queue_name(name)
+    async with r.pipeline(transaction=False) as pipe:
+        pipe.hdel(PAUSED_KEY, name)
+        pipe.lpush(wake_key(name), *(["1"] * 20))       # idle workers notice at once
+        pipe.ltrim(wake_key(name), 0, WAKE_CAP - 1)
+        pipe.publish(EVENTS_CHANNEL, "update")
+        removed, *_ = await pipe.execute()
+    return bool(removed)
+
+
 async def prune_queues(r) -> list[str]:
     """
     Forget queue names nothing uses any more: no waiting jobs, no live worker
@@ -724,6 +762,7 @@ async def prune_queues(r) -> list[str]:
     for q in served:
         keep.update(x for x in (q or "").split(",") if x)
     keep.update(t.get("queue") or DEFAULT_QUEUE for t in await registered_tasks(r))
+    keep.update(await r.hkeys(PAUSED_KEY))              # a paused queue stays listed, so it can be resumed
     for raw in delayed:
         try:
             keep.add(payload_queue(json.loads(raw)))
@@ -751,7 +790,8 @@ async def queue_overview(r) -> dict:
         pipe.zrange(rkey("active_workers"), 0, -1, withscores=True)
         pipe.zcard(rkey("delayed_tasks"))
         pipe.llen(rkey("dlq"))
-        names, redis_time, workers, delayed, dlq = await pipe.execute()
+        pipe.hgetall(PAUSED_KEY)
+        names, redis_time, workers, delayed, dlq, paused = await pipe.execute()
     clock.update(redis_time)
     now = clock.now()      # Redis's clock: the one heartbeats are written with
     live_workers = [w for w, expires in workers if expires >= now]
@@ -774,7 +814,7 @@ async def queue_overview(r) -> dict:
             if q:
                 served[q] = served.get(q, 0) + 1
     lengths = counts[2 * len(live_workers):]
-    names = sorted(set(known) | set(served), key=lambda n: (n != DEFAULT_QUEUE, n))
+    names = sorted(set(known) | set(served) | set(paused), key=lambda n: (n != DEFAULT_QUEUE, n))
     queues = []
     for name in names:
         if name in known:
@@ -783,7 +823,8 @@ async def queue_overview(r) -> dict:
         else:
             high = default = low = 0
         queues.append({"name": name, "high": high, "default": default, "low": low,
-                       "total": high + default + low, "workers": served.get(name, 0)})
+                       "total": high + default + low, "workers": served.get(name, 0),
+                       "paused": name in paused})
     return {
         "queues": queues,
         "waiting": sum(q["total"] for q in queues),

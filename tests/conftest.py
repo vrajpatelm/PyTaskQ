@@ -53,6 +53,8 @@ async def reset_worker_globals():
     # Fresh events per test: an asyncio.Event belongs to the event loop that first waited on it.
     worker.shutdown_event = asyncio.Event()
     worker._hard_stop = asyncio.Event()
+    worker._pause_changed = asyncio.Event()
+    worker._paused = set()
     worker.active_tasks.clear()
     pressure._pending.clear()
     yield

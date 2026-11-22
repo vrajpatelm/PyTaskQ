@@ -448,6 +448,10 @@ tr:hover .name-cell .icon-btn, .name-cell .icon-btn:focus-visible { opacity: 1; 
 .queue-chip-count { font-size: 0.8rem; font-variant-numeric: tabular-nums; }
 .queue-chip-workers { font-size: 0.74rem; color: var(--text-secondary); display: inline-flex; align-items: center; gap: 0.2rem; }
 .queue-chip.stranded { border-color: var(--status-warning-border); background: var(--status-warning-bg); }
+.queue-chip-wrap { display: inline-flex; align-items: center; gap: 0.15rem; }
+.queue-chip.paused { border-style: dashed; opacity: 0.85; }
+.queue-chip.paused .queue-chip-workers { color: var(--text-primary); font-weight: 600; }
+.queue-pause { width: 28px; height: 28px; align-items: center; justify-content: center; }
 .queue-chip.stranded .queue-chip-workers { color: var(--warning-color); font-weight: 600; }
 .task-pick-meta { display: flex; flex-wrap: wrap; gap: 0.6rem; }
 .callout-inline { display: flex; gap: 0.4rem; align-items: flex-start; font-size: 0.86rem; color: var(--text-secondary); margin: 0; }
