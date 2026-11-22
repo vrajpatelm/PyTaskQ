@@ -3,6 +3,7 @@ from fastapi import APIRouter, Depends
 
 from pytaskq.core import clock, redis_client
 from pytaskq.core.dependencies import require
+from pytaskq.core.keys import k as rkey
 
 router = APIRouter(prefix="/system", tags=["system"], dependencies=[Depends(require("viewer"))])
 
@@ -10,16 +11,16 @@ router = APIRouter(prefix="/system", tags=["system"], dependencies=[Depends(requ
 @router.get("/stats")
 async def get_system_stats():
     stats = await redis_client.r.mget(
-        "stats:pending",
-        "stats:processing",
-        "stats:completed",
-        "stats:failed",
-        "stats:delayed",
-        "stats:dlq"
+        rkey("stats:pending"),
+        rkey("stats:processing"),
+        rkey("stats:completed"),
+        rkey("stats:failed"),
+        rkey("stats:delayed"),
+        rkey("stats:dlq")
     )
 
     stats = [max(0, int(s)) if s else 0 for s in stats]
-    workers = await redis_client.r.zcount("active_workers", await clock.sync(redis_client.r), "+inf")
+    workers = await redis_client.r.zcount(rkey("active_workers"), await clock.sync(redis_client.r), "+inf")
 
     return {
         "pending": stats[0],
@@ -43,11 +44,11 @@ async def load_workers() -> list[dict]:
     """Every live worker with its pool sizes and counters (two Redis round trips)."""
     async with redis_client.r.pipeline(transaction=False) as pipe:
         pipe.time()
-        pipe.zrange("active_workers", 0, -1, withscores=True)
+        pipe.zrange(rkey("active_workers"), 0, -1, withscores=True)
         redis_time, workers_with_scores = await pipe.execute()
     async with redis_client.r.pipeline(transaction=False) as pipe:
         for worker_id, _ in workers_with_scores:
-            pipe.hgetall(f"worker:{worker_id}")
+            pipe.hgetall(rkey(f"worker:{worker_id}"))
         infos = await pipe.execute() if workers_with_scores else []
     worker_list = []
     clock.update(redis_time)

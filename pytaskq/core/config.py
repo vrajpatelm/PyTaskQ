@@ -21,6 +21,7 @@ class Settings(BaseSettings):
 
     # ── Queue behaviour ──────────────────────────────────────────────────────
     QUEUE_CAPACITY: int = 500          # jobs that can wait in EACH queue before the API answers 429 (0 = no limit)
+    REDIS_KEY_PREFIX: str = ""         # put every PyTaskQ key under "{prefix}:" (share a Redis; Cluster-ready)
     PRIORITY_WEIGHTS: str = "6,3,1"    # share of pops that prefer high,default,low jobs; "strict" = high always first
     MAX_QUEUES: int = 100              # how many queue names may exist (0 = no limit); unused ones are forgotten
     TASK_TIMEOUT: float = 300          # default per-task timeout (seconds, 0 = none)

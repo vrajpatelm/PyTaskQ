@@ -56,6 +56,7 @@ from pytaskq.core.config import settings
 from pytaskq.pools import CpuPool, IoPool, PoolBroken, ProcessCrashed, TaskTimeoutError  # noqa: F401  (re-exported)
 from pytaskq.schemas.requests import Taskloader, Taskresult  # noqa: F401  (Taskresult kept for API compat)
 from pytaskq.tracing import extract_trace_context, init_tracer, inject_trace_context  # noqa: F401  (re-exported)
+from pytaskq.core.keys import fill_scripts, k as rkey, strip as strip_prefix
 
 TASKS = {}
 APP_NAME = ""
@@ -63,7 +64,7 @@ QUEUES: list[str] = []          # the queues this worker serves (set at startup)
 QUEUES_OVERRIDE = ""            # `pytaskq worker --queues a,b` (else WORKER_QUEUES, else its tasks' queues)
 NAME_OVERRIDE = ""              # `pytaskq worker --name x` (else WORKER_NAME, else a random id)
 HAND_BACK_FOR = 600             # seconds a job keeps being handed back for a worker that has its task
-WORKERS_KEY = "pytaskq:workers"  # SET of every worker id that may own a processing_queue
+WORKERS_KEY = rkey("pytaskq:workers")  # SET of every worker id that may own a processing_queue
 EXIT_CODE = 0                   # non-zero when the worker stopped because it couldn't work any more
 THREADS_LEFT_RUNNING = 0        # IO threads still busy at exit (the CLI exits without waiting for them)
 
@@ -273,7 +274,7 @@ local removed = redis.call('LREM', KEYS[1], 1, ARGV[1])
 if removed == 0 and ARGV[3] == '1' then return -1 end
 local current = redis.call('GET', KEYS[2])
 if current and current ~= ARGV[2] then
-    redis.call('PUBLISH', 'events:global', 'update')
+    redis.call('PUBLISH', '__PYTASKQ__events:global', 'update')
     return 0
 end
 redis.call('HSET', KEYS[3], 'task_id', ARGV[4], 'status', 'Success', 'result', ARGV[5],
@@ -287,7 +288,7 @@ redis.call('EXPIRE', KEYS[3], tonumber(ARGV[9]))
 pytaskq_keep(KEYS[6], ARGV[4], ARGV[6], tonumber(ARGV[10]), ARGV[11])
 redis.call('INCR', KEYS[5])
 redis.call('HINCRBY', KEYS[4], 'processed', 1)
-redis.call('PUBLISH', 'events:global', 'update')
+redis.call('PUBLISH', '__PYTASKQ__events:global', 'update')
 return 1
 """
 
@@ -303,7 +304,7 @@ local removed = redis.call('LREM', KEYS[1], 1, ARGV[1])
 if removed == 0 and ARGV[3] == '1' then return -1 end
 local current = redis.call('GET', KEYS[2])
 if current and current ~= ARGV[2] then
-    redis.call('PUBLISH', 'events:global', 'update')
+    redis.call('PUBLISH', '__PYTASKQ__events:global', 'update')
     return 0
 end
 redis.call('INCR', KEYS[6])
@@ -326,7 +327,7 @@ else
     redis.call('EXPIRE', KEYS[3], tonumber(ARGV[7]))
     pytaskq_keep(KEYS[7], ARGV[9], ARGV[10], tonumber(ARGV[11]), ARGV[12])
 end
-redis.call('PUBLISH', 'events:global', 'update')
+redis.call('PUBLISH', '__PYTASKQ__events:global', 'update')
 return 1 + trimmed
 """
 
@@ -358,7 +359,7 @@ if status then
     redis.call('HDEL', KEYS[4], 'started_at', 'worker_id')
     redis.call('PERSIST', KEYS[4])
 end
-redis.call('PUBLISH', 'events:global', 'update')
+redis.call('PUBLISH', '__PYTASKQ__events:global', 'update')
 return 1
 """
 
@@ -417,7 +418,7 @@ for qi, _ in pairs(used) do
     redis.call('SADD', KEYS[2], ARGV[2 + qi])
     pytaskq_wake(KEYS[2 + nq * 3 + qi], 100)
 end
-if moved > 0 then redis.call('PUBLISH', 'events:global', 'update') end
+if moved > 0 then redis.call('PUBLISH', '__PYTASKQ__events:global', 'update') end
 return {moved, full}
 """
 
@@ -444,7 +445,7 @@ pytaskq_keep(KEYS[6], ARGV[4], ARGV[6], tonumber(ARGV[10]), ARGV[11])
 redis.call('LPUSH', KEYS[4], ARGV[4])
 redis.call('LTRIM', KEYS[4], 0, tonumber(ARGV[8]) - 1)
 redis.call('INCR', KEYS[5])
-redis.call('PUBLISH', 'events:global', 'update')
+redis.call('PUBLISH', '__PYTASKQ__events:global', 'update')
 return 1
 """
 
@@ -454,7 +455,7 @@ STARTED_SCRIPT = """
 local unpack = unpack or table.unpack
 redis.call('PERSIST', KEYS[1])
 redis.call('HSET', KEYS[1], unpack(ARGV))
-redis.call('PUBLISH', 'events:global', 'update')
+redis.call('PUBLISH', '__PYTASKQ__events:global', 'update')
 return 1
 """
 
@@ -485,7 +486,7 @@ return 1
 
 
 def _processing_key(worker_id: Optional[str] = None) -> str:
-    return f"processing_queue:{worker_id or WORKER_ID}"
+    return rkey(f"processing_queue:{worker_id or WORKER_ID}")
 
 
 def _priority(payload: dict) -> str:
@@ -533,7 +534,7 @@ async def _with_retries(op, what: str, task_id: str = ""):
 
 async def is_leader() -> bool:
     try:
-        return bool(await redis_client.r.eval(LEADER_SCRIPT, 1, "pytaskq:leader_lock", WORKER_ID, 20))
+        return bool(await redis_client.r.eval(LEADER_SCRIPT, 1, rkey("pytaskq:leader_lock"), WORKER_ID, 20))
     except Exception as e:
         logger.warning(f"[Leader Election] Redis error: {e}")
         return False
@@ -577,7 +578,7 @@ async def run_due_cron_jobs(now: float = None) -> int:
                 continue
             # One run per LOCAL clock time: when clocks go back, 01:30 happens twice,
             # and the second one finds the first one's lock (standard cron runs once too).
-            lock = f"cron_lock:{task_name}:{zone_name}:{prev_tick.strftime('%Y-%m-%dT%H:%M')}"
+            lock = rkey(f"cron_lock:{task_name}:{zone_name}:{prev_tick.strftime('%Y-%m-%dT%H:%M')}")
             queue = task_info.get("queue") or queueing.DEFAULT_QUEUE
             payload = queueing.new_payload(task_name, priority=task_info.get("priority") or "default", queue=queue)
             # The lock only has to outlive the tick (and clocks going back an hour): 3 hours, not 30 days
@@ -620,7 +621,7 @@ async def _promote_due_tasks(now: float = None) -> int:
     moved_total, offset, batches = 0, 0, 0
     while batches < PROMOTE_MAX_BATCHES:
         batches += 1
-        raws = await r.zrangebyscore("delayed_tasks", "-inf", now, start=offset, num=PROMOTE_BATCH)
+        raws = await r.zrangebyscore(rkey("delayed_tasks"), "-inf", now, start=offset, num=PROMOTE_BATCH)
         if not raws:
             break
         queues: list[str] = []
@@ -631,7 +632,7 @@ async def _promote_due_tasks(now: float = None) -> int:
             except ValueError:
                 data = None
             if not isinstance(data, dict) or not isinstance(data.get("task_id"), str):
-                await _dead_letter_invalid(r, raw, "not a JSON object with a task_id", source="delayed_tasks")
+                await _dead_letter_invalid(r, raw, "not a JSON object with a task_id", source=rkey("delayed_tasks"))
                 continue
             queue = queueing.payload_queue(data)
             if queue not in queues:
@@ -639,7 +640,7 @@ async def _promote_due_tasks(now: float = None) -> int:
             items.append((raw, queues.index(queue) + 1,
                           queueing.queue_key(_priority(data), queue), queueing.task_key(data["task_id"])))
         if items:
-            keys = (["delayed_tasks", queueing.QUEUES_KEY] + [k for q in queues for k in queueing.queue_keys(q)]
+            keys = ([rkey("delayed_tasks"), queueing.QUEUES_KEY] + [k for q in queues for k in queueing.queue_keys(q)]
                     + [queueing.wake_key(q) for q in queues])
             argv: list = [max(0, settings.QUEUE_CAPACITY), len(queues), *queues]
             for raw, qi, target, hash_key in items:
@@ -688,8 +689,8 @@ async def _sweep_dead_workers() -> int:
     r = redis_client.r
     now = await clock.sync(r)
     async with r.pipeline(transaction=False) as pipe:
-        pipe.zrangebyscore("active_workers", "-inf", now)
-        pipe.zrange("active_workers", 0, -1)
+        pipe.zrangebyscore(rkey("active_workers"), "-inf", now)
+        pipe.zrange(rkey("active_workers"), 0, -1)
         pipe.smembers(WORKERS_KEY)
         expired, listed, known = await pipe.execute()
     alive = set(listed) - set(expired)
@@ -697,8 +698,8 @@ async def _sweep_dead_workers() -> int:
     if not _scanned_legacy:
         # Once per leader: processing lists left by workers older than 0.4.1 (not in WORKERS_KEY).
         _scanned_legacy = True
-        async for key in r.scan_iter(match="processing_queue:*", count=500):
-            worker_id = key.split(":", 1)[1]
+        async for key in r.scan_iter(match=rkey("processing_queue:*"), count=500):
+            worker_id = strip_prefix(key).split(":", 1)[1]
             if worker_id not in alive and worker_id not in gone:
                 gone.append(worker_id)
     total = 0
@@ -706,7 +707,7 @@ async def _sweep_dead_workers() -> int:
         if worker_id == WORKER_ID:
             continue          # never take jobs from ourselves (our heartbeat thread may just be late)
         recovered = await _recover_worker(worker_id, f"Recovered from worker {worker_id}, which stopped")
-        await r.eval(FORGET_WORKER_SCRIPT, 3, "active_workers", f"worker:{worker_id}", WORKERS_KEY,
+        await r.eval(FORGET_WORKER_SCRIPT, 3, rkey("active_workers"), rkey(f"worker:{worker_id}"), WORKERS_KEY,
                      worker_id, repr(clock.now()))
         total += recovered
         if recovered:
@@ -725,13 +726,13 @@ async def _put_back(r, worker_id: str, raw: str, note: str, side: str = "front")
         return 2
     task_id = data["task_id"]
     for _ in range(5):
-        current = await r.get(f"fence:{task_id}")
+        current = await r.get(rkey(f"fence:{task_id}"))
         token = max(_as_int(current), _as_int(data.get("fence_token"))) + 1
         new_raw = json.dumps({**data, "fence_token": token})
         queue = queueing.payload_queue(data)
         result = await r.eval(
             PUT_BACK_SCRIPT, 6,
-            _processing_key(worker_id), f"fence:{task_id}",
+            _processing_key(worker_id), rkey(f"fence:{task_id}"),
             queueing.queue_key(_priority(data), queue), queueing.task_key(task_id), queueing.QUEUES_KEY,
             queueing.wake_key(queue),
             raw, new_raw, current or "", str(token), note, side, queue,
@@ -822,7 +823,7 @@ class _Heartbeat(threading.Thread):
         info = {**_worker_info(), **_health(), "last_seen": now, "started_at": _started_at or now,
                 "loop_blocked_seconds": round(self.blocked_for) if self.blocked_for >= LOOP_BLOCKED_WARN else 0}
         fields = [str(x) for kv in info.items() for x in kv]
-        c.eval(HEARTBEAT_SCRIPT, 4, "active_workers", f"worker:{WORKER_ID}", WORKERS_KEY, queueing.QUEUES_KEY,
+        c.eval(HEARTBEAT_SCRIPT, 4, rkey("active_workers"), rkey(f"worker:{WORKER_ID}"), WORKERS_KEY, queueing.QUEUES_KEY,
                WORKER_ID, repr(now + HEARTBEAT_TTL), HEARTBEAT_TTL * 4, len(QUEUES), *QUEUES, *fields)
 
     def _watchdog(self) -> None:
@@ -923,8 +924,8 @@ async def _dead_letter_invalid(r, raw: str, error: str, *, source: str) -> bool:
         entry["raw_truncated_from"] = len(text)
     done = await r.eval(
         INVALID_SCRIPT, 6,
-        source, "dlq", queueing.task_key(task_id), queueing.RECENT_KEY, "stats:failed", queueing.FINISHED_KEY,
-        raw, "zset" if source == "delayed_tasks" else "list", json.dumps(entry), task_id,
+        source, rkey("dlq"), queueing.task_key(task_id), queueing.RECENT_KEY, rkey("stats:failed"), queueing.FINISHED_KEY,
+        raw, "zset" if source == rkey("delayed_tasks") else "list", json.dumps(entry), task_id,
         f"Invalid job: {error}", repr(now), int(settings.RESULT_TTL), max(1, settings.HISTORY_LIMIT),
         max(0, settings.DLQ_LIMIT), *queueing.keep_args(),
     )
@@ -965,7 +966,7 @@ async def _record_failure(r, tasks, task_json, task_id, error, max_retries) -> s
         entry, due, ttl = json.dumps(dlq_entry), "0", str(int(settings.RESULT_TTL))
         fields = {"task_id": task_id, "status": queueing.DEAD_LETTER, "finished_at": finished_at,
                   "error": f"Failed after {tasks.retry_count} retries. Last error: {error}"}
-        target = "dlq"
+        target = rkey("dlq")
     else:
         tasks.retry_count += 1
         base, max_delay = 1.0, 30.0
@@ -975,14 +976,14 @@ async def _record_failure(r, tasks, task_json, task_id, error, max_retries) -> s
         fields = {"task_id": task_id, "status": queueing.RETRY_SCHEDULED, "retry_count": tasks.retry_count,
                   "next_retry_at": finished_at + delay, "payload": entry, "finished_at": finished_at,
                   "error": f"{error}. Retry {tasks.retry_count}/{max_retries} in {delay:.1f}s."}
-        target = "delayed_tasks"
+        target = rkey("delayed_tasks")
     flat = [str(x) for kv in fields.items() for x in kv]
 
     async def save(attempt):
         return int(await r.eval(
             FAIL_SCRIPT, 7,
-            _processing_key(), f"fence:{task_id}", queueing.task_key(task_id), target,
-            f"worker:{WORKER_ID}", "stats:failed", queueing.FINISHED_KEY,
+            _processing_key(), rkey(f"fence:{task_id}"), queueing.task_key(task_id), target,
+            rkey(f"worker:{WORKER_ID}"), rkey("stats:failed"), queueing.FINISHED_KEY,
             task_json, str(tasks.fence_token), "1" if attempt else "0", "dead" if dead else "retry",
             entry, due, ttl, max(0, settings.DLQ_LIMIT), task_id, repr(finished_at), *queueing.keep_args(),
             *flat,
@@ -1043,7 +1044,7 @@ async def _hand_back(r, tasks, task_json, task_id) -> bool:
     due = now + random.uniform(0.5, 2.0)   # via the delayed set, so it doesn't bounce straight back here
     note = (f"Waiting for a worker that has task '{tasks.task_name}' (worker {WORKER_ID} doesn't). "
             f"Give each app its own queue to avoid this.")
-    await _with_retries(lambda _: r.eval(HAND_BACK_SCRIPT, 3, _processing_key(), "delayed_tasks",
+    await _with_retries(lambda _: r.eval(HAND_BACK_SCRIPT, 3, _processing_key(), rkey("delayed_tasks"),
                                          queueing.task_key(task_id), task_json, raw, repr(due), note),
                         "hand a job back", task_id)
     from pytaskq.core import pressure
@@ -1226,7 +1227,7 @@ async def _run(r, tasks, task_json, process_pool, thread_pool) -> None:
                 # Invalidate this attempt; the retry carries the new token so
                 # ITS result is accepted while any late write from this one is not.
                 new_token = int(await _with_retries(
-                    lambda _: r.eval(TIMEOUT_FENCE_SCRIPT, 1, f"fence:{task_id}", str(tasks.fence_token)),
+                    lambda _: r.eval(TIMEOUT_FENCE_SCRIPT, 1, rkey(f"fence:{task_id}"), str(tasks.fence_token)),
                     "record a timeout", task_id))
                 if new_token >= 0:
                     tasks.fence_token = new_token
@@ -1246,8 +1247,8 @@ async def _run(r, tasks, task_json, process_pool, thread_pool) -> None:
         async def save(attempt):
             return int(await r.eval(
                 COMPLETE_SCRIPT, 6,
-                _processing_key(), f"fence:{task_id}", queueing.task_key(task_id),
-                f"worker:{WORKER_ID}", "stats:completed", queueing.FINISHED_KEY,
+                _processing_key(), rkey(f"fence:{task_id}"), queueing.task_key(task_id),
+                rkey(f"worker:{WORKER_ID}"), rkey("stats:completed"), queueing.FINISHED_KEY,
                 task_json, str(tasks.fence_token), "1" if attempt else "0", task_id, encoded,
                 repr(finished_at), repr(duration_ms), dropped, int(settings.RESULT_TTL), *queueing.keep_args(),
             ))
@@ -1333,10 +1334,10 @@ async def _claim_name(r) -> None:
     at once and puts back the jobs it was running. Otherwise it waits for the
     old heartbeat to run out, and refuses to start if that worker is still alive.
     """
-    score = await r.zscore("active_workers", WORKER_ID)
+    score = await r.zscore(rkey("active_workers"), WORKER_ID)
     if score is None or score < clock.now():
         return
-    info = await r.hgetall(f"worker:{WORKER_ID}")
+    info = await r.hgetall(rkey(f"worker:{WORKER_ID}"))
     pid = _as_int(info.get("pid"))
     if info.get("hostname") == HOSTNAME and (pid == os.getpid() or _pid_alive(pid) is False):
         return
@@ -1345,7 +1346,7 @@ async def _claim_name(r) -> None:
     deadline = time.monotonic() + HEARTBEAT_TTL + 5
     while time.monotonic() < deadline:
         await asyncio.sleep(2)
-        latest = await r.zscore("active_workers", WORKER_ID)
+        latest = await r.zscore(rkey("active_workers"), WORKER_ID)
         if latest is None or latest < clock.now():
             return
         if latest > score + 0.5:
@@ -1403,7 +1404,7 @@ async def _startup(named: str) -> bool:
 
     _started_at = clock.now()
     try:
-        await r.hset(f"worker:{WORKER_ID}", mapping={**_worker_info(), "started_at": _started_at})
+        await r.hset(rkey(f"worker:{WORKER_ID}"), mapping={**_worker_info(), "started_at": _started_at})
         await r.sadd(queueing.QUEUES_KEY, *QUEUES)
         await _publish_registry()
     except Exception as e:
@@ -1623,9 +1624,9 @@ async def _shutdown(background, heart, cpu_pool, io_pool):
     try:
         if not await r.exists(_processing_key()):
             # Only leave the fleet with nothing listed; otherwise the leader recovers what's left.
-            await r.zrem("active_workers", WORKER_ID)
+            await r.zrem(rkey("active_workers"), WORKER_ID)
             await r.srem(WORKERS_KEY, WORKER_ID)
-            await r.delete(f"worker:{WORKER_ID}")
+            await r.delete(rkey(f"worker:{WORKER_ID}"))
     except Exception:
         pass
 
@@ -1650,3 +1651,6 @@ async def _shutdown(background, heart, cpu_pool, io_pool):
 
 if __name__ == "__main__":
     asyncio.run(consumer_task())
+
+
+fill_scripts(globals())     # put the key prefix into the Lua scripts above

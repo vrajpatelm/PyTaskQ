@@ -8,6 +8,7 @@ from pytaskq.core.config import settings
 from pytaskq.core.dependencies import _same_origin, authenticate_request, require
 from pytaskq.services.dashboard_service import _get_dashboard_data
 from pytaskq.services.live import broadcaster, min_interval
+from pytaskq.core.keys import k as rkey
 
 router = APIRouter(tags=["dashboard"])
 logger = logging.getLogger("api")
@@ -92,7 +93,7 @@ async def dashboard_websocket(websocket: WebSocket):
                 if tracked_ids:
                     async with redis_client.r.pipeline(transaction=False) as pipe:
                         for tid in tracked_ids:
-                            pipe.hget(f"task:{tid}", "status")
+                            pipe.hget(rkey(f"task:{tid}"), "status")
                         statuses = await pipe.execute()
                     data["task_statuses"] = {t: s for t, s in zip(tracked_ids, statuses) if s}
                 else:

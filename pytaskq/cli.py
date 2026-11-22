@@ -20,6 +20,7 @@ import os
 import sys
 
 from dotenv import load_dotenv
+from pytaskq.core.keys import k as rkey
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("pytaskq")
@@ -146,7 +147,7 @@ def cmd_ping(args):
         try:
             await client.ping()
             seconds, micros = await client.time()      # Redis's clock: heartbeats are written with it
-            return await client.zcount("active_workers", seconds + micros / 1e6, "+inf")   # alive ones only
+            return await client.zcount(rkey("active_workers"), seconds + micros / 1e6, "+inf")   # alive ones only
         finally:
             await client.aclose()
 

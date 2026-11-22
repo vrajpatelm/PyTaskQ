@@ -1,6 +1,7 @@
 from fastapi import HTTPException, Request
 from pytaskq.core import redis_client
 from pytaskq.core.config import settings
+from pytaskq.core.keys import k as rkey
 
 def get_client_ip(req: Request) -> str:
     """The caller's IP address (used to throttle sign-in attempts).
@@ -12,7 +13,7 @@ def get_client_ip(req: Request) -> str:
     """
     return req.client.host if req.client else "unknown"
 
-QUEUE_KEYS = ("queue:high", "queue:default", "queue:low")   # the "default" queue's lists
+QUEUE_KEYS = (rkey("queue:high"), rkey("queue:default"), rkey("queue:low"))   # the "default" queue's lists
 RETRY_AFTER_SECONDS = 2
 
 

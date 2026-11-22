@@ -275,3 +275,88 @@ async def test_3_strict_mode_and_empty_priorities(r):
     assert await _drain(r, 5, ["high"]) == ["high"] * 5, "strict: high first"
     assert await _drain(r, 5, worker.priority_schedule("6,3,1")) == ["low"] * 5, \
         "a preferred priority with nothing waiting falls back to the next"
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 4. Key prefix
+# ═════════════════════════════════════════════════════════════════════════════
+
+def test_4_prefix_is_a_cluster_hash_tag():
+    from pytaskq.core import keys
+    assert keys._compute("") == ""
+    assert keys._compute("shop") == "{shop}:"
+    for bad in ("a b", "x" * 60, "{x}", "a:b"):
+        with pytest.raises(SystemExit, match="REDIS_KEY_PREFIX"):
+            keys._compute(bad)
+
+
+def test_4_no_unprefixed_key_names_in_the_code():
+    """Every Redis key must go through keys.k() (rkey); Lua scripts use the __PYTASKQ__ placeholder."""
+    import pathlib
+    import re
+    fam = (r'(?:queue:|processing_queue:|delayed_tasks|dlq"|task:|tasks:recent|fence:|active_workers|worker:|'
+           r'pytaskq:|cron_lock:|stats:|idempotency:|auth:|events:global)')
+    py_lit = re.compile(r'(?<![\w.(])f?"' + fam)
+    lua_lit = re.compile(r"'" + fam.replace('dlq"', "dlq'"))
+    root = pathlib.Path(worker.__file__).parent
+    found = []
+    for path in root.rglob("*.py"):
+        if "static" in path.parts or path.name == "keys.py":
+            continue
+        for n, line in enumerate(path.read_text().splitlines(), 1):
+            code = line.split("#")[0]
+            if (py_lit.search(code) and "rkey(" not in code and "tags=" not in code
+                    and not re.search(r'"\w+":\s', code)):
+                found.append(f"{path.name}:{n}: {line.strip()}")
+            if lua_lit.search(code):
+                found.append(f"{path.name}:{n}: {line.strip()}")
+    assert not found, "\n".join(found)
+
+
+def _redis_server():
+    import shutil
+    return shutil.which("redis-server")
+
+
+@pytest.mark.skipif(not _redis_server(), reason="needs redis-server")
+def test_4_two_installations_share_one_redis(tmp_path):
+    """Everything a prefixed installation writes stays under its prefix; an unprefixed one on the same Redis is untouched."""
+    import os
+    import socket
+    import subprocess
+    import sys
+    import redis as redis_sync
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+    server = subprocess.Popen(["redis-server", "--port", str(port), "--save", "", "--appendonly", "no",
+                               "--dir", str(tmp_path)], stdout=subprocess.DEVNULL)
+    try:
+        client = redis_sync.Redis(port=port, decode_responses=True)
+        for _ in range(50):
+            try:
+                client.ping()
+                break
+            except Exception:
+                time.sleep(0.1)
+        script = os.path.join(os.path.dirname(__file__), "prefix_scenario.py")
+        results = {}
+        for prefix in ("", "shop"):
+            env = {**os.environ, "REDIS_URL": f"redis://127.0.0.1:{port}/0", "REDIS_KEY_PREFIX": prefix}
+            before = set(client.keys("*"))
+            out = subprocess.run([sys.executable, script], env=env, capture_output=True, text=True, timeout=120)
+            assert out.returncode == 0, out.stderr[-3000:]
+            results[prefix] = json.loads(out.stdout.strip().splitlines()[-1])
+            new = set(client.keys("*")) - before
+            if prefix:
+                stray = sorted(k for k in new if not k.startswith("{shop}:"))
+                assert not stray, f"keys outside the prefix: {stray[:20]}"
+                assert len(new) > 30, "the scenario wrote plenty of keys"
+                assert before <= set(client.keys("*")), "the unprefixed installation's keys are untouched"
+            else:
+                assert not any(k.startswith("{") for k in new)
+        assert results[""]["statuses"] == results["shop"]["statuses"], "both installations behave the same"
+        assert results["shop"]["statuses"].get("Success", 0) >= 6
+    finally:
+        server.terminate()
+        server.wait()

@@ -42,6 +42,7 @@ from dataclasses import asdict, dataclass
 from typing import Optional
 
 from pytaskq.core.config import settings
+from pytaskq.core.keys import k as rkey, fill_scripts
 
 ROLES = ("viewer", "operator", "admin")
 ROLE_LEVEL = {role: i for i, role in enumerate(ROLES, start=1)}
@@ -57,9 +58,9 @@ MAX_FAILS_PER_IP = 30
 
 TOKEN_PREFIX = "ptq_"
 
-K_USERS = "auth:users"
-K_INVITES = "auth:invites"
-K_SETUP_CODE = "auth:setup_code"
+K_USERS = rkey("auth:users")
+K_INVITES = rkey("auth:invites")
+K_SETUP_CODE = rkey("auth:setup_code")
 
 
 class AuthError(Exception):
@@ -95,7 +96,7 @@ def _sha(secret: str) -> str:
 
 
 def _k_user(username: str) -> str:
-    return f"auth:user:{username}"
+    return rkey(f"auth:user:{username}")
 
 
 # ── password hashing ─────────────────────────────────────────────────────────
@@ -249,10 +250,10 @@ async def delete_user(r, username: str) -> None:
     if user.role == "admin" and not user.disabled and await _active_admins(r) == [username]:
         raise AuthError("This is the only active admin. Make someone else an admin first.", 409)
     await revoke_all_sessions(r, username)
-    for token_sha in await r.smembers(f"auth:user_tokens:{username}"):
-        await r.delete(f"auth:token:{token_sha}")
+    for token_sha in await r.smembers(rkey(f"auth:user_tokens:{username}")):
+        await r.delete(rkey(f"auth:token:{token_sha}"))
     async with r.pipeline(transaction=True) as pipe:
-        pipe.delete(_k_user(username), f"auth:user_tokens:{username}")
+        pipe.delete(_k_user(username), rkey(f"auth:user_tokens:{username}"))
         pipe.srem(K_USERS, username)
         await pipe.execute()
 
@@ -278,7 +279,7 @@ async def _reserve_attempt(r, username: str, ip: str) -> tuple[int, int]:
     any of them was recorded.
     """
     async with r.pipeline(transaction=True) as pipe:
-        for key in (f"auth:fail:user:{username}", f"auth:fail:ip:{ip}"):
+        for key in (rkey(f"auth:fail:user:{username}"), rkey(f"auth:fail:ip:{ip}")):
             pipe.incr(key)
             pipe.expire(key, LOGIN_WINDOW)
         by_user, _, by_ip, _ = await pipe.execute()
@@ -299,8 +300,8 @@ async def authenticate(r, username: str, password: str, ip: str = "unknown") -> 
 
     # A correct password isn't a failure: clear the user's count, give the IP its attempt back.
     async with r.pipeline(transaction=True) as pipe:
-        pipe.delete(f"auth:fail:user:{name}")
-        pipe.decr(f"auth:fail:ip:{ip}")
+        pipe.delete(rkey(f"auth:fail:user:{name}"))
+        pipe.decr(rkey(f"auth:fail:ip:{ip}"))
         await pipe.execute()
     return _user_from_hash(h)
 
@@ -315,8 +316,8 @@ async def create_session(r, username: str) -> str:
     token = secrets.token_urlsafe(32)
     sha = _sha(token)
     async with r.pipeline(transaction=True) as pipe:
-        pipe.set(f"auth:session:{sha}", username, ex=session_ttl())
-        pipe.sadd(f"auth:user_sessions:{username}", sha)
+        pipe.set(rkey(f"auth:session:{sha}"), username, ex=session_ttl())
+        pipe.sadd(rkey(f"auth:user_sessions:{username}"), sha)
         pipe.hset(_k_user(username), "last_login_at", time.time())  # every sign-in path goes through here
         await pipe.execute()
     return token
@@ -325,24 +326,24 @@ async def create_session(r, username: str) -> str:
 async def user_for_session(r, token: str) -> Optional[User]:
     if not token:
         return None
-    return await _lookup(r, "session", f"auth:session:{_sha(token)}")
+    return await _lookup(r, "session", rkey(f"auth:session:{_sha(token)}"))
 
 
 async def end_session(r, token: str) -> None:
     if not token:
         return
     sha = _sha(token)
-    username = await r.get(f"auth:session:{sha}")
-    await r.delete(f"auth:session:{sha}")
+    username = await r.get(rkey(f"auth:session:{sha}"))
+    await r.delete(rkey(f"auth:session:{sha}"))
     if username:
-        await r.srem(f"auth:user_sessions:{username}", sha)
+        await r.srem(rkey(f"auth:user_sessions:{username}"), sha)
 
 
 async def revoke_all_sessions(r, username: str, keep: Optional[str] = None) -> None:
-    key = f"auth:user_sessions:{username}"
+    key = rkey(f"auth:user_sessions:{username}")
     for sha in await r.smembers(key):
         if sha != keep:
-            await r.delete(f"auth:session:{sha}")
+            await r.delete(rkey(f"auth:session:{sha}"))
             await r.srem(key, sha)
 
 
@@ -358,8 +359,8 @@ async def create_api_token(r, username: str, name: str) -> tuple[str, dict]:
     sha = _sha(token)
     info = {"id": sha[:12], "username": username, "name": name, "created_at": time.time(), "last_used_at": 0}
     async with r.pipeline(transaction=True) as pipe:
-        pipe.hset(f"auth:token:{sha}", mapping=info)
-        pipe.sadd(f"auth:user_tokens:{username}", sha)
+        pipe.hset(rkey(f"auth:token:{sha}"), mapping=info)
+        pipe.sadd(rkey(f"auth:user_tokens:{username}"), sha)
         await pipe.execute()
     return token, _token_view(info)
 
@@ -375,18 +376,18 @@ def _token_view(h: dict) -> dict:
 
 async def list_api_tokens(r, username: str) -> list[dict]:
     out = []
-    for sha in await r.smembers(f"auth:user_tokens:{username}"):
-        h = await r.hgetall(f"auth:token:{sha}")
+    for sha in await r.smembers(rkey(f"auth:user_tokens:{username}")):
+        h = await r.hgetall(rkey(f"auth:token:{sha}"))
         if h:
             out.append(_token_view(h))
     return sorted(out, key=lambda t: t["created_at"], reverse=True)
 
 
 async def revoke_api_token(r, username: str, token_id: str) -> bool:
-    for sha in await r.smembers(f"auth:user_tokens:{username}"):
+    for sha in await r.smembers(rkey(f"auth:user_tokens:{username}")):
         if sha.startswith(token_id) and len(token_id) >= 8:
-            await r.delete(f"auth:token:{sha}")
-            await r.srem(f"auth:user_tokens:{username}", sha)
+            await r.delete(rkey(f"auth:token:{sha}"))
+            await r.srem(rkey(f"auth:user_tokens:{username}"), sha)
             return True
     return False
 
@@ -398,9 +399,9 @@ async def rename_api_token(r, username: str, token_id: str, name: str) -> Option
         raise AuthError("Give the token a name.")
     if len(token_id) < 8:
         return None
-    for sha in await r.smembers(f"auth:user_tokens:{username}"):
+    for sha in await r.smembers(rkey(f"auth:user_tokens:{username}")):
         if sha.startswith(token_id):
-            key = f"auth:token:{sha}"
+            key = rkey(f"auth:token:{sha}")
             if not await r.exists(key):
                 return None
             await r.hset(key, "name", name)
@@ -411,7 +412,7 @@ async def rename_api_token(r, username: str, token_id: str, name: str) -> Option
 async def user_for_api_token(r, token: str) -> Optional[User]:
     if not token or not token.startswith(TOKEN_PREFIX):
         return None
-    user = await _lookup(r, "token", f"auth:token:{_sha(token)}")
+    user = await _lookup(r, "token", rkey(f"auth:token:{_sha(token)}"))
     if user:
         user.via = "token"
     return user
@@ -437,7 +438,7 @@ end
 if not username then
     return false
 end
-return redis.call('HGETALL', 'auth:user:' .. username)
+return redis.call('HGETALL', '__PYTASKQ__auth:user:' .. username)
 """
 TOKEN_TOUCH_SECONDS = 60
 _lookup_script = None
@@ -470,8 +471,8 @@ async def create_invite(r, role: str, created_by: str) -> tuple[str, dict]:
     info = {"id": sha[:12], "role": role, "created_by": created_by,
             "created_at": now, "expires_at": now + INVITE_TTL}
     async with r.pipeline(transaction=True) as pipe:
-        pipe.hset(f"auth:invite:{sha}", mapping=info)
-        pipe.expire(f"auth:invite:{sha}", INVITE_TTL)
+        pipe.hset(rkey(f"auth:invite:{sha}"), mapping=info)
+        pipe.expire(rkey(f"auth:invite:{sha}"), INVITE_TTL)
         pipe.sadd(K_INVITES, sha)
         await pipe.execute()
     return token, _invite_view(info)
@@ -488,14 +489,14 @@ def _invite_view(h: dict) -> dict:
 
 
 async def get_invite(r, token: str) -> Optional[dict]:
-    h = await r.hgetall(f"auth:invite:{_sha(token or '')}")
+    h = await r.hgetall(rkey(f"auth:invite:{_sha(token or '')}"))
     return _invite_view(h) if h else None
 
 
 async def list_invites(r) -> list[dict]:
     out = []
     for sha in await r.smembers(K_INVITES):
-        h = await r.hgetall(f"auth:invite:{sha}")
+        h = await r.hgetall(rkey(f"auth:invite:{sha}"))
         if h:
             out.append(_invite_view(h))
         else:
@@ -506,7 +507,7 @@ async def list_invites(r) -> list[dict]:
 async def revoke_invite(r, invite_id: str) -> bool:
     for sha in await r.smembers(K_INVITES):
         if sha.startswith(invite_id) and len(invite_id) >= 8:
-            await r.delete(f"auth:invite:{sha}")
+            await r.delete(rkey(f"auth:invite:{sha}"))
             await r.srem(K_INVITES, sha)
             return True
     return False
@@ -514,7 +515,7 @@ async def revoke_invite(r, invite_id: str) -> bool:
 
 async def accept_invite(r, token: str, username: str, password: str) -> User:
     sha = _sha(token or "")
-    h = await r.hgetall(f"auth:invite:{sha}")
+    h = await r.hgetall(rkey(f"auth:invite:{sha}"))
     if not h:
         raise AuthError("This invite link is invalid or has expired. Ask an admin for a new one.", 404)
     # Validate everything before consuming the invite, so a typo doesn't burn it.
@@ -523,7 +524,7 @@ async def accept_invite(r, token: str, username: str, password: str) -> User:
     if await r.exists(_k_user(username)):
         raise AuthError(f"The username '{username}' is taken.", 409)
     # Consume atomically: only one person can use a link.
-    if not await r.delete(f"auth:invite:{sha}"):
+    if not await r.delete(rkey(f"auth:invite:{sha}")):
         raise AuthError("This invite link has already been used.", 409)
     await r.srem(K_INVITES, sha)
     return await create_user(r, username, password, h["role"], created_by=h.get("created_by", ""))
@@ -584,7 +585,7 @@ async def complete_setup(r, code: str, username: str, password: str) -> User:
         raise AuthError("That setup code is not right. Use the newest code in the PyTaskQ server log, or run "
                         "`pytaskq users setup-code` on the server to print it.", 403)
     # Lock so two browsers can't both finish setup at the same moment
-    if not await r.set("auth:setup_lock", "1", nx=True, ex=30):
+    if not await r.set(rkey("auth:setup_lock"), "1", nx=True, ex=30):
         raise AuthError("Setup is already in progress.", 409)
     try:
         # Check again under the lock: another browser may have just finished.
@@ -594,7 +595,7 @@ async def complete_setup(r, code: str, username: str, password: str) -> User:
         await r.delete(K_SETUP_CODE)
         return user
     finally:
-        await r.delete("auth:setup_lock")
+        await r.delete(rkey("auth:setup_lock"))
 
 
 async def bootstrap_from_env(r) -> Optional[User]:
@@ -626,3 +627,6 @@ def master_key_user() -> User:
 def matches_master_key(token: str) -> bool:
     key = settings.MASTER_KEY
     return bool(key) and len(key) >= 16 and hmac.compare_digest(token.encode(), key.encode())
+
+
+fill_scripts(globals())     # put the key prefix into the Lua scripts above

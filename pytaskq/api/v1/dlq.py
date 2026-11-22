@@ -7,11 +7,12 @@ from pytaskq.core import queueing, redis_client
 from pytaskq.core.config import settings
 from pytaskq.core.dependencies import require
 from pytaskq.services.dashboard_service import _notify_tenant
+from pytaskq.core.keys import k as rkey
 
 router = APIRouter(prefix="/dlq", tags=["dlq"], dependencies=[Depends(require("viewer"))])
 _operator = [Depends(require("operator"))]
 
-DLQ_KEY = "dlq"
+DLQ_KEY = rkey("dlq")
 _DLQ_ONLY_FIELDS = ("error", "failed_at")
 _NOT_REPLAYABLE = ("This entry isn't a valid job: it was found in a queue and kept here so you can see what was "
                    "sent (its text is in 'raw'). It can't run; delete it.")
@@ -75,7 +76,7 @@ async def _fresh_payload(item: dict) -> dict:
     task["prev_delay"] = 1.0
     task["bounces"] = 0
     task.pop("handed_back_since", None)
-    current_fence = await redis_client.r.get(f"fence:{task.get('task_id')}")
+    current_fence = await redis_client.r.get(rkey(f"fence:{task.get('task_id')}"))
     if current_fence is not None:
         task["fence_token"] = int(current_fence)
     return task

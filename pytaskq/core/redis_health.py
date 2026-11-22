@@ -26,6 +26,7 @@ import time
 from typing import Optional
 
 from redis import exceptions as redis_errors
+from pytaskq.core.keys import k as rkey, fill_scripts
 
 logger = logging.getLogger("pytaskq")
 
@@ -37,9 +38,9 @@ logger = logging.getLogger("pytaskq")
 # when Redis is full. Used only for steps that free memory overall or keep the
 # fleet running (taking and finishing jobs, heartbeats, leader election) —
 # never for queueing new work.
-OOM_PROBE = "redis.call('DEL', 'pytaskq:oom-probe')\n"
+OOM_PROBE = "redis.call('DEL', '__PYTASKQ__pytaskq:oom-probe')\n"
 
-INSTALL_KEY = "pytaskq:install"       # hash: created_at, data_lost_at (marker for data loss)
+INSTALL_KEY = rkey("pytaskq:install")       # hash: created_at, data_lost_at (marker for data loss)
 MEMORY_WARN_RATIO = 0.9
 
 
@@ -222,3 +223,6 @@ def retention_problems(mem: dict, ret: dict) -> list[dict]:
                    f"and Redis's limit is {_mb(limit)} ({_mb(used)} used now). Lower FINISHED_JOBS_KEPT or "
                    f"RESULT_TTL, or raise maxmemory."),
     }]
+
+
+fill_scripts(globals())     # put the key prefix into the Lua scripts above

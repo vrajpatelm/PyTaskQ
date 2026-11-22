@@ -26,6 +26,7 @@ from typing import Any, Iterable, Optional
 from pytaskq import tracing
 from pytaskq.core import clock
 from pytaskq.core.config import settings
+from pytaskq.core.keys import k as rkey, fill_scripts
 
 PRIORITIES = ("high", "default", "low")
 
@@ -38,7 +39,7 @@ PRIORITIES = ("high", "default", "low")
 # already waiting in Redis keep working after an upgrade.
 DEFAULT_QUEUE = "default"
 QUEUE_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,49}$")
-QUEUES_KEY = "pytaskq:queues"    # SET of every queue name that has been used
+QUEUES_KEY = rkey("pytaskq:queues")    # SET of every queue name that has been used
 
 # Task lifecycle states stored in task:{id} → status
 QUEUED = "Queued"
@@ -55,15 +56,15 @@ ALL_STATES = (QUEUED, SCHEDULED, PROCESSING, RETRY_SCHEDULED, SUCCESS, FAILED, D
 
 MAX_DELAY_SECONDS = 365 * 24 * 3600   # the longest delay a job can be scheduled with
 
-RECENT_KEY = "tasks:recent"
-REGISTRY_KEY = "pytaskq:registry"              # HASH task name → spec (JSON)
-REGISTRY_SEEN_KEY = "pytaskq:registry:seen"    # ZSET task name → last time something advertised it
+RECENT_KEY = rkey("tasks:recent")
+REGISTRY_KEY = rkey("pytaskq:registry")              # HASH task name → spec (JSON)
+REGISTRY_SEEN_KEY = rkey("pytaskq:registry:seen")    # ZSET task name → last time something advertised it
 REGISTRY_TTL = 300                             # a task disappears 5 min after nothing advertises it
-EVENTS_CHANNEL = "events:global"
+EVENTS_CHANNEL = rkey("events:global")
 
 
 def task_key(task_id: str) -> str:
-    return f"task:{task_id}"
+    return rkey(f"task:{task_id}")
 
 
 def check_queue_name(name: Optional[str]) -> str:
@@ -85,8 +86,8 @@ def queue_key(priority: str, queue: str = DEFAULT_QUEUE) -> str:
     """The Redis list for one priority of one queue."""
     priority = priority if priority in PRIORITIES else "default"
     if not queue or queue == DEFAULT_QUEUE:
-        return f"queue:{priority}"            # the original key names
-    return f"queue:{queue}:{priority}"
+        return rkey(f"queue:{priority}")            # the original key names
+    return rkey(f"queue:{queue}:{priority}")
 
 
 def queue_keys(queue: str = DEFAULT_QUEUE) -> list[str]:
@@ -180,7 +181,7 @@ FINAL_STATUSES = ("Success", "DeadLetter", "Cancelled", "Failed")
 # Redis memory grew with jobs-per-second × RESULT_TTL (about 2.3 KB per job, so
 # a day of 140 jobs/s needed 27 GB). The set also gives the job history its
 # time order (searching finished jobs).
-FINISHED_KEY = "pytaskq:finished"
+FINISHED_KEY = rkey("pytaskq:finished")
 
 # Lua: list a finished job and delete the oldest records beyond the cap.
 KEEP_LUA = """
@@ -203,7 +204,7 @@ end
 # later, ~475 ms typical). Redis gives each token to one waiting worker. Tokens
 # are only a hint: a worker always takes the job itself with the pop script, and
 # stale tokens cost one empty pop each.
-WAKE_PREFIX = "pytaskq:wake:"
+WAKE_PREFIX = rkey("pytaskq:wake:")
 WAKE_CAP = 100                  # tokens kept per queue (enough to wake every idle worker)
 WAKE_LUA = """
 local function pytaskq_wake(key, cap)
@@ -291,7 +292,7 @@ IDEMPOTENCY_KEY_RE = re.compile(r"^[\x21-\x7e]{1,255}$")   # printable ASCII, no
 def _idempotency_redis_key(key: str) -> str:
     if not isinstance(key, str) or not IDEMPOTENCY_KEY_RE.match(key):
         raise ValueError("Idempotency-Key must be 1–255 printable characters without spaces (a UUID works well).")
-    return f"idempotency:{key}"
+    return rkey(f"idempotency:{key}")
 
 
 def _fingerprint(payload: dict, delay_seconds: float) -> str:
@@ -337,7 +338,7 @@ async def find_duplicate(r, key: Optional[str], payload: dict, delay_seconds: fl
 # The task hash has no expiry while the job waits: it gets RESULT_TTL when the job finishes.
 ENQUEUE_SCRIPT = WAKE_LUA + """
 local unpack = unpack or table.unpack
-if ARGV[11] == '1' then redis.call('DEL', 'pytaskq:oom-probe') end
+if ARGV[11] == '1' then redis.call('DEL', '__PYTASKQ__pytaskq:oom-probe') end
 if ARGV[7] ~= '' then
     local existing = redis.call('GET', KEYS[5])
     if existing then return {2, existing} end
@@ -377,11 +378,11 @@ redis.call('HSET', KEYS[2], unpack(ARGV, 13))
 redis.call('PERSIST', KEYS[2])
 redis.call('LPUSH', KEYS[3], ARGV[10])
 redis.call('LTRIM', KEYS[3], 0, tonumber(ARGV[5]) - 1)
-redis.call('PUBLISH', 'events:global', 'update')
+redis.call('PUBLISH', '__PYTASKQ__events:global', 'update')
 return {1}
 """
 
-_NO_KEY = "pytaskq:unused"     # placeholder for KEYS a call doesn't use
+_NO_KEY = rkey("pytaskq:unused")     # placeholder for KEYS a call doesn't use
 
 
 async def enqueue(r, payload: dict, delay_seconds: float = 0, created_by: Optional[str] = None,
@@ -430,9 +431,9 @@ async def enqueue(r, payload: dict, delay_seconds: float = 0, created_by: Option
         fields = [str(x) for kv in meta.items() for x in kv]
         reply = await r.eval(
             ENQUEUE_SCRIPT, 12,
-            "delayed_tasks" if delay_seconds > 0 else queue_key(priority, queue),
+            rkey("delayed_tasks") if delay_seconds > 0 else queue_key(priority, queue),
             task_key(task_id), RECENT_KEY, QUEUES_KEY, idem or _NO_KEY, lock or _NO_KEY,
-            *queue_keys(queue), f"fence:{task_id}", FINISHED_KEY, wake_key(queue),
+            *queue_keys(queue), rkey(f"fence:{task_id}"), FINISHED_KEY, wake_key(queue),
             raw, "delayed" if delay_seconds > 0 else "list", repr(now + delay_seconds), queue,
             max(1, settings.HISTORY_LIMIT), int(capacity or 0), record, max(1, settings.IDEMPOTENCY_TTL),
             str(int(lock_ttl)) if lock else "", task_id, "1" if oom_ok else "0", max(0, settings.MAX_QUEUES),
@@ -491,7 +492,7 @@ async def cancel(r, task_id: str, by: Optional[str] = None) -> tuple[bool, str]:
         return False, status
     ok = await r.eval(
         CANCEL_SCRIPT, 6,
-        *queue_keys(payload_queue(meta)), "delayed_tasks", task_key(task_id), FINISHED_KEY,
+        *queue_keys(payload_queue(meta)), rkey("delayed_tasks"), task_key(task_id), FINISHED_KEY,
         payload, str(clock.now()), int(settings.RESULT_TTL), task_id, *keep_args(),
     )
     if ok:
@@ -681,12 +682,12 @@ async def prune_queues(r) -> list[str]:
         return []
     now = clock.now()
     async with r.pipeline(transaction=False) as pipe:
-        pipe.zrangebyscore("active_workers", now, "+inf")
-        pipe.zrange("delayed_tasks", 0, 9999)
+        pipe.zrangebyscore(rkey("active_workers"), now, "+inf")
+        pipe.zrange(rkey("delayed_tasks"), 0, 9999)
         live, delayed = await pipe.execute()
     async with r.pipeline(transaction=False) as pipe:
         for w in live:
-            pipe.hget(f"worker:{w}", "queues")
+            pipe.hget(rkey(f"worker:{w}"), "queues")
         served = await pipe.execute() if live else []
     keep = {DEFAULT_QUEUE}
     for q in served:
@@ -716,17 +717,17 @@ async def queue_overview(r) -> dict:
     async with r.pipeline(transaction=False) as pipe:
         pipe.smembers(QUEUES_KEY)
         pipe.time()
-        pipe.zrange("active_workers", 0, -1, withscores=True)
-        pipe.zcard("delayed_tasks")
-        pipe.llen("dlq")
+        pipe.zrange(rkey("active_workers"), 0, -1, withscores=True)
+        pipe.zcard(rkey("delayed_tasks"))
+        pipe.llen(rkey("dlq"))
         names, redis_time, workers, delayed, dlq = await pipe.execute()
     clock.update(redis_time)
     now = clock.now()      # Redis's clock: the one heartbeats are written with
     live_workers = [w for w, expires in workers if expires >= now]
     async with r.pipeline(transaction=False) as pipe:
         for worker in live_workers:
-            pipe.llen(f"processing_queue:{worker}")
-            pipe.hget(f"worker:{worker}", "queues")
+            pipe.llen(rkey(f"processing_queue:{worker}"))
+            pipe.hget(rkey(f"worker:{worker}"), "queues")
         known = sorted(set(names or ()) | {DEFAULT_QUEUE})
         for name in known:
             for key in queue_keys(name):
@@ -760,3 +761,6 @@ async def queue_overview(r) -> dict:
         "dlq": dlq,
         "live_workers": live_workers,
     }
+
+
+fill_scripts(globals())     # put the key prefix into the Lua scripts above
