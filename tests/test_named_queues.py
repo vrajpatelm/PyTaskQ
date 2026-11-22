@@ -348,6 +348,9 @@ async def test_api_uses_the_tasks_queue_and_allows_an_override(client, r):
     a = await client.post("/task/enqueue", json={"task_name": "resize", "args": ["x.png"]})
     assert a.status_code == 200, a.text
     assert await r.llen("queue:images:default") == 1
+    typo = await client.post("/task/enqueue", json={"task_name": "resize", "args": ["y.png"], "queue": "bulk"})
+    assert typo.status_code == 422 and "Unknown queue 'bulk'" in typo.json()["detail"], "0.4.2: no silent new queues"
+    await r.sadd(queueing.QUEUES_KEY, "bulk")            # a worker serves it
     b = await client.post("/task/enqueue", json={"task_name": "resize", "args": ["y.png"], "queue": "bulk"})
     assert b.status_code == 200 and await r.llen("queue:bulk:default") == 1
     bad = await client.post("/task/enqueue", json={"task_name": "resize", "queue": "Not OK"})

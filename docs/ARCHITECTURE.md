@@ -25,6 +25,7 @@ PyTaskQ runs Python functions in the background. Your app queues a job, a worker
 | `pytaskq/worker.py` | The worker: choosing its queues, taking jobs, retries, dead letters, crash recovery, the heartbeat thread, cron (with time zones), shutdown |
 | `pytaskq/pools.py` | Where task code runs: one process per CPU job (stopped at its timeout, replaced if it dies) and IO threads |
 | `pytaskq/core/clock.py` | Redis's clock, used for every time another machine compares against |
+| `pytaskq/core/redis_health.py` | Is Redis safe? Memory and eviction checks, the data-loss marker, and the "works when Redis is full" rule for scripts |
 | `pytaskq/main.py`, `pytaskq/api/v1/` | The API: jobs, dead letters, workers, metrics, sign-in, the live WebSocket |
 | `pytaskq/core/auth.py`, `core/dependencies.py` | Accounts, sessions, API tokens, invites, roles |
 | `pytaskq/core/redis_client.py` | The shared Redis connection pool |
@@ -40,7 +41,8 @@ PyTaskQ runs Python functions in the background. Your app queues a job, a worker
 |---|---|---|
 | `queue:high`, `queue:default`, `queue:low` | List | Jobs waiting on the `default` queue, one list per priority |
 | `queue:{name}:{priority}` | List | Jobs waiting on another named queue (e.g. `queue:images:high`) |
-| `pytaskq:queues` | Set | Every queue name that has been used |
+| `pytaskq:queues` | Set | Queue names in use (at most `MAX_QUEUES`; unused ones are forgotten) |
+| `pytaskq:install` | Hash | Marker key: if it vanishes while PyTaskQ runs, Redis lost its data |
 | `processing_queue:{worker}` | List | Jobs a worker is running right now (its safety net if it crashes) |
 | `delayed_tasks` | Sorted set | Scheduled jobs and retries, scored by the time they're due |
 | `dlq` | List | Dead letters: jobs that failed every retry, with their last error, and "(invalid job)" entries (the newest `DLQ_LIMIT`) |
@@ -141,5 +143,7 @@ Spans record task names, job ids, attempts, workers, route patterns and status c
 | Jobs wait in a queue no worker serves | The dashboard marks the queue, and *Settings → Performance* says which worker to start. Their records don't expire while they wait. |
 | A task returns a huge result, or is sent huge arguments | Results over `MAX_RESULT_BYTES` aren't stored (the job still succeeds); jobs over `MAX_PAYLOAD_BYTES` are refused. |
 | A client isn't sure its job was queued | It resends with the same `Idempotency-Key` and gets the original job back. |
-| Redis is busy or briefly down | API requests wait for a connection, then answer `503` with `Retry-After`. Workers pause and retry until Redis is back. |
+| Redis is busy or briefly down | API requests wait for a connection, then answer `503` with `Retry-After`; a connection Redis closed is replaced and the request retried. Workers pause and retry until Redis is back. Open dashboards show "Redis unreachable" and resume by themselves. |
+| Redis is full (`maxmemory`) | New jobs get `503 Redis is full`. Workers, including ones starting now, keep taking and finishing jobs, which frees memory: the scripts that do that start with a write that needs no memory, which Redis always lets a script complete. |
+| Redis is set to evict keys, or loses its data | Logged at startup, in `/health` and in *Settings → Performance*. Lost data is noticed through a marker key, and a new setup code is printed so the admin can be created again. See [REDIS.md](REDIS.md). |
 | Ctrl+C or `docker stop` | The worker stops taking jobs and gives running ones `WORKER_SHUTDOWN_GRACE` (30 s) to finish. Whatever is still running is stopped and put back at the front of its queue. |

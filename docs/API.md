@@ -148,9 +148,9 @@ Errors:
 * `403` — the task name starts with `_`: those are PyTaskQ's internal tasks (such as webhook delivery) and can't be queued through the API.
 * `404` — the task name isn't advertised by any running worker. The message lists the available tasks.
 * `413` — the job is over `MAX_PAYLOAD_BYTES` (1 MB) once encoded. Put large data in storage and pass its location.
-* `422` — invalid body: a task name over 200 characters, an unknown priority, an invalid queue name, a delay outside 0 to 1 year, `NaN`/`Infinity` in the arguments, a malformed `Idempotency-Key`, or a key already used for a different job. Also **arguments the task doesn't accept** (a missing required argument, an unknown keyword, too many positional ones), checked against the parameters the workers advertise: `"Wrong arguments for task 'send_receipt': missing a required argument: 'order_id'"`. Long rejected values are shortened in the reply.
+* `422` — invalid body: a task name over 200 characters, an unknown priority, an invalid queue name, **a queue that doesn't exist yet** (no worker serves it and no task lives on it: usually a typo; the message lists the known queues), a new queue beyond `MAX_QUEUES`, a delay outside 0 to 1 year, `NaN`/`Infinity` in the arguments, a malformed `Idempotency-Key`, or a key already used for a different job. Also **arguments the task doesn't accept** (a missing required argument, an unknown keyword, too many positional ones), checked against the parameters the workers advertise: `"Wrong arguments for task 'send_receipt': missing a required argument: 'order_id'"`. Long rejected values are shortened in the reply.
 * `429` — the job's queue already holds `QUEUE_CAPACITY` jobs (each queue has its own limit). The check and the push are one step, so the limit is exact under any load. Scheduled jobs (`delay_seconds` > 0) are refused too while their queue is full. Wait `Retry-After` seconds and try again.
-* `503` — the server couldn't reach Redis in time. Also carries `Retry-After`.
+* `503` — Redis can't take the job right now, with `Retry-After`: it couldn't be reached or didn't answer in time (`"error": "Redis is unavailable"`), or it's **full** (`"error": "Redis is full"`, `maxmemory` reached; see [REDIS.md](REDIS.md#when-redis-is-full)). Every endpoint answers 503 rather than 500 in these cases.
 
 `POST /task/schedule?delay_seconds=60` still works and takes the same body.
 
@@ -172,6 +172,26 @@ curl -X POST https://jobs.example.com/task/enqueue \
 * Keys are 1 to 255 printable characters without spaces, and shared by everyone using this server.
 
 The SDK takes the same option: `await send_receipt.delay(1042, idempotency_key="order-1042-receipt")`.
+
+### Choosing a job's id (Python SDK)
+
+`await task.apply_async(args, task_id="report-2026-11-22")` queues a job under your own id instead of a random one:
+
+* While a job with that id is **waiting, scheduled or running**, queueing another one raises `TaskIdInUse` (a `ValueError`). Two schedules with the same id used to merge silently into one.
+* Once that job has **finished** (succeeded, dead-lettered or cancelled), the id can be used again: the old record is replaced.
+* To make sure a job is queued **only once** however often you ask, use `idempotency_key=` instead.
+
+### Health — `GET /health`
+
+No sign-in needed. `503` with `"status": "down"` when Redis can't be reached. Otherwise `200`, with `"status": "ok"`, or `"status": "degraded"` and a `warnings` list when Redis is nearly full, is set to delete keys (`maxmemory-policy`), or lost its data in the last week:
+
+```json
+{"status": "degraded", "redis": "connected", "version": "0.4.2",
+ "redis_memory": {"used_bytes": 402653184, "max_bytes": 419430400, "percent": 96.0, "policy": "noeviction"},
+ "warnings": ["Redis is 96% full (384 MB of 400 MB)"]}
+```
+
+Point monitoring at the `status` field, not only the HTTP code: a degraded PyTaskQ still serves the dashboard, so Docker shouldn't restart it, but someone should look.
 
 ### Job status — `GET /task/{task_id}`
 

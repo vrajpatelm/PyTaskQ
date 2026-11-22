@@ -724,6 +724,7 @@ function Dashboard({ me, authEnabled, onSignOut, theme, setTheme }) {
   const [metrics, setMetrics] = useState(EMPTY_METRICS);
   const [dlq, setDlq] = useState([]);
   const [connected, setConnected] = useState(false);
+  const [redisProblem, setRedisProblem] = useState(null);   // the server can't read Redis right now
   const [tick, setTick] = useState(0);          // bumps on every live update
   const [tasks, setTasks] = useState([]);
   const [loadingTasks, setLoadingTasks] = useState(true);
@@ -746,9 +747,11 @@ function Dashboard({ me, authEnabled, onSignOut, theme, setTheme }) {
     let ws, retry, alive = true;
     const connect = () => {
       ws = new WebSocket(WS_URL);
-      ws.onopen = () => setConnected(true);
+      ws.onopen = () => { setConnected(true); setRedisProblem(null); };
       ws.onmessage = ev => {
         const data = JSON.parse(ev.data);
+        setRedisProblem(data.degraded ? (data.detail || "Can't reach Redis right now.") : null);
+        if (data.degraded) return;
         if (data.metrics) setMetrics(data.metrics);
         if (data.dlq) setDlq(data.dlq);
         setTick(t => t + 1);
@@ -821,8 +824,8 @@ function Dashboard({ me, authEnabled, onSignOut, theme, setTheme }) {
       <header className="topbar">
         <Brand />
         <div className="topbar-right">
-          <span className={`conn ${connected ? 'live' : ''}`}>
-            <span className="dot" /> {connected ? 'Live' : 'Reconnecting…'}
+          <span className={`conn ${connected && !redisProblem ? 'live' : ''}`} title={redisProblem || undefined}>
+            <span className="dot" /> {!connected ? 'Reconnecting…' : redisProblem ? (redisProblem.startsWith('Redis is full') ? 'Redis is full' : 'Redis unreachable') : 'Live'}
           </span>
           <button className="user-chip" onClick={() => setTab('settings')} title="Account settings">
             <UserRound size={14} />

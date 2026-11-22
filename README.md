@@ -234,7 +234,7 @@ npm run dev                  # dashboard with hot reload; talks to `pytaskq dash
 npm run build                # writes the bundle into pytaskq/static/
 ```
 
-See [QUEUES](https://github.com/vrajpatelm/PyTaskQ/blob/main/docs/QUEUES.md), [WORKERS](https://github.com/vrajpatelm/PyTaskQ/blob/main/docs/WORKERS.md), [CONTRIBUTING](https://github.com/vrajpatelm/PyTaskQ/blob/main/docs/CONTRIBUTING.md), [ARCHITECTURE](https://github.com/vrajpatelm/PyTaskQ/blob/main/docs/ARCHITECTURE.md) and the [CHANGELOG](https://github.com/vrajpatelm/PyTaskQ/blob/main/CHANGELOG.md).
+See [QUEUES](https://github.com/vrajpatelm/PyTaskQ/blob/main/docs/QUEUES.md), [WORKERS](https://github.com/vrajpatelm/PyTaskQ/blob/main/docs/WORKERS.md), [REDIS](https://github.com/vrajpatelm/PyTaskQ/blob/main/docs/REDIS.md), [CONTRIBUTING](https://github.com/vrajpatelm/PyTaskQ/blob/main/docs/CONTRIBUTING.md), [ARCHITECTURE](https://github.com/vrajpatelm/PyTaskQ/blob/main/docs/ARCHITECTURE.md) and the [CHANGELOG](https://github.com/vrajpatelm/PyTaskQ/blob/main/CHANGELOG.md).
 
 ## License
 

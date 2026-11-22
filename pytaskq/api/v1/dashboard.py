@@ -12,6 +12,13 @@ from pytaskq.services.live import broadcaster, min_interval
 router = APIRouter(tags=["dashboard"])
 logger = logging.getLogger("api")
 
+def _redis_problem(e: Exception) -> str:
+    text = str(e)
+    if "OOM command not allowed" in text or type(e).__name__ == "OutOfMemoryError":
+        return "Redis is full: showing the last numbers."
+    return "Can't reach Redis right now: showing the last numbers. Retrying…"
+
+
 @router.get("/metrics", dependencies=[Depends(require("viewer"))])
 async def metrics(req: Request):
     data = await _get_dashboard_data("global", include_dlq=False)
@@ -54,10 +61,21 @@ async def dashboard_websocket(websocket: WebSocket):
             stop_event.set()
             changed.set()
 
+    async def send(payload: dict) -> bool:
+        try:
+            await websocket.send_json(payload)
+            return True
+        except Exception:
+            return False          # the browser went away
+
     async def pusher():
         # At most LIVE_UPDATES_PER_SECOND pushes a second, however fast jobs change.
+        # A Redis error (restart, outage, full memory) used to end this loop while the
+        # socket stayed open, so the tab froze until it was reloaded. Now the browser
+        # is told ("degraded") and the loop tries again until Redis answers.
         interval = min_interval()
         last_push = 0.0
+        backoff = 1.0
         while not stop_event.is_set():
             try:
                 await asyncio.wait_for(changed.wait(), timeout=30)
@@ -79,11 +97,25 @@ async def dashboard_websocket(websocket: WebSocket):
                     data["task_statuses"] = {t: s for t, s in zip(tracked_ids, statuses) if s}
                 else:
                     data["task_statuses"] = {}
-                await websocket.send_json(data)
-                last_push = time.monotonic()
-            except Exception:
-                stop_event.set()
+            except Exception as e:
+                if not await send({"degraded": True, "detail": _redis_problem(e)}):
+                    break
+                try:
+                    await asyncio.wait_for(stop_event.wait(), timeout=backoff)
+                except asyncio.TimeoutError:
+                    pass
+                backoff = min(backoff * 2, 10)
+                changed.set()     # try again
+                continue
+            backoff = 1.0
+            if not await send(data):
                 break
+            last_push = time.monotonic()
+        stop_event.set()
+        try:
+            await websocket.close(code=1011)   # if still open: make the browser reconnect, never leave it frozen
+        except Exception:
+            pass
 
     try:
         await asyncio.gather(client_listener(), pusher(), return_exceptions=True)

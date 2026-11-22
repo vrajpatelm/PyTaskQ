@@ -47,10 +47,16 @@ async def reset_worker_globals():
         Without this, test order affects results — the classic 'it passes
         alone but fails in suite' problem.
     """
+    import asyncio
     import pytaskq.worker as worker
-    worker.shutdown_event.clear()
+    from pytaskq.core import pressure
+    # Fresh events per test: an asyncio.Event belongs to the event loop that first waited on it.
+    worker.shutdown_event = asyncio.Event()
+    worker._hard_stop = asyncio.Event()
     worker.active_tasks.clear()
+    pressure._pending.clear()
     yield
+    pressure._pending.clear()
     worker.shutdown_event.clear()
     worker._hard_stop.clear()
     worker.active_tasks.clear()

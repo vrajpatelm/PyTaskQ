@@ -38,7 +38,9 @@ PYTASKQ_DOMAIN=jobs.example.com
 REDIS_PASSWORD=<paste the output of: python3 -c "import secrets; print(secrets.token_urlsafe(32))">
 ```
 
-Pin the version too (`PYTASKQ_VERSION=0.4.1`), so upgrades only happen when you choose.
+Pin the version too (`PYTASKQ_VERSION=0.4.2`), so upgrades only happen when you choose.
+
+`REDIS_MAXMEMORY` (default `400mb`) is the most memory Redis may use. Keep it well below the server's RAM: about `300mb` on a 1 GB server, `1500mb` on 4 GB. When it's reached, new jobs get `503` and no existing job is lost. [REDIS.md](REDIS.md) explains the Redis settings that matter.
 
 ## 3. Start
 
@@ -128,7 +130,7 @@ Why not just copy the file into Redis? Redis keeps an append-only log of every c
 ## Upgrading
 
 ```bash
-# in .env: PYTASKQ_VERSION=0.4.1
+# in .env: PYTASKQ_VERSION=0.4.2
 docker compose -f docker-compose.prod.yml exec backup sh /backup-loop.sh once   # backup first
 docker compose -f docker-compose.prod.yml pull
 docker compose -f docker-compose.prod.yml up -d
@@ -153,6 +155,7 @@ The image already includes the tracing libraries. Spans never contain URLs, job 
 - [ ] `PYTASKQ_ADMIN_PASSWORD` has been removed from `.env` after the first start.
 - [ ] Backups are copied to another machine or to cloud storage.
 - [ ] `PYTASKQ_VERSION` is pinned.
+- [ ] *Settings → Performance* shows no Redis warning (eviction policy, memory). See [REDIS.md](REDIS.md).
 
 ## How the pieces connect
 
@@ -173,3 +176,6 @@ Caddy adds `X-Forwarded-For` and `X-Forwarded-Proto`, so PyTaskQ sees the visito
 | Dashboard says "No workers are running" | `docker compose -f docker-compose.prod.yml logs worker` |
 | Lost the admin password | `docker compose -f docker-compose.prod.yml exec web pytaskq users reset-password NAME` |
 | Requests get 429 or 503 under load | Open **Settings → Performance** in the dashboard. [PERFORMANCE.md](PERFORMANCE.md) explains each setting. |
+| 503 "Redis is full" | Redis reached `REDIS_MAXMEMORY`. Workers drain it; raise it if it happens again. [REDIS.md](REDIS.md#when-redis-is-full) |
+| Worker exits at once with "Redis refused this worker" | Wrong `REDIS_PASSWORD`. `docker compose -f docker-compose.prod.yml exec web pytaskq ping` tests it. |
+| The dashboard asks for a setup code after a restart, and accounts are gone | Redis lost its data (no volume, or flushed). The new setup code is in `docker compose -f docker-compose.prod.yml logs web`; restore a backup to get the old data back. [REDIS.md](REDIS.md#when-redis-loses-its-data) |

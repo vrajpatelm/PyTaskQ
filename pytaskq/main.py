@@ -8,6 +8,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from redis.exceptions import ConnectionError as RedisConnectionError
+from redis.exceptions import OutOfMemoryError as RedisOutOfMemoryError
+from redis.exceptions import ReadOnlyError as RedisReadOnlyError
+from redis.exceptions import TimeoutError as RedisTimeoutError
 
 from pytaskq import __version__
 from pytaskq.api.router import api_router
@@ -52,6 +55,29 @@ async def _keep_app_registry_fresh():
         await _publish_app_registry(quiet=True)
 
 
+async def _watch_redis():
+    """Every 15 s: notice lost Redis data (and log a new setup code), and a Redis set up to delete keys."""
+    import asyncio
+    from pytaskq.core import auth, redis_client, redis_health
+    warned_problems: set[str] = set()
+    while True:
+        try:
+            r = redis_client.r
+            await redis_health.check_data(r, "API")
+            for problem in redis_health.problems(await redis_health.memory(r)):
+                key = problem["title"].split("(")[0]
+                if key not in warned_problems:
+                    warned_problems.add(key)
+                    logger.error(f"[Redis] {problem['title']}. {problem['detail']}")
+            if settings.auth_enabled:
+                await auth.announce_setup_code(r, logger)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            pass                       # Redis down: requests report that themselves
+        await asyncio.sleep(15)
+
+
 async def _prepare_auth():
     """Create the first admin from env vars, or print the one-time setup code."""
     from pytaskq.core import auth, redis_client
@@ -65,13 +91,7 @@ async def _prepare_auth():
             logger.info(f"Created admin '{user.username}' from PYTASKQ_ADMIN_USER.")
         code = await auth.ensure_setup_code(r)
         if code:
-            bar = "=" * 64
-            logger.warning(
-                f"\n{bar}\n  PyTaskQ first-run setup\n\n"
-                f"  Open the dashboard and enter this setup code to create the admin:\n\n"
-                f"      {code}\n\n"
-                f"  (Lost it? Run: pytaskq users setup-code)\n{bar}"
-            )
+            logger.warning(auth.setup_banner(code))
     except Exception as e:  # Redis down at startup must not crash the API
         logger.warning(f"Could not prepare sign-in yet: {e}")
 
@@ -86,6 +106,7 @@ async def lifespan(app: FastAPI):
     if await _publish_app_registry():
         background.append(asyncio.create_task(_keep_app_registry_fresh(), name="pytaskq-registry"))
     await _prepare_auth()
+    background.append(asyncio.create_task(_watch_redis(), name="pytaskq-redis-watch"))
     yield
     for task in background:
         task.cancel()
@@ -140,7 +161,8 @@ app.add_middleware(TracingMiddleware)   # outermost: one span per request (steps
 if STATIC_DIR.is_dir():
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
-app.add_exception_handler(RedisConnectionError, redis_connection_error_handler)
+for _redis_error in (RedisConnectionError, RedisTimeoutError, RedisOutOfMemoryError, RedisReadOnlyError):
+    app.add_exception_handler(_redis_error, redis_connection_error_handler)
 app.add_exception_handler(RequestValidationError, validation_error_handler)
 
 app.include_router(api_router)
@@ -148,13 +170,34 @@ app.include_router(api_router)
 
 @app.get("/health", tags=["ops"])
 async def health_check():
-    """Used by Docker health checks and load balancers to verify service health."""
+    """
+    Used by Docker health checks, load balancers and monitoring.
+
+    503 only when Redis can't be reached (this API can't serve anything then).
+    Otherwise 200, with "status": "degraded" and a list of warnings when Redis
+    is nearly full, set to delete keys, or has lost its data: the API still
+    serves the dashboard then, but someone should look.
+    """
+    import time as _time
+    from pytaskq.core import redis_client, redis_health
     try:
-        from pytaskq.core import redis_client
         await redis_client.r.ping()
-        return {"status": "ok", "redis": "connected", "version": __version__}
     except Exception:
-        return JSONResponse(status_code=503, content={"status": "degraded", "redis": "unreachable"})
+        return JSONResponse(status_code=503, content={"status": "down", "redis": "unreachable", "version": __version__})
+    mem = await redis_health.memory(redis_client.r)
+    warnings = [p["title"] for p in redis_health.problems(mem)]
+    try:
+        lost_at = await redis_health.check_data(redis_client.r, "API")
+    except Exception:
+        lost_at = None
+    if lost_at and _time.time() - lost_at < 7 * 86400:
+        warnings.append(f"Redis lost its data {(_time.time() - lost_at) / 3600:.0f} hours ago")
+    body = {"status": "degraded" if warnings else "ok", "redis": "connected", "version": __version__}
+    if mem:
+        body["redis_memory"] = {k: mem[k] for k in ("used_bytes", "max_bytes", "percent", "policy")}
+    if warnings:
+        body["warnings"] = warnings
+    return body
 
 
 @app.get("/", include_in_schema=False)

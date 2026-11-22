@@ -96,6 +96,13 @@ services:
       - everysec
       - --save
       - 900 1 300 10 60 10000
+      # When full, refuse new jobs (503) instead of silently deleting old ones
+      # (any other policy evicts queues, job records and accounts). Keep
+      # REDIS_MAXMEMORY below the memory this server can give Redis.
+      - --maxmemory
+      - ${REDIS_MAXMEMORY:-400mb}
+      - --maxmemory-policy
+      - noeviction
       - --requirepass
       - ${REDIS_PASSWORD:?Set REDIS_PASSWORD in .env}
     environment:

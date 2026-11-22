@@ -21,6 +21,7 @@ class Settings(BaseSettings):
 
     # ── Queue behaviour ──────────────────────────────────────────────────────
     QUEUE_CAPACITY: int = 500          # jobs that can wait in EACH queue before the API answers 429 (0 = no limit)
+    MAX_QUEUES: int = 100              # how many queue names may exist (0 = no limit); unused ones are forgotten
     TASK_TIMEOUT: float = 300          # default per-task timeout (seconds, 0 = none)
     MAX_RETRIES: int = 3               # default retries before a task is dead-lettered
     RESULT_TTL: int = 86400            # how long a FINISHED job's status/result is kept (seconds)

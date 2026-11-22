@@ -32,6 +32,10 @@ A single job can go elsewhere: `await make_thumbnail.delay("a.png", queue="bulk"
 
 Queue names are 1 to 50 lowercase letters, digits, `-` or `_`.
 
+A queue exists once a task lives on it or a worker serves it. Through the API, `"queue"` must name an existing queue: `"queue": "imgaes"` gets `422 Unknown queue 'imgaes'` with the list of known queues, instead of a job no worker would ever take. Your app's code (`.delay(queue=...)`) can create queues freely.
+
+At most `MAX_QUEUES` (100) queue names can exist. Names that nothing uses any more (no waiting jobs, no worker serving them, no task on them, no scheduled job for them) are forgotten after a few minutes, so one-off names don't pile up and slow down every dashboard refresh.
+
 ### Which queues a worker serves
 
 By default, a worker serves **the queues its own tasks live on**. A worker started with the app above serves `default` and `images`, so it never takes a job it can't run. To choose yourself:

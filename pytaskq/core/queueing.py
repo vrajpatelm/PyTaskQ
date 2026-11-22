@@ -149,6 +149,32 @@ class PayloadTooLarge(ValueError):
     """The job's JSON is over MAX_PAYLOAD_BYTES."""
 
 
+class TaskIdInUse(ValueError):
+    """apply_async(task_id=…) named a job that is still waiting or running."""
+
+    def __init__(self, task_id: str, status: str):
+        super().__init__(
+            f"task_id '{task_id}' is already in use by a job that is {status}. Wait for it to finish, cancel it, "
+            f"or let PyTaskQ pick the id. To queue a job only once, use idempotency_key= instead."
+        )
+        self.task_id = task_id
+        self.status = status
+
+
+class TooManyQueues(ValueError):
+    """The job would create a queue beyond MAX_QUEUES."""
+
+    def __init__(self, queue: str, count: int):
+        super().__init__(
+            f"Can't create queue '{queue}': there are already {count} queues (MAX_QUEUES). Use an existing queue, "
+            f"or raise MAX_QUEUES. Unused queue names are forgotten after a few minutes."
+        )
+        self.queue = queue
+
+
+FINAL_STATUSES = ("Success", "DeadLetter", "Cancelled", "Failed")
+
+
 class QueueFull(Exception):
     """The queue already holds QUEUE_CAPACITY jobs (only callers that ask for a capacity check get this)."""
 
@@ -251,17 +277,32 @@ async def find_duplicate(r, key: Optional[str], payload: dict, delay_seconds: fl
 
 # Queue one job in a single atomic step.
 #   KEYS: 1 target (queue list or delayed zset), 2 task hash, 3 history list, 4 queue-name set,
-#         5 idempotency key, 6 cron tick lock, 7-9 the queue's three lists (capacity)
+#         5 idempotency key, 6 cron tick lock, 7-9 the queue's three lists (capacity), 10 the job's fence
 #   ARGV: 1 payload, 2 "list" | "delayed", 3 due time, 4 queue name, 5 history limit, 6 capacity (0 = none),
 #         7 idempotency record ("" = none), 8 idempotency TTL, 9 lock TTL ("" = no lock), 10 task id,
-#         11.. task hash fields (name, value, …)
-# Returns {1} queued, {2, record} idempotency key already used, {3} lock already taken, {0, waiting} full.
+#         11 "1" = may run when Redis is full (internal follow-ups), 12 MAX_QUEUES (0 = none),
+#         13.. task hash fields (name, value, …)
+# Returns {1} queued, {2, record} idempotency key already used, {3} lock already taken, {0, waiting} full,
+#         {4, status} the task id belongs to a job that hasn't finished, {5, count} too many queues.
+# A task id whose job HAS finished is reused cleanly: its old record, fence and history entry are dropped
+# (otherwise the new job's result was thrown away as "stale").
 # The task hash has no expiry while the job waits: it gets RESULT_TTL when the job finishes.
 ENQUEUE_SCRIPT = """
 local unpack = unpack or table.unpack
+if ARGV[11] == '1' then redis.call('DEL', 'pytaskq:oom-probe') end
 if ARGV[7] ~= '' then
     local existing = redis.call('GET', KEYS[5])
     if existing then return {2, existing} end
+end
+local previous = redis.call('HGET', KEYS[2], 'status')
+if previous and previous ~= 'Success' and previous ~= 'DeadLetter' and previous ~= 'Cancelled'
+        and previous ~= 'Failed' then
+    return {4, previous}
+end
+local maxq = tonumber(ARGV[12])
+if maxq > 0 and redis.call('SISMEMBER', KEYS[4], ARGV[4]) == 0 then
+    local count = redis.call('SCARD', KEYS[4])
+    if count >= maxq then return {5, count} end
 end
 if ARGV[9] ~= '' then
     if not redis.call('SET', KEYS[6], '1', 'NX', 'EX', tonumber(ARGV[9])) then return {3} end
@@ -271,6 +312,10 @@ if cap > 0 then
     local waiting = redis.call('LLEN', KEYS[7]) + redis.call('LLEN', KEYS[8]) + redis.call('LLEN', KEYS[9])
     if waiting >= cap then return {0, waiting} end
 end
+if previous then
+    redis.call('DEL', KEYS[2], KEYS[10])
+    redis.call('LREM', KEYS[3], 0, ARGV[10])
+end
 if ARGV[7] ~= '' then redis.call('SET', KEYS[5], ARGV[7], 'EX', tonumber(ARGV[8])) end
 if ARGV[2] == 'delayed' then
     redis.call('ZADD', KEYS[1], ARGV[3], ARGV[1])
@@ -278,7 +323,7 @@ else
     redis.call('LPUSH', KEYS[1], ARGV[1])
 end
 redis.call('SADD', KEYS[4], ARGV[4])
-redis.call('HSET', KEYS[2], unpack(ARGV, 11))
+redis.call('HSET', KEYS[2], unpack(ARGV, 13))
 redis.call('PERSIST', KEYS[2])
 redis.call('LPUSH', KEYS[3], ARGV[10])
 redis.call('LTRIM', KEYS[3], 0, tonumber(ARGV[5]) - 1)
@@ -292,7 +337,7 @@ _NO_KEY = "pytaskq:unused"     # placeholder for KEYS a call doesn't use
 async def enqueue(r, payload: dict, delay_seconds: float = 0, created_by: Optional[str] = None,
                   idempotency_key: Optional[str] = None, *, capacity: int = 0,
                   lock: Optional[str] = None, lock_ttl: int = 2592000,
-                  max_bytes: Optional[int] = None) -> Optional[dict]:
+                  max_bytes: Optional[int] = None, oom_ok: bool = False) -> Optional[dict]:
     """Push a task payload onto its priority queue (or the delayed set), atomically.
 
     With an idempotency key, the first call queues the job and remembers the key
@@ -306,6 +351,11 @@ async def enqueue(r, payload: dict, delay_seconds: float = 0, created_by: Option
     lock      queue only if this key isn't set yet (cron: one run per tick);
               returns None when it is.
     max_bytes size limit for the job (default MAX_PAYLOAD_BYTES; 0 = none).
+    oom_ok    queue even when Redis is out of memory (follow-ups of a job that
+              just finished, such as webhooks; never for new work).
+
+    Raises TaskIdInUse when a job with the same task_id is still waiting or
+    running, and TooManyQueues when its queue would be one more than MAX_QUEUES.
     """
     delay_seconds = float(delay_seconds or 0)
     if not math.isfinite(delay_seconds) or not 0 <= delay_seconds <= MAX_DELAY_SECONDS:
@@ -329,13 +379,14 @@ async def enqueue(r, payload: dict, delay_seconds: float = 0, created_by: Option
         record = json.dumps({"fingerprint": fingerprint, "response": result}) if idem else ""
         fields = [str(x) for kv in meta.items() for x in kv]
         reply = await r.eval(
-            ENQUEUE_SCRIPT, 9,
+            ENQUEUE_SCRIPT, 10,
             "delayed_tasks" if delay_seconds > 0 else queue_key(priority, queue),
             task_key(task_id), RECENT_KEY, QUEUES_KEY, idem or _NO_KEY, lock or _NO_KEY,
-            *queue_keys(queue),
+            *queue_keys(queue), f"fence:{task_id}",
             raw, "delayed" if delay_seconds > 0 else "list", repr(now + delay_seconds), queue,
             max(1, settings.HISTORY_LIMIT), int(capacity or 0), record, max(1, settings.IDEMPOTENCY_TTL),
-            str(int(lock_ttl)) if lock else "", task_id, *fields,
+            str(int(lock_ttl)) if lock else "", task_id, "1" if oom_ok else "0", max(0, settings.MAX_QUEUES),
+            *fields,
         )
         code = int(reply[0])
         if code == 1:
@@ -344,6 +395,10 @@ async def enqueue(r, payload: dict, delay_seconds: float = 0, created_by: Option
             return _duplicate(reply[1], fingerprint)
         if code == 3:
             return None
+        if code == 4:
+            raise TaskIdInUse(task_id, str(reply[1]))
+        if code == 5:
+            raise TooManyQueues(queue, int(reply[1]))
         raise QueueFull(queue, int(reply[1]) if len(reply) > 1 else 0)
 
 
@@ -552,6 +607,50 @@ async def publish_registry(r, specs: dict[str, dict]) -> None:
         pipe.zadd(REGISTRY_SEEN_KEY, {k: now for k in specs})
         pipe.publish(EVENTS_CHANNEL, "update")
         await pipe.execute()
+
+
+# Forget a queue name, but only while all three of its lists are empty.
+# KEYS: queue-name set, the queue's 3 lists   ARGV: name
+PRUNE_QUEUE_SCRIPT = """
+if redis.call('LLEN', KEYS[2]) + redis.call('LLEN', KEYS[3]) + redis.call('LLEN', KEYS[4]) > 0 then return 0 end
+return redis.call('SREM', KEYS[1], ARGV[1])
+"""
+
+
+async def prune_queues(r) -> list[str]:
+    """
+    Forget queue names nothing uses any more: no waiting jobs, no live worker
+    serving them, no advertised task living on them, no scheduled job for them.
+
+    Names were only ever added, so typos and one-off names piled up, and every
+    dashboard refresh counted all of them (5,000 names: 10 ms → 480 ms).
+    """
+    names = await r.smembers(QUEUES_KEY)
+    if len(names) <= 1:
+        return []
+    now = clock.now()
+    async with r.pipeline(transaction=False) as pipe:
+        pipe.zrangebyscore("active_workers", now, "+inf")
+        pipe.zrange("delayed_tasks", 0, 9999)
+        live, delayed = await pipe.execute()
+    async with r.pipeline(transaction=False) as pipe:
+        for w in live:
+            pipe.hget(f"worker:{w}", "queues")
+        served = await pipe.execute() if live else []
+    keep = {DEFAULT_QUEUE}
+    for q in served:
+        keep.update(x for x in (q or "").split(",") if x)
+    keep.update(t.get("queue") or DEFAULT_QUEUE for t in await registered_tasks(r))
+    for raw in delayed:
+        try:
+            keep.add(payload_queue(json.loads(raw)))
+        except (ValueError, AttributeError):
+            pass
+    dropped = []
+    for name in sorted(names - keep):
+        if await r.eval(PRUNE_QUEUE_SCRIPT, 4, QUEUES_KEY, *queue_keys(name), name):
+            dropped.append(name)
+    return dropped
 
 
 async def queue_overview(r) -> dict:

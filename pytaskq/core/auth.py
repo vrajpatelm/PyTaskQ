@@ -544,13 +544,45 @@ async def ensure_setup_code(r) -> Optional[str]:
     return await r.get(K_SETUP_CODE)
 
 
+def setup_banner(code: str, why: str = "") -> str:
+    bar = "=" * 64
+    return (f"\n{bar}\n  PyTaskQ first-run setup{(' (' + why + ')') if why else ''}\n\n"
+            f"  Open the dashboard and enter this setup code to create the admin:\n\n"
+            f"      {code}\n\n"
+            f"  (Lost it? Run: pytaskq users setup-code)\n{bar}")
+
+
+async def announce_setup_code(r, log, why: str = "no accounts exist any more") -> Optional[str]:
+    """
+    If nobody can sign in and there's no setup code either, make one and log it.
+
+    The code used to be created only when the dashboard started. After Redis
+    lost its data (a restart without its volume, a flush, eviction), every
+    account was gone and the dashboard asked for a code that didn't exist.
+    Safe to call often, and from several API processes: only one creates a code.
+    """
+    if not settings.auth_enabled or await r.exists(K_SETUP_CODE) or await user_count(r) > 0:
+        return None
+    code = "-".join(secrets.token_hex(3).upper() for _ in range(3))
+    if await r.set(K_SETUP_CODE, code, nx=True):
+        log.warning(setup_banner(code, why))
+        return code
+    return None
+
+
 async def complete_setup(r, code: str, username: str, password: str) -> User:
     if await user_count(r) > 0:
         raise AuthError("Setup is already complete. Sign in instead.", 409)
     expected = await r.get(K_SETUP_CODE)
     given = (code or "").strip().upper()
-    if not expected or not hmac.compare_digest(given, expected):
-        raise AuthError("That setup code is not right. Copy it from the PyTaskQ server log.", 403)
+    if not expected:
+        import logging
+        await announce_setup_code(r, logging.getLogger("api"))
+        raise AuthError("That code isn't valid any more. A new setup code was just printed in the PyTaskQ server "
+                        "log (or run `pytaskq users setup-code` on the server).", 403)
+    if not hmac.compare_digest(given, expected):
+        raise AuthError("That setup code is not right. Use the newest code in the PyTaskQ server log, or run "
+                        "`pytaskq users setup-code` on the server to print it.", 403)
     # Lock so two browsers can't both finish setup at the same moment
     if not await r.set("auth:setup_lock", "1", nx=True, ex=30):
         raise AuthError("Setup is already in progress.", 409)

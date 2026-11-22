@@ -2,6 +2,33 @@
 
 All notable changes to PyTaskQ. Versions follow [semantic versioning](https://semver.org/).
 
+## 0.4.2 — 2026-11-22
+
+Fixes from a second break test, on what happens when Redis itself misbehaves: full, set to evict keys, restarted, frozen, wiped, or given the wrong password. New guide: `docs/REDIS.md` (the three Redis settings that matter, and what PyTaskQ does when Redis is full, restarts or loses its data).
+
+### Upgrading from 0.4.1
+- **Set Redis to `maxmemory-policy noeviction` with a `maxmemory`.** Both compose files and `redis.conf` now do (`REDIS_MAXMEMORY`, default `400mb`, in the production `.env`). Managed Redis services often default to an eviction policy: change it. PyTaskQ now warns when it isn't `noeviction`.
+- **Through the API, `"queue"` must name an existing queue** (one a worker serves or a task lives on). New names get `422` with the list of known queues. Your app's `.delay(queue=...)` can still create queues; at most `MAX_QUEUES` (100) can exist.
+- **`apply_async(task_id=...)` with the id of a job that is still waiting or running raises `TaskIdInUse`** (a `ValueError`) instead of corrupting both jobs.
+- `/health` returns `"status": "degraded"` with `warnings` (still HTTP 200) when Redis is nearly full, set to evict, or lost its data; `503` (`"status": "down"`) only when Redis can't be reached.
+
+### Fixed
+- **A worker couldn't start while Redis was full**, so nothing ever took jobs to free memory (0.4.1 even crashed at startup). Workers now start and drain the queue; taking and finishing jobs, heartbeats and leader election work when Redis is full, while new jobs are refused.
+- **Eviction silently deleted queues, job records, idempotency keys and accounts.** The shipped configs use `noeviction` with a memory limit; workers and the dashboard log an error, and `/health` and *Settings → Performance* show it, when the policy is anything else or Redis is over 90% full.
+- **Open dashboards froze forever after a Redis restart** (the socket stayed open, updates had stopped). They now show "Redis unreachable" and resume by themselves; if updates ever stop, the socket is closed so the browser reconnects.
+- **Reusing a `task_id` broke the job**: its result was thrown away as stale and it stayed "Processing" for a day, and two schedules with the same id silently merged into one. A finished job's id is now reused cleanly; an active one is refused.
+- **Queue names piled up forever** (5,000 names made every dashboard refresh 48× slower). Unused names are forgotten, the API refuses unknown ones, and `MAX_QUEUES` caps them.
+- **After Redis lost its data, the dashboard asked for a setup code that didn't exist**, and nothing said why. PyTaskQ notices the loss (a marker key), logs it, shows it in `/health` and *Settings → Performance*, and prints a new setup code.
+- A frozen or full Redis gave `500`; now `503` with `Retry-After` (`"Redis is full"` when it's full), also for timeouts and a read-only replica during failover.
+- The first request after a Redis restart failed with `503`; a connection Redis closed is now replaced and the request retried (connection errors only, never timeouts, since a timed-out command may have run).
+- A worker with a wrong Redis password retried forever; it now stops with exit code 1 and says to check `REDIS_URL` / `REDIS_PASSWORD`. Stopping a worker during startup no longer logs "started and ready".
+- `redis.conf` claimed idempotency keys made a lost second of AOF data harmless; they don't. The comment now explains the real trade-off.
+
+### Added
+- `docs/REDIS.md`.
+- Settings: `MAX_QUEUES` (100), `REDIS_MAXMEMORY` (compose, 400mb).
+- `/health` reports Redis memory use and policy; *Settings → Performance* reports Redis memory problems, refusals because Redis was full, and data loss.
+
 ## 0.4.1 — 2026-11-21
 
 Reliability fixes from a break test of 0.4.0: crashed and hung tasks, Redis outages mid-job, frozen event loops, invalid jobs and request floods, on a real Redis with real worker processes. Every fix has a regression test, and the experiments were re-run. New guide: `docs/WORKERS.md` (how tasks run, timeouts per task type, what happens when things go wrong).

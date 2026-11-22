@@ -50,6 +50,8 @@ from redis import exceptions as redis_errors
 from pytaskq.core import clock
 from pytaskq.core import queueing
 from pytaskq.core import redis_client
+from pytaskq.core import redis_health
+from pytaskq.core.redis_health import OOM_PROBE
 from pytaskq.core.config import settings
 from pytaskq.pools import CpuPool, IoPool, PoolBroken, ProcessCrashed, TaskTimeoutError  # noqa: F401  (re-exported)
 from pytaskq.schemas.requests import Taskloader, Taskresult  # noqa: F401  (Taskresult kept for API compat)
@@ -187,7 +189,7 @@ end
 # On timeout, invalidate this attempt — but only if it still owns the job.
 # If the sweeper already handed the job to another worker, bumping the fence
 # would wrongly make THIS attempt's retry the current one. Returns -1 then.
-TIMEOUT_FENCE_SCRIPT = """
+TIMEOUT_FENCE_SCRIPT = OOM_PROBE + """
 local current = redis.call('get', KEYS[1])
 if current == false or current == ARGV[1] then
     local token = redis.call('incr', KEYS[1])
@@ -197,7 +199,9 @@ end
 return -1
 """
 
-PRIORITY_POP_SCRIPT = """
+# Starts with OOM_PROBE: taking a job must work when Redis is full, since
+# finishing jobs is what frees memory (moving a job uses no extra memory).
+PRIORITY_POP_SCRIPT = OOM_PROBE + """
 local dest = KEYS[1]
 for i = 2, #KEYS do
     local val = redis.call('RPOPLPUSH', KEYS[i], dest)
@@ -210,7 +214,7 @@ return nil
 
 # Take or keep the leader lock, in one step (a GET then EXPIRE could extend
 # another worker's lock).  KEYS: lock   ARGV: worker id, seconds
-LEADER_SCRIPT = """
+LEADER_SCRIPT = OOM_PROBE + """
 if redis.call('SET', KEYS[1], ARGV[1], 'NX', 'EX', tonumber(ARGV[2])) then return 1 end
 if redis.call('GET', KEYS[1]) == ARGV[1] then
     redis.call('EXPIRE', KEYS[1], tonumber(ARGV[2]))
@@ -286,8 +290,9 @@ return 1 + trimmed
 # Put a job from a processing list back on its queue (crashed or stopped worker,
 # or a job this worker can't run right now). Only if it's still in that list,
 # so a job that just finished is never queued again.
-# KEYS: processing list, fence, target list, task hash
-# ARGV: payload as listed, new payload, fence value read before ("" = none), new fence, note, "front" | "back"
+# KEYS: processing list, fence, target list, task hash, queue-name set
+# ARGV: payload as listed, new payload, fence value read before ("" = none), new fence, note, "front" | "back",
+#       queue name
 # Returns 1 put back, 2 was already finished (entry dropped), 0 not in the list, -2 fence changed (read again).
 PUT_BACK_SCRIPT = """
 local current = redis.call('GET', KEYS[2])
@@ -303,6 +308,7 @@ if ARGV[6] == 'front' then
 else
     redis.call('LPUSH', KEYS[3], ARGV[2])
 end
+redis.call('SADD', KEYS[5], ARGV[7])
 if status then
     redis.call('HSET', KEYS[4], 'status', 'Queued', 'payload', ARGV[2], 'note', ARGV[5])
     redis.call('HDEL', KEYS[4], 'started_at', 'worker_id')
@@ -324,23 +330,25 @@ return 1
 
 # Move a batch of due jobs from the delayed set onto their queues, only while a
 # queue has room (QUEUE_CAPACITY), so a big backlog can't flood one queue.
-# KEYS: delayed set, each queue's 3 lists, then per job: target list, task hash
-# ARGV: capacity (0 = none), number of queues, then per job: payload, queue index (1-based)
+# KEYS: delayed set, queue-name set, each queue's 3 lists, then per job: target list, task hash
+# ARGV: capacity (0 = none), number of queues, the queue names, then per job: payload, queue index (1-based)
 # Returns {moved, skipped because the queue was full}
 PROMOTE_SCRIPT = """
 local cap = tonumber(ARGV[1])
 local nq = tonumber(ARGV[2])
 local counts = {}
+local used = {}
 local moved, full = 0, 0
-local base = 1 + nq * 3
-local n = (#ARGV - 2) / 2
+local base = 2 + nq * 3
+local first = 2 + nq
+local n = (#ARGV - first) / 2
 for i = 1, n do
-    local raw = ARGV[1 + 2 * i]
-    local qi = tonumber(ARGV[2 + 2 * i])
+    local raw = ARGV[first - 1 + 2 * i]
+    local qi = tonumber(ARGV[first + 2 * i])
     local room = true
     if cap > 0 then
         if counts[qi] == nil then
-            local k = 1 + (qi - 1) * 3
+            local k = 2 + (qi - 1) * 3
             counts[qi] = redis.call('LLEN', KEYS[k + 1]) + redis.call('LLEN', KEYS[k + 2])
                          + redis.call('LLEN', KEYS[k + 3])
         end
@@ -356,9 +364,11 @@ for i = 1, n do
         if status == 'Scheduled' or status == 'RetryScheduled' then
             redis.call('HSET', hash, 'status', 'Queued')
         end
+        used[qi] = true
         moved = moved + 1
     end
 end
+for qi, _ in pairs(used) do redis.call('SADD', KEYS[2], ARGV[2 + qi]) end
 if moved > 0 then redis.call('PUBLISH', 'events:global', 'update') end
 return {moved, full}
 """
@@ -385,6 +395,30 @@ redis.call('LPUSH', KEYS[4], ARGV[4])
 redis.call('LTRIM', KEYS[4], 0, tonumber(ARGV[8]) - 1)
 redis.call('INCR', KEYS[5])
 redis.call('PUBLISH', 'events:global', 'update')
+return 1
+"""
+
+# A job really starts: record it. (PERSIST first, so this works when Redis is full.)
+# KEYS: task hash   ARGV: field, value, …
+STARTED_SCRIPT = """
+local unpack = unpack or table.unpack
+redis.call('PERSIST', KEYS[1])
+redis.call('HSET', KEYS[1], unpack(ARGV))
+redis.call('PUBLISH', 'events:global', 'update')
+return 1
+"""
+
+# "This worker is alive" (works when Redis is full).
+# KEYS: active_workers, worker hash, workers set, queue-name set
+# ARGV: worker id, alive until, hash TTL, number of queue names, queue names…, hash fields…
+HEARTBEAT_SCRIPT = OOM_PROBE + """
+local unpack = unpack or table.unpack
+redis.call('ZADD', KEYS[1], ARGV[2], ARGV[1])
+redis.call('SADD', KEYS[3], ARGV[1])
+local nq = tonumber(ARGV[4])
+if nq > 0 then redis.call('SADD', KEYS[4], unpack(ARGV, 5, 4 + nq)) end
+if #ARGV > 4 + nq then redis.call('HSET', KEYS[2], unpack(ARGV, 5 + nq)) end
+redis.call('EXPIRE', KEYS[2], tonumber(ARGV[3]))
 return 1
 """
 
@@ -431,12 +465,13 @@ async def _with_retries(op, what: str, task_id: str = ""):
             if attempt:
                 logger.info(f"[Redis] Back again: {what}" + (f" for task {task_id}" if task_id else "") + " done.")
             return result
-        except REDIS_DOWN as e:
+        except (*REDIS_DOWN, redis_errors.OutOfMemoryError) as e:
             if _hard_stop.is_set():
                 raise
             if attempt == 0:
+                why = "Redis is out of memory" if redis_health.is_oom(e) else f"{type(e).__name__}: {e}"
                 logger.warning(f"[Redis] Couldn't {what}" + (f" for task {task_id}" if task_id else "")
-                               + f" ({type(e).__name__}: {e}). Retrying until Redis is back; nothing is lost.")
+                               + f" ({why}). Retrying until Redis is back; nothing is lost.")
             attempt += 1
             await asyncio.sleep(delay)
             delay = min(delay * 2, 5)
@@ -548,8 +583,8 @@ async def _promote_due_tasks(now: float = None) -> int:
             items.append((raw, queues.index(queue) + 1,
                           queueing.queue_key(_priority(data), queue), queueing.task_key(data["task_id"])))
         if items:
-            keys = ["delayed_tasks"] + [k for q in queues for k in queueing.queue_keys(q)]
-            argv: list = [max(0, settings.QUEUE_CAPACITY), len(queues)]
+            keys = ["delayed_tasks", queueing.QUEUES_KEY] + [k for q in queues for k in queueing.queue_keys(q)]
+            argv: list = [max(0, settings.QUEUE_CAPACITY), len(queues), *queues]
             for raw, qi, target, hash_key in items:
                 keys += [target, hash_key]
                 argv += [raw, qi]
@@ -564,12 +599,18 @@ async def _promote_due_tasks(now: float = None) -> int:
 
 
 async def zombie_sweeper():
+    rounds = 0
     while True:
         if not await is_leader():
             await asyncio.sleep(5)
             continue
         try:
             await _sweep_dead_workers()
+            if rounds % 30 == 0:                   # every ~5 minutes
+                dropped = await queueing.prune_queues(redis_client.r)
+                if dropped:
+                    logger.info(f"[Sweeper] Forgot {len(dropped)} unused queue name(s): {', '.join(dropped[:10])}")
+            rounds += 1
         except Exception as e:
             logger.error(f"[Sweeper] Redis error: {e}. Retrying in 5s...")
             await asyncio.sleep(5)
@@ -630,11 +671,12 @@ async def _put_back(r, worker_id: str, raw: str, note: str, side: str = "front")
         current = await r.get(f"fence:{task_id}")
         token = max(_as_int(current), _as_int(data.get("fence_token"))) + 1
         new_raw = json.dumps({**data, "fence_token": token})
+        queue = queueing.payload_queue(data)
         result = await r.eval(
-            PUT_BACK_SCRIPT, 4,
+            PUT_BACK_SCRIPT, 5,
             _processing_key(worker_id), f"fence:{task_id}",
-            queueing.queue_key(_priority(data), queueing.payload_queue(data)), queueing.task_key(task_id),
-            raw, new_raw, current or "", str(token), note, side,
+            queueing.queue_key(_priority(data), queue), queueing.task_key(task_id), queueing.QUEUES_KEY,
+            raw, new_raw, current or "", str(token), note, side, queue,
         )
         if result != -2:
             return int(result)
@@ -721,14 +763,9 @@ class _Heartbeat(threading.Thread):
         self.blocked_for = max(0.0, time.monotonic() - _loop_tick)
         info = {**_worker_info(), **_health(), "last_seen": now, "started_at": _started_at or now,
                 "loop_blocked_seconds": round(self.blocked_for) if self.blocked_for >= LOOP_BLOCKED_WARN else 0}
-        p = c.pipeline(transaction=True)
-        p.zadd("active_workers", {WORKER_ID: now + HEARTBEAT_TTL})
-        p.sadd(WORKERS_KEY, WORKER_ID)
-        p.hset(f"worker:{WORKER_ID}", mapping=info)
-        p.expire(f"worker:{WORKER_ID}", HEARTBEAT_TTL * 4)
-        if QUEUES:
-            p.sadd(queueing.QUEUES_KEY, *QUEUES)
-        p.execute()
+        fields = [str(x) for kv in info.items() for x in kv]
+        c.eval(HEARTBEAT_SCRIPT, 4, "active_workers", f"worker:{WORKER_ID}", WORKERS_KEY, queueing.QUEUES_KEY,
+               WORKER_ID, repr(now + HEARTBEAT_TTL), HEARTBEAT_TTL * 4, len(QUEUES), *QUEUES, *fields)
 
     def _watchdog(self) -> None:
         blocked = time.monotonic() - _loop_tick
@@ -787,6 +824,10 @@ async def _periodic():
     from pytaskq.core import pressure
     last_registry = time.monotonic()
     while True:
+        try:
+            await redis_health.check_data(redis_client.r, "Worker")
+        except Exception:
+            pass                                   # Redis down or full: nothing to compare
         await asyncio.sleep(10)
         try:
             if time.monotonic() - last_registry > 60:
@@ -794,7 +835,7 @@ async def _periodic():
                 last_registry = time.monotonic()
             await pressure.flush(redis_client.r)    # hand-backs counted here show in Settings → Performance
         except Exception as e:
-            logger.warning(f"[Registry] Redis unreachable: {e}")
+            logger.warning(f"[Registry] Couldn't update ({'Redis is out of memory' if redis_health.is_oom(e) else e})")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1081,18 +1122,10 @@ async def _run(r, tasks, task_json, process_pool, thread_pool) -> None:
             logger.info(f"Executing task {task_id} ({tasks.task_name})")
 
             async def write(_):
-                async with r.pipeline(transaction=True) as pipe:
-                    pipe.hset(queueing.task_key(task_id), mapping={
-                        "task_id": task_id,
-                        "task_name": tasks.task_name,
-                        "status": queueing.PROCESSING,
-                        "started_at": started_at,
-                        "worker_id": WORKER_ID,
-                        "retry_count": tasks.retry_count,
-                    })
-                    pipe.persist(queueing.task_key(task_id))
-                    pipe.publish(queueing.EVENTS_CHANNEL, "update")
-                    await pipe.execute()
+                await r.eval(STARTED_SCRIPT, 1, queueing.task_key(task_id),
+                             "task_id", task_id, "task_name", tasks.task_name, "status", queueing.PROCESSING,
+                             "started_at", repr(started_at), "worker_id", WORKER_ID,
+                             "retry_count", tasks.retry_count)
             await _with_retries(write, "mark a job as started", task_id)
 
         try:
@@ -1185,7 +1218,8 @@ async def _run(r, tasks, task_json, process_pool, thread_pool) -> None:
                 [tasks.on_success_url, task_id, tasks.task_name, encoded] + ([dropped] if dropped else []),
                 queue=tasks.queue,   # a worker serving this queue certainly has the built-in task
             )
-            await _with_retries(lambda _: queueing.enqueue(r, webhook, max_bytes=0), "queue a webhook", task_id)
+            await _with_retries(lambda _: queueing.enqueue(r, webhook, max_bytes=0, oom_ok=True),
+                                "queue a webhook", task_id)
             logger.info(f"Enqueued webhook delivery for task {task_id} → {tasks.on_success_url}")
 
 
@@ -1269,6 +1303,67 @@ async def _watch_cpu_pool(cpu_pool: CpuPool):
     shutdown_event.set()
 
 
+async def _startup(named: str) -> bool:
+    """
+    Connect, recover, announce. Returns False if the worker must not start.
+
+    Only the steps that need Redis to answer at all are retried here. The
+    worker's bookkeeping (its details, its queues, its task list) is
+    best-effort: when Redis is full it can't be written, and refusing to start
+    then meant no worker ever took a job, so memory never freed up again.
+    Configuration errors (a wrong password) stop the worker with exit code 1:
+    retrying won't fix them.
+    """
+    global EXIT_CODE, _started_at
+    r = redis_client.r
+    while not shutdown_event.is_set():
+        try:
+            await clock.sync(r, force=True)
+            await r.ping()
+            if named:
+                await _claim_name(r)
+                recovered = await _recover_worker(WORKER_ID, f"Put back after worker {WORKER_ID} restarted")
+                if recovered:
+                    logger.info(f"Put back {recovered} job(s) this worker was running before it restarted.")
+            break
+        except Exception as e:
+            if redis_health.is_config_error(e):
+                logger.critical(f"[Startup] Redis refused this worker: {e}. Check REDIS_URL / REDIS_PASSWORD "
+                                f"(`pytaskq ping` tests them). Stopping with exit code 1.")
+                EXIT_CODE = 1
+                return False
+            if not isinstance(e, REDIS_DOWN):
+                raise
+            logger.error(f"[Startup] Redis unavailable ({e.__class__.__name__}: {e}). Retrying in 5s...")
+            try:
+                await asyncio.wait_for(shutdown_event.wait(), timeout=5)
+            except asyncio.TimeoutError:
+                pass
+    if shutdown_event.is_set():
+        return False
+
+    _started_at = clock.now()
+    try:
+        await r.hset(f"worker:{WORKER_ID}", mapping={**_worker_info(), "started_at": _started_at})
+        await r.sadd(queueing.QUEUES_KEY, *QUEUES)
+        await _publish_registry()
+    except Exception as e:
+        if not (redis_health.is_oom(e) or isinstance(e, REDIS_DOWN)):
+            raise
+        mem = await redis_health.memory(r)
+        logger.error(f"[Startup] {redis_health.describe_oom(mem) if redis_health.is_oom(e) else e}. Starting "
+                     f"anyway: taking and finishing waiting jobs frees memory. New jobs are refused meanwhile.")
+    await _check_redis_setup(r)
+    return True
+
+
+async def _check_redis_setup(r) -> None:
+    """Warn loudly when Redis is set up to delete keys, or nearly full."""
+    for problem in redis_health.problems(await redis_health.memory(r)):
+        log = logger.error if problem["level"] == "critical" else logger.warning
+        log(f"[Redis] {problem['title']}. {problem['detail']}")
+
+
 def _cpu_modules() -> tuple:
     mods = []
     for name, entry in TASKS.items():
@@ -1321,22 +1416,15 @@ async def consumer_task():
         signal.signal(signal.SIGINT, lambda s, f: loop.call_soon_threadsafe(_signal_handler))
         signal.signal(signal.SIGTERM, lambda s, f: loop.call_soon_threadsafe(_signal_handler))
 
-    while not shutdown_event.is_set():
+    ready = await _startup(named)
+    if not ready:
+        if not EXIT_CODE:
+            logger.info(f"Worker {WORKER_ID} stopped before it started.")
         try:
-            await clock.sync(redis_client.r, force=True)
-            if named:
-                await _claim_name(redis_client.r)
-                recovered = await _recover_worker(WORKER_ID, f"Put back after worker {WORKER_ID} restarted")
-                if recovered:
-                    logger.info(f"Put back {recovered} job(s) this worker was running before it restarted.")
-            _started_at = clock.now()
-            await redis_client.r.hset(f"worker:{WORKER_ID}", mapping={**_worker_info(), "started_at": _started_at})
-            await redis_client.r.sadd(queueing.QUEUES_KEY, *QUEUES)
-            await _publish_registry()
-            break
-        except REDIS_DOWN as e:
-            logger.error(f"[Startup] Redis unavailable ({e.__class__.__name__}). Retrying in 5s...")
-            await asyncio.sleep(5)
+            await redis_client.r.aclose()
+        except Exception:
+            pass
+        return
 
     cpu_pool = None
     if needs_processes:
@@ -1406,7 +1494,10 @@ async def consumer_task():
             idle_delay = 0.05
         except Exception as e:
             sem.release()
-            logger.error(f"[Main loop] Redis error: {e.__class__.__name__}. Backing off 5s...")
+            why = ("Redis is out of memory" if redis_health.is_oom(e)
+                   else "Redis refused the password or permissions" if redis_health.is_config_error(e)
+                   else f"Redis error: {e.__class__.__name__}")
+            logger.error(f"[Main loop] {why}. Backing off 5s...")
             await asyncio.sleep(5)
             continue
 

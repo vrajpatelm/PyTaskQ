@@ -86,6 +86,16 @@ A job that finishes while Redis is unreachable keeps its result in memory, and t
 
 Saving the outcome and removing the job from the worker's processing list happen in one Redis step, so a job can't end up marked finished while still listed as running, or listed as running forever.
 
+## When Redis is full
+
+With `maxmemory` reached, Redis refuses new jobs, but workers keep taking, running and finishing the waiting ones, since that's what frees memory. A worker started while Redis is full starts anyway and says so:
+
+```
+[Startup] Redis is out of memory (402 MB used, maxmemory 400 MB). Starting anyway: taking and finishing waiting jobs frees memory.
+```
+
+A wrong Redis password stops the worker at startup with exit code 1, since retrying can't fix it. [REDIS.md](REDIS.md) covers the Redis settings that matter.
+
 ## Stopping a worker
 
 Ctrl+C, `docker stop` or SIGTERM:

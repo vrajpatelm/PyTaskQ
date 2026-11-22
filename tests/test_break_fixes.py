@@ -542,7 +542,7 @@ async def test_b7_cron_job_record_exists_before_it_can_be_taken(env):
         result = await real_eval(src, *args, **kw)
         if src == queueing.ENQUEUE_SCRIPT and "status" not in seen:
             # The instant the push happens, a hot worker could take the job: its record must exist.
-            tid = args[19]      # (numkeys, 9 keys, ARGV…): ARGV[10] is the task id
+            tid = args[20]      # (numkeys, 10 keys, ARGV…): ARGV[10] is the task id
             seen["status"] = await r.hget(f"task:{tid}", "status")
             seen["id"] = tid
         return result

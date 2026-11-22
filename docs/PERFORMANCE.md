@@ -43,7 +43,8 @@ Nothing is cached in a way that changes behaviour: revoking a token, ending a se
 |---|---|---|
 | **429** "Server is busy: queue '…' is full" on `POST /task/enqueue` | That queue holds `QUEUE_CAPACITY` jobs. Workers serving it are finishing jobs more slowly than they arrive. The limit is exact: with `QUEUE_CAPACITY=10`, 200 simultaneous requests get exactly 10 jobs in. | Add workers, or raise `WORKER_IO_WORKERS`. Raise `QUEUE_CAPACITY` only to absorb short bursts. |
 | **503** "Redis is unavailable", detail "The server is busy" | Every Redis connection stayed busy for `REDIS_POOL_TIMEOUT` seconds. | Raise `REDIS_MAX_CONNECTIONS`. If the server's CPU is at 100%, it needs more cores instead. |
-| **503** "Redis is unavailable", detail "temporarily down" | Redis couldn't be reached at all. | `docker compose logs redis`. Check `REDIS_URL` / `REDIS_HOST`. |
+| **503** "Redis is unavailable", detail "temporarily down" or "not answering" | Redis couldn't be reached, or didn't answer in time. | `docker compose logs redis`. Check `REDIS_URL` / `REDIS_HOST`. |
+| **503** "Redis is full" | Redis reached `maxmemory`: new jobs are refused until workers finish waiting ones. | Raise `maxmemory`, add workers, or keep less (`RESULT_TTL`, `HISTORY_LIMIT`, old dead letters). See [REDIS.md](REDIS.md). |
 
 Both responses carry a `Retry-After` header. Well-behaved clients wait that many seconds and try again, so a short overload causes a short delay, not lost work.
 
@@ -62,6 +63,7 @@ All of these go in `.env` (or the environment). Restart after changing them.
 | `WORKER_IO_WORKERS` | cores × 4, at least 4 | Jobs each worker runs at once, besides CPU jobs. The biggest lever for jobs that mostly wait: HTTP calls, email, database queries, `async` tasks. Doesn't help CPU-heavy jobs. |
 | `WORKER_CPU_WORKERS` | cores − 1 | Processes for `type="cpu"` jobs. More than the number of cores doesn't help. |
 | `QUEUE_CAPACITY` | 500 | Jobs that can wait in **each** queue before new API jobs for it get 429 (`0` = no limit). Jobs your app queues with `.delay()` aren't refused. Due scheduled jobs and retries move onto a queue only while it's below this, so a big backlog drains as workers keep up instead of flooding it. A bigger queue absorbs longer bursts but doesn't make workers faster. |
+| `MAX_QUEUES` | 100 | How many queue names may exist. Unused names are forgotten automatically. `0` = no limit. |
 | `WORKER_QUEUES` | the worker's tasks' queues | Which queues a worker serves (`--queues`). See [QUEUES.md](QUEUES.md). |
 | `MAX_RESULT_BYTES` | 1,000,000 | Larger results aren't stored in Redis (the job still succeeds). `0` = no limit. |
 | `MAX_PAYLOAD_BYTES` | 1,000,000 | Larger jobs (their arguments) are refused: `413` from the API, `ValueError` from `.delay()`. Each waiting job is held in Redis memory. `0` = no limit. |

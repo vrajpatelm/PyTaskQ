@@ -4,7 +4,6 @@ from fastapi import Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
-from redis.exceptions import ConnectionError as RedisConnectionError
 
 from pytaskq.core import pressure
 
@@ -16,8 +15,30 @@ def _is_pool_exhausted(exc: Exception) -> bool:
     return "no connection available" in text or "too many connections" in text or type(exc).__name__ == "MaxConnectionsError"
 
 
-async def redis_connection_error_handler(request: Request, exc: RedisConnectionError):
-    if _is_pool_exhausted(exc):
+async def redis_connection_error_handler(request: Request, exc: Exception):
+    """503 + Retry-After for every "Redis can't answer right now" error.
+
+    Connection errors, timeouts (a frozen or overloaded Redis), a full Redis
+    (maxmemory reached) and a read-only replica during a failover all used to
+    surface as 500 Internal Server Error, except plain connection errors.
+    """
+    from redis import exceptions as redis_errors
+    if isinstance(exc, redis_errors.OutOfMemoryError) or "OOM command not allowed" in str(exc):
+        pressure.record("redis_full", f"{request.method} {request.url.path}")
+        return JSONResponse(
+            status_code=503,
+            content={"error": "Redis is full",
+                     "detail": "The task queue's storage is full, so no new jobs can be accepted right now. "
+                               "Workers free space as they finish jobs; please retry shortly."},
+            headers={"Retry-After": str(RETRY_AFTER_SECONDS * 5)},
+        )
+    if isinstance(exc, redis_errors.ReadOnlyError):
+        pressure.record("redis_down", "read-only replica (failover in progress?)")
+        detail = "The task queue service is switching servers. Please try again shortly."
+    elif isinstance(exc, redis_errors.TimeoutError):
+        pressure.record("redis_down", f"timeout: {str(exc)[:150]}")
+        detail = "The task queue service is not answering. Please try again shortly."
+    elif _is_pool_exhausted(exc):
         pressure.record("redis_busy", f"{request.method} {request.url.path}")
         detail = "The server is busy. Please retry in a moment."
     else:
