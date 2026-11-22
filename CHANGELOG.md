@@ -32,7 +32,7 @@ The first release on PyPI since 0.3.1: it includes everything from 0.4.0, 0.4.1 
 - Docs: `TASKS.md`, `GUARANTEES.md`, `UPGRADING.md`; high availability, sharing a Redis, monitoring, priorities, pausing and missed runs in the existing guides.
 
 ### Changed
-- **Instant pickup**: queueing a job wakes an idle worker through a wake-up token, so jobs start within 1–3 ms instead of up to a second (about 475 ms on average), and an idle worker sends 9 Redis commands a second instead of 15–65.
+- **Instant pickup**: queueing a job wakes an idle worker through a wake-up token, so jobs start within 1–3 ms instead of up to a second (about 475 ms on average), and an idle worker sends about 10–12 Redis commands a second instead of 15–65 (with 20 queues).
 - **Redis memory stays flat**: finished jobs are capped by count (above). With 100 jobs a second, memory used to grow to about 20 GB a day.
 - Cron tick locks are kept 3 hours instead of 30 days (an every-minute task left 43,200 keys behind).
 - `queue.wait()` checks every 20 ms at first, then less often, so quick jobs return quickly.

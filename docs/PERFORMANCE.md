@@ -26,7 +26,7 @@ At 400 users, who create jobs a little slower than the worker finishes them, 0.4
 | | 0.4 | 0.5 |
 |---|---|---|
 | Time from queueing a job to an idle worker starting it | up to 1 s (about 475 ms on average) | 1–3 ms |
-| Redis commands per second from one idle worker (20 queues) | 65 | 9 |
+| Redis commands per second from one idle worker (1 queue / 20 queues) | 15 / 65 | 10 / 12 |
 | Redis memory after a million jobs | grows with jobs per day × `RESULT_TTL` | flat: the newest `FINISHED_JOBS_KEPT` finished jobs |
 
 - **Instant pickup.** Idle workers used to check their queues every so often. Now queueing a job also drops a small wake-up token, and an idle worker waits on those tokens, so it starts the job at once and asks Redis almost nothing while idle.
