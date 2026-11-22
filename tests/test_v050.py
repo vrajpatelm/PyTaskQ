@@ -360,3 +360,59 @@ def test_4_two_installations_share_one_redis(tmp_path):
     finally:
         server.terminate()
         server.wait()
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 5. Fleet version and settings check
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _worker_record(worker_id, version=None, **changes):
+    from pytaskq.core import fleet
+    shared = {**fleet.fingerprint(), **{k: str(v) for k, v in changes.items()}}
+    return {"worker_id": worker_id, "version": version or __import__("pytaskq").__version__,
+            "settings": json.dumps(shared)}
+
+
+def test_5_matching_fleet_has_no_warnings():
+    from pytaskq.core import fleet
+    assert fleet.compare([_worker_record("a"), _worker_record("b")]) == []
+
+
+def test_5_different_versions_and_settings_are_named():
+    from pytaskq.core import fleet
+    problems = fleet.compare([
+        _worker_record("a"),
+        _worker_record("b", RESULT_TTL=3600),
+        {"worker_id": "old-1", "version": None, "settings": None},
+    ])
+    titles = [p["title"] for p in problems]
+    assert "Different PyTaskQ versions are running (2)" in titles
+    assert "RESULT_TTL is set differently on some workers" in titles
+    detail = next(p for p in problems if p["title"].startswith("RESULT_TTL"))["detail"]
+    assert "The dashboard uses 86400" in detail and "3600 on b" in detail
+    versions = next(p for p in problems if "versions" in p["title"])["detail"]
+    assert "older than 0.5: old-1" in versions
+
+
+def test_5_webhook_secrets_are_compared_without_revealing_them(monkeypatch):
+    from pytaskq.core import fleet
+    monkeypatch.setenv("WEBHOOK_SECRET", "super-secret-value")
+    value = fleet.fingerprint()["WEBHOOK_SECRET"]
+    assert value.startswith("set (") and "super" not in value
+    monkeypatch.setenv("WEBHOOK_SECRET", "another")
+    assert fleet.fingerprint()["WEBHOOK_SECRET"] != value
+
+
+async def test_5_worker_advertises_and_dashboard_reports(env, client, caplog):
+    r = env
+    with patch.object(worker, "QUEUES", ["default"]):
+        await r.hset("worker:other", mapping=_worker_record("other", RESULT_TTL=60))
+        await r.zadd("active_workers", {"other": clock.now() + 30})
+        assert await worker._startup("") is True
+    assert "[Fleet] RESULT_TTL is set differently" in caplog.text and "This worker uses 86400" in caplog.text
+    info = await r.hgetall("worker:test-worker")
+    assert info["version"] == __import__("pytaskq").__version__ and "RESULT_TTL" in json.loads(info["settings"])
+    workers = (await client.get("/system/workers")).json()["workers"]
+    assert {w["version"] for w in workers} == {__import__("pytaskq").__version__}
+    perf = (await client.get("/system/performance")).json()["suggestions"]
+    assert any(s["title"] == "RESULT_TTL is set differently on some workers" for s in perf)

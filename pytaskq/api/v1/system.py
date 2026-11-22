@@ -72,6 +72,8 @@ async def load_workers() -> list[dict]:
             "queues": [q for q in (info.get("queues") or "default").split(",") if q],
             "uptime_seconds": int(now - started_at) if started_at else None,
             "last_heartbeat_seconds_ago": seconds_ago,
+            "version": info.get("version") or None,
+            "settings": info.get("settings") or None,
             "stuck_io": _num(info.get("stuck_io"), int, 0),
             "cpu_restarts": _num(info.get("cpu_restarts"), int, 0),
             "loop_blocked_seconds": _num(info.get("loop_blocked_seconds"), int, 0),

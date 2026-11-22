@@ -614,7 +614,7 @@ function WorkersView({ workers }) {
           <tbody>
             {workers.map(w => (
               <tr key={w.worker_id}>
-                <td><div className="task-name">{w.hostname || 'worker'}{w.pid ? ` · pid ${w.pid}` : ''}</div><div className="task-id">{w.worker_id}</div></td>
+                <td><div className="task-name">{w.hostname || 'worker'}{w.pid ? ` · pid ${w.pid}` : ''}</div><div className="task-id">{w.worker_id}</div><div className="muted small">{w.version ? `PyTaskQ ${w.version}` : 'PyTaskQ older than 0.5'}</div></td>
                 <td>{w.app || <span className="muted">—</span>}</td>
                 <td className="small">{(w.queues || ['default']).join(', ')}</td>
                 <td className="num">{w.active}</td>

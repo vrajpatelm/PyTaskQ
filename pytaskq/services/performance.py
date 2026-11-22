@@ -170,6 +170,8 @@ async def build_report(workers: list[dict]) -> dict:
         cores=cores, processes=processes, pool_max=pool["max_connections"],
     )
     found = await _redis_suggestions(r, mem, turned_away) + found
+    from pytaskq.core import fleet
+    found += [_suggest(p["level"], p["title"], p["detail"]) for p in fleet.compare(live)]
     try:
         kept = await redis_health.retention(r)
     except Exception:

@@ -48,6 +48,7 @@ from opentelemetry import trace
 from redis import exceptions as redis_errors
 
 from pytaskq.core import clock
+from pytaskq.core import fleet
 from pytaskq.core import queueing
 from pytaskq.core import redis_client
 from pytaskq.core import redis_health
@@ -777,6 +778,7 @@ def _worker_info() -> dict:
         "tasks": len([t for t in TASKS if not t.startswith("_")]),
         "queues": ",".join(QUEUES),
         "heartbeat_ttl": HEARTBEAT_TTL,
+        **fleet.advertised(),                 # version + shared settings, compared by the dashboard
     }
 
 
@@ -1414,7 +1416,19 @@ async def _startup(named: str) -> bool:
         logger.error(f"[Startup] {redis_health.describe_oom(mem) if redis_health.is_oom(e) else e}. Starting "
                      f"anyway: taking and finishing waiting jobs frees memory. New jobs are refused meanwhile.")
     await _check_redis_setup(r)
+    await _check_fleet(r)
     return True
+
+
+async def _check_fleet(r) -> None:
+    """Warn at startup when this worker's version or shared settings differ from the other live workers'."""
+    try:
+        others = await fleet.live_workers(r, exclude=WORKER_ID)
+    except Exception:
+        return
+    for problem in fleet.compare(others):
+        logger.warning(f"[Fleet] {problem['title'].replace('the dashboard', 'this worker')}. "
+                       f"{problem['detail'].replace('The dashboard uses', 'This worker uses')}")
 
 
 async def _check_redis_setup(r) -> None:

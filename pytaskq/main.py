@@ -71,6 +71,11 @@ async def _watch_redis():
                     logger.error(f"[Redis] {problem['title']}. {problem['detail']}")
             if settings.auth_enabled:
                 await auth.announce_setup_code(r, logger)
+            from pytaskq.core import fleet
+            for problem in fleet.compare(await fleet.live_workers(r)):
+                if problem["title"] not in warned_problems:
+                    warned_problems.add(problem["title"])
+                    logger.warning(f"[Fleet] {problem['title']}. {problem['detail']}")
         except asyncio.CancelledError:
             raise
         except Exception:
