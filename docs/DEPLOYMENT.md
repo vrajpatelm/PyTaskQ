@@ -67,7 +67,7 @@ The image includes a small example app so you can try PyTaskQ immediately. For r
 
 ```dockerfile
 # Dockerfile.worker
-FROM ghcr.io/vrajpatelm/pytaskq:0.4
+FROM ghcr.io/vrajpatelm/pytaskq:0.5
 COPY requirements.txt .
 RUN pip install --user -r requirements.txt     # your task's own dependencies
 COPY tasks.py .
@@ -130,11 +130,37 @@ Why not just copy the file into Redis? Redis keeps an append-only log of every c
 ## Upgrading
 
 ```bash
-# in .env: PYTASKQ_VERSION=0.4.2
+# in .env: PYTASKQ_VERSION=0.5.0
 docker compose -f docker-compose.prod.yml exec backup sh /backup-loop.sh once   # backup first
 docker compose -f docker-compose.prod.yml pull
 docker compose -f docker-compose.prod.yml up -d
 ```
+
+Upgrade the web service and every worker to the same version. If you build your own worker image (`FROM ghcr.io/vrajpatelm/pytaskq:…`), rebuild it with the new tag too. Afterwards, *Settings → Performance* warns if any worker still runs another version or has different settings. Coming from 0.3.1, read [UPGRADING.md](UPGRADING.md) first.
+
+## Monitoring
+
+- **Health checks:** `GET /health` (no sign-in). Watch the `status` field: `ok`, `degraded` (with `warnings`: Redis nearly full, set to evict keys, or lost its data) or `down` (HTTP 503).
+- **Prometheus / Grafana:** `GET /metrics/prometheus` returns the dashboard's numbers in the Prometheus text format: waiting jobs per queue and priority, paused queues, running and scheduled jobs, dead letters, live workers, succeeded jobs and failed attempts (counters), missed cron runs per task, requests turned away in the last hour, and Redis memory. Create an API token for a **viewer** (*Settings → API tokens*) and scrape with it:
+
+  ```yaml
+  # prometheus.yml
+  scrape_configs:
+    - job_name: pytaskq
+      scheme: https
+      metrics_path: /metrics/prometheus
+      authorization:
+        credentials: ptq_...          # a viewer's API token
+      static_configs:
+        - targets: ["jobs.example.com"]
+  ```
+
+  Useful alerts: `pytaskq_workers == 0` for a few minutes; `pytaskq_queue_jobs` growing for 15 minutes; `increase(pytaskq_cron_missed_runs_total[1h]) > 0`; `pytaskq_redis_used_memory_bytes / pytaskq_redis_max_memory_bytes > 0.8`.
+- **Settings → Performance** in the dashboard explains anything unusual in plain words, with the setting to change.
+
+## High availability
+
+One Redis is one machine that can fail. For a setup that survives losing it, run Redis with a replica and Redis Sentinel (or a managed Redis with automatic failover) and point PyTaskQ at the Sentinels with `REDIS_SENTINELS`. [REDIS.md](REDIS.md#high-availability) explains the options. Run at least two workers, on different machines if you can, so scheduled tasks keep running when one stops.
 
 ## Tracing (optional)
 
@@ -178,4 +204,6 @@ Caddy adds `X-Forwarded-For` and `X-Forwarded-Proto`, so PyTaskQ sees the visito
 | Requests get 429 or 503 under load | Open **Settings → Performance** in the dashboard. [PERFORMANCE.md](PERFORMANCE.md) explains each setting. |
 | 503 "Redis is full" | Redis reached `REDIS_MAXMEMORY`. Workers drain it; raise it if it happens again. [REDIS.md](REDIS.md#when-redis-is-full) |
 | Worker exits at once with "Redis refused this worker" | Wrong `REDIS_PASSWORD`. `docker compose -f docker-compose.prod.yml exec web pytaskq ping` tests it. |
+| *Settings → Performance* says versions or settings differ | A worker wasn't upgraded or uses another `.env`. The Workers tab shows each one's version. |
+| Jobs stay *Queued* with "Waiting…" | The task has `max_concurrency` or `rate_limit` and is waiting for its turn, or its queue is paused (the Queues row shows it). |
 | The dashboard asks for a setup code after a restart, and accounts are gone | Redis lost its data (no volume, or flushed). The new setup code is in `docker compose -f docker-compose.prod.yml logs web`; restore a backup to get the old data back. [REDIS.md](REDIS.md#when-redis-loses-its-data) |

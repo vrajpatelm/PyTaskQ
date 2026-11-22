@@ -26,7 +26,8 @@ Async-first, self-hosted, built on FastAPI and Redis.
 
 - **Plain Python.** One decorator. Sync, `async def`, CPU-heavy and I/O-bound tasks each run in the right pool automatically.
 - **See everything.** A live dashboard shows every job's arguments, timing, result and error, and lets you run, cancel and replay jobs.
-- **Built for failure.** Retries with backoff, a dead-letter queue, crash recovery, fencing tokens, safe retries with idempotency keys and graceful shutdown come built in.
+- **Built for failure.** Retries with backoff, a dead-letter queue, crash recovery, fencing tokens, safe retries with idempotency keys and graceful shutdown come built in. [What PyTaskQ guarantees](https://github.com/vrajpatelm/PyTaskQ/blob/main/docs/GUARANTEES.md), stated plainly.
+- **In control.** Report progress from a task, stop a running job, pause a queue, limit how many of a task run at once or how fast, and search every finished job.
 - **Fast on small servers.** On a 2-core server, 500 simultaneous users get a typical response in 16 ms, and the dashboard tells you which setting to change when it can't keep up.
 - **Self-hosted.** Accounts, roles, invite links, HTTPS and backups are included. Redis is the only thing you need to run.
 
@@ -92,7 +93,7 @@ Live updates, light and dark themes, and a layout that works on phones.
 
 <img src="https://raw.githubusercontent.com/vrajpatelm/PyTaskQ/main/docs/images/dashboard-dark.png" alt="Jobs view with the lifecycle strip and a live job list" width="100%" />
 
-**Job details.** Timings, the worker that ran it, attempts, arguments, and the result or error. Waiting jobs can be cancelled.
+**Job details.** Timings, the worker that ran it, attempts, arguments, progress, and the result or error. Waiting jobs can be cancelled and running ones stopped.
 
 <img src="https://raw.githubusercontent.com/vrajpatelm/PyTaskQ/main/docs/images/job-details.png" alt="Job detail panel with timings, arguments and result" width="100%" />
 
@@ -104,7 +105,11 @@ Live updates, light and dark themes, and a layout that works on phones.
 
 <img src="https://raw.githubusercontent.com/vrajpatelm/PyTaskQ/main/docs/images/dead-letters.png" alt="Dead letters with their errors and replay buttons" width="100%" />
 
-**Workers.** Host, load, jobs done and failed, pool sizes, uptime and heartbeat health.
+**Workers.** Host, load, jobs done and failed, pool sizes, uptime, heartbeat health and PyTaskQ version.
+
+**History.** Search every kept finished job (50,000 by default) by text, outcome, task, queue and time.
+
+**Queues.** How many jobs wait in each queue and how many workers serve it, with a button to pause and resume each one.
 
 <img src="https://raw.githubusercontent.com/vrajpatelm/PyTaskQ/main/docs/images/workers.png" alt="Worker fleet with health and throughput" width="100%" />
 
@@ -155,7 +160,12 @@ Lost it? Run `pytaskq users setup-code`. For automated installs, set `PYTASKQ_AD
 | `timeout` | `300` s | Stop and retry an attempt after this long, counted from when it starts ([how each task type is stopped](https://github.com/vrajpatelm/PyTaskQ/blob/main/docs/WORKERS.md)) |
 | `cron` | — | 5-field cron schedule |
 | `tz` | `CRON_TIMEZONE` (UTC) | Time zone the cron schedule is read in, e.g. `"Asia/Kolkata"` |
+| `catch_up` | on | After an outage, run the latest missed cron tick once ([missed runs](https://github.com/vrajpatelm/PyTaskQ/blob/main/docs/QUEUES.md#missed-runs-and-catch-up)) |
+| `max_concurrency` | — | At most this many running at once, across all workers |
+| `rate_limit` | — | At most this many starts, across all workers: `"10/s"`, `"100/m"`, `"1000/h"` |
 | `name` | function name | Registered task name |
+
+Inside a task, `pytaskq.progress(40, "loading")` reports progress and `pytaskq.cancelled()` tells a long IO task it was cancelled. Everything about writing tasks: [docs/TASKS.md](https://github.com/vrajpatelm/PyTaskQ/blob/main/docs/TASKS.md).
 
 App-wide defaults: `PyTaskQ(default_priority="low", default_queue="emails", max_retries=5, timeout=60)`.
 
@@ -183,6 +193,10 @@ Every server setting is an environment variable or a line in `.env`, and all of 
 8. **Tracing (optional).** Set `OTEL_EXPORTER_OTLP_ENDPOINT` and one OpenTelemetry trace follows each job from the request that queued it through every attempt, in Jaeger, Grafana Tempo, Honeycomb or Datadog.
 9. **Named queues.** Put a kind of work on its own queue (`queue="images"`) and give it its own workers (`--queues images`). Each queue has its own capacity, and the dashboard flags a queue no worker serves.
 10. **Polite under load.** When workers fall behind, new jobs get `429` with `Retry-After` instead of Redis filling up, and *Settings → Performance* says what to change.
+11. **Instant pickup, flat memory.** Idle workers wake the moment a job arrives (a few milliseconds), and only the newest `FINISHED_JOBS_KEPT` finished jobs are kept, so Redis memory doesn't grow with traffic.
+12. **Fair priorities.** High jobs go first most of the time, but default and low ones still move (`PRIORITY_WEIGHTS=6,3,1`).
+13. **Production Redis.** Redis Sentinel for automatic failover, `REDIS_WAIT_REPLICAS` so a queued job is on two machines, and `REDIS_KEY_PREFIX` to share one Redis. Warnings when Redis is set up to lose data. ([REDIS.md](https://github.com/vrajpatelm/PyTaskQ/blob/main/docs/REDIS.md))
+14. **Watchable.** `/metrics/prometheus` for Grafana and alerts; the dashboard warns when workers run different versions or settings, or scheduled runs were missed.
 
 [docs/ARCHITECTURE.md](https://github.com/vrajpatelm/PyTaskQ/blob/main/docs/ARCHITECTURE.md) explains each part in detail: what's stored in Redis, the life of a job, and what happens when things go wrong. [docs/WORKERS.md](https://github.com/vrajpatelm/PyTaskQ/blob/main/docs/WORKERS.md) covers what a worker does with your task code: timeouts for each task type, crashes, stopping, and a checklist for tasks that behave well.
 
@@ -194,8 +208,11 @@ Interactive docs are served at `/docs`, and the full reference is in [docs/API.m
 |---|---|---|
 | `POST` | `/task/enqueue` | Queue a job (`task_name`, `args`, `kwargs`, `priority`, `delay_seconds`). Optional `Idempotency-Key` header |
 | `GET` | `/task/{id}` | Status, timings, result or error |
-| `POST` | `/task/{id}/cancel` | Cancel a waiting job |
+| `POST` | `/task/{id}/cancel` | Cancel a waiting job, or stop a running one |
 | `GET` | `/tasks` | Recent jobs, filterable by status and task |
+| `GET` | `/tasks/history` | Search finished jobs (text, status, task, queue, time) |
+| `GET` / `POST` | `/queues`, `/queues/{name}/pause`, `/queues/{name}/resume` | Queues, and pausing them |
+| `GET` | `/metrics/prometheus` | Prometheus metrics |
 | `GET` | `/metrics`, `/system/workers`, `/dlq` | Queue, worker and dead-letter state |
 | `GET` | `/system/performance` | Refused requests and tuning suggestions |
 | `POST` | `/dlq/replay/{id}`, `/dlq/retry_all` | Replay dead letters |
@@ -216,12 +233,12 @@ docker compose -f docker-compose.prod.yml up -d
 For your own tasks, build a worker image on top of the official one:
 
 ```dockerfile
-FROM ghcr.io/vrajpatelm/pytaskq:0.4
+FROM ghcr.io/vrajpatelm/pytaskq:0.5
 COPY tasks.py .
 CMD ["pytaskq", "worker", "--app", "tasks:queue"]
 ```
 
-The full guide covers backups, restoring, upgrades and a security checklist: [docs/DEPLOYMENT.md](https://github.com/vrajpatelm/PyTaskQ/blob/main/docs/DEPLOYMENT.md). For local development, `docker compose up --build` in the repo root starts Redis, the dashboard, a worker and Jaeger.
+Upgrading from 0.3.1 (the previous release on PyPI)? Read [docs/UPGRADING.md](https://github.com/vrajpatelm/PyTaskQ/blob/main/docs/UPGRADING.md) first. The full guide covers backups, restoring, upgrades, monitoring, high availability and a security checklist: [docs/DEPLOYMENT.md](https://github.com/vrajpatelm/PyTaskQ/blob/main/docs/DEPLOYMENT.md). For local development, `docker compose up --build` in the repo root starts Redis, the dashboard, a worker and Jaeger.
 
 ## Development
 
@@ -234,7 +251,7 @@ npm run dev                  # dashboard with hot reload; talks to `pytaskq dash
 npm run build                # writes the bundle into pytaskq/static/
 ```
 
-See [QUEUES](https://github.com/vrajpatelm/PyTaskQ/blob/main/docs/QUEUES.md), [WORKERS](https://github.com/vrajpatelm/PyTaskQ/blob/main/docs/WORKERS.md), [REDIS](https://github.com/vrajpatelm/PyTaskQ/blob/main/docs/REDIS.md), [CONTRIBUTING](https://github.com/vrajpatelm/PyTaskQ/blob/main/docs/CONTRIBUTING.md), [ARCHITECTURE](https://github.com/vrajpatelm/PyTaskQ/blob/main/docs/ARCHITECTURE.md) and the [CHANGELOG](https://github.com/vrajpatelm/PyTaskQ/blob/main/CHANGELOG.md).
+See [TASKS](https://github.com/vrajpatelm/PyTaskQ/blob/main/docs/TASKS.md), [GUARANTEES](https://github.com/vrajpatelm/PyTaskQ/blob/main/docs/GUARANTEES.md), [QUEUES](https://github.com/vrajpatelm/PyTaskQ/blob/main/docs/QUEUES.md), [WORKERS](https://github.com/vrajpatelm/PyTaskQ/blob/main/docs/WORKERS.md), [REDIS](https://github.com/vrajpatelm/PyTaskQ/blob/main/docs/REDIS.md), [UPGRADING](https://github.com/vrajpatelm/PyTaskQ/blob/main/docs/UPGRADING.md), [CONTRIBUTING](https://github.com/vrajpatelm/PyTaskQ/blob/main/docs/CONTRIBUTING.md), [ARCHITECTURE](https://github.com/vrajpatelm/PyTaskQ/blob/main/docs/ARCHITECTURE.md) and the [CHANGELOG](https://github.com/vrajpatelm/PyTaskQ/blob/main/CHANGELOG.md).
 
 ## License
 

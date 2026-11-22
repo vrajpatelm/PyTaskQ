@@ -2,7 +2,7 @@
 
 PyTaskQ's defaults handle a few hundred requests a second on a small server. This guide explains what limits that number, how to tell which limit you're hitting, and which setting to change. None of the settings here weaken security or risk losing jobs.
 
-**Start with the dashboard.** **Settings → Performance** shows what PyTaskQ had to turn away in the last 15 minutes, and suggests the setting to change, ready to copy into `.env`.
+**Start with the dashboard.** **Settings → Performance** shows what PyTaskQ had to turn away in the last 15 minutes, and suggests the setting to change, ready to copy into `.env`. It also warns when Redis is heading for full, when workers run different versions or settings, and when scheduled runs were missed. For graphs over time, scrape `/metrics/prometheus` ([DEPLOYMENT.md](DEPLOYMENT.md#monitoring)).
 
 ## What a 2-core server handles
 
@@ -20,6 +20,18 @@ Measured with the load test in [`loadtest/`](../loadtest) on 2 CPU cores, with s
 The 429s in 0.4 are not an error. 500 users created about 175 jobs a second, more than one worker on 2 cores can finish (about 146 a second for this test job). The queue absorbed the difference until it was full, and then PyTaskQ told clients to retry instead of letting Redis fill up. In 0.3.1 the same overload showed up as 503 errors spread across *every* endpoint, including just looking at the dashboard.
 
 At 400 users, who create jobs a little slower than the worker finishes them, 0.4 refused nothing: 291 requests a second, a median response of 8 ms, the slowest 5% under 60 ms, and only 13 jobs left waiting at the end. That's the sustained capacity of this setup. See [Sizing](#sizing) for what to add when you need more.
+
+## What changed in 0.5
+
+| | 0.4 | 0.5 |
+|---|---|---|
+| Time from queueing a job to an idle worker starting it | up to 1 s (about 475 ms on average) | 1–3 ms |
+| Redis commands per second from one idle worker (20 queues) | 65 | 9 |
+| Redis memory after a million jobs | grows with jobs per day × `RESULT_TTL` | flat: the newest `FINISHED_JOBS_KEPT` finished jobs |
+
+- **Instant pickup.** Idle workers used to check their queues every so often. Now queueing a job also drops a small wake-up token, and an idle worker waits on those tokens, so it starts the job at once and asks Redis almost nothing while idle.
+- **Bounded memory.** Finished jobs used to stay for `RESULT_TTL` (a day) each, so memory grew with traffic: 100 jobs a second filled about 20 GB a day. Now at most `FINISHED_JOBS_KEPT` (50,000) finished jobs are kept, the oldest going first. Measured: 10,000 jobs with a cap of 2,000 kept Redis at a flat 6 MB.
+- **A forecast.** *Settings → Performance* measures how fast jobs finish and how big their records are, works out how much memory the kept records will settle at, and warns when that would take Redis past 90% of `maxmemory`, with roughly when ("Redis will be full in about 25 minutes at the current rate"), before anything is refused.
 
 ## What changed in 0.4
 
@@ -72,7 +84,10 @@ All of these go in `.env` (or the environment). Restart after changing them.
 | `REDIS_MAX_CONNECTIONS` | 200 | Redis connections per process. Redis accepts 10,000 by default, so raising this is safe. A value in `REDIS_URL` (`?max_connections=1000`) also works. |
 | `REDIS_POOL_TIMEOUT` | 5 | Seconds a request waits for a free connection before a 503. |
 | `LIVE_UPDATES_PER_SECOND` | 2 | How often an open dashboard refreshes at most. |
-| `HISTORY_LIMIT` | 500 | How many recent jobs the Jobs list can show. |
+| `HISTORY_LIMIT` | 500 | How many recent jobs the Jobs list can show. The **History** tab searches every kept finished job. |
+| `FINISHED_JOBS_KEPT` | 50,000 | Finished jobs whose records are kept; the oldest go first. Each takes about 1–3 KB (more with big arguments or results), so 50,000 is roughly 50–150 MB. `0` = no cap (then only `RESULT_TTL` limits them). |
+| `RESULT_TTL` | 86,400 | Seconds a finished job's record is kept at most. |
+| `PRIORITY_WEIGHTS` | `6,3,1` | How a worker shares its turns between high, default and low jobs; `strict` = high always first. See [QUEUES.md](QUEUES.md#priorities). |
 
 In Docker, each container can open only 1024 files by default, and every client connection and Redis connection uses one. The compose files in this repo raise that to 65,536 (`ulimits: nofile`). Do the same if you write your own.
 

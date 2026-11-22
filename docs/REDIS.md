@@ -38,7 +38,7 @@ In the production compose file, set `REDIS_MAXMEMORY` in `.env` (default `400mb`
 
 Without `maxmemory`, Redis grows until the operating system's out-of-memory killer stops it. It then restarts from its append-only file and loses up to the last second of writes.
 
-**How much memory do jobs need?** Roughly the size of the job's JSON twice while it waits (its queue entry and its record), plus its result for `RESULT_TTL` (a day) after it finishes. A typical small job uses about 1–2 KB in total, so 400 MB holds a few hundred thousand of them. Large arguments or results change this a lot; `MAX_PAYLOAD_BYTES` and `MAX_RESULT_BYTES` (1 MB each) cap them.
+**How much memory do jobs need?** Roughly the size of the job's JSON twice while it waits (its queue entry and its record), plus its record and result after it finishes. A typical small job uses about 1–3 KB. Finished jobs are kept for `RESULT_TTL` (a day) but never more than `FINISHED_JOBS_KEPT` (50,000) of them, so with the defaults finished jobs settle at roughly 50–150 MB however busy you are. Add what's waiting: 400 MB holds a backlog of over a hundred thousand small jobs. Large arguments or results change this a lot; `MAX_PAYLOAD_BYTES` and `MAX_RESULT_BYTES` (1 MB each) cap them. *Settings → Performance* warns ahead of time when the kept jobs would fill Redis at the current rate.
 
 ### `appendonly yes`
 
@@ -82,6 +82,57 @@ PyTaskQ keeps a marker key (`pytaskq:install`). If it disappears while PyTaskQ i
 
 To restore the data from a backup instead, see [DEPLOYMENT.md](DEPLOYMENT.md#restoring).
 
+## Sharing one Redis
+
+Set `REDIS_KEY_PREFIX` to keep a PyTaskQ installation's keys apart from everything else in the same Redis database:
+
+```bash
+REDIS_KEY_PREFIX=shop        # keys become {shop}:queue:high, {shop}:task:…, {shop}:auth:…
+```
+
+- Use it to run several PyTaskQ installations (staging and production, two apps) on one Redis, or PyTaskQ next to your app's own keys. Each installation sees only its own queues, jobs, workers, accounts and dashboard.
+- The braces make the prefix a Redis Cluster hash tag: every key of one installation lands in the same cluster slot, which PyTaskQ's multi-key scripts need. (PyTaskQ's client doesn't connect to Redis Cluster itself yet; this keeps the door open.)
+- The dashboard, every worker and your app must use the same prefix, set before they start. A process with another prefix simply sees an empty installation.
+- Without it (the default), keys keep the names earlier versions used. **Changing the prefix of an existing installation starts from an empty one**: the old keys stay where they were. Set it before you start, or move the data yourself.
+
+Separate Redis databases (`redis://…/1`) also keep installations apart, but managed Redis services and Redis Cluster often allow only database 0.
+
+## High availability
+
+A single Redis server is a single point of failure: while it's down, nothing can be queued or run, and if its disk is lost, so are the jobs. For a setup that survives losing a machine:
+
+### Option 1: a managed Redis with automatic failover
+
+AWS ElastiCache (with Multi-AZ), Azure Cache for Redis (Standard or Premium), Google Memorystore (Standard tier), Redis Cloud and others keep a replica and switch to it automatically, behind one address. Point `REDIS_URL` at that address. Remember to set the eviction policy to `noeviction`.
+
+### Option 2: Redis Sentinel
+
+Run a primary, at least one replica, and three Sentinels (on different machines), then tell PyTaskQ where the Sentinels are instead of where Redis is:
+
+```bash
+REDIS_SENTINELS=sentinel-1:26379,sentinel-2:26379,sentinel-3:26379
+REDIS_SENTINEL_MASTER=mymaster          # the name in the Sentinels' "sentinel monitor" line
+REDIS_PASSWORD=…                        # Redis's password (or put it in REDIS_URL; its host is then ignored)
+# REDIS_SENTINEL_PASSWORD=…             # only if the Sentinels themselves need one
+```
+
+PyTaskQ asks the Sentinels which server is the primary and follows it when it changes. Tested with a real failover (the primary killed while jobs were being queued): the replica took over and PyTaskQ was queueing again within about 3 seconds, without losing a job that had been confirmed. During those seconds the API answers `503` with `Retry-After`, and workers wait and carry on.
+
+### Waiting for a replica: `REDIS_WAIT_REPLICAS`
+
+Redis copies writes to replicas a moment after it confirms them. If the primary dies in that moment, a job that `.delay()` already reported as queued can be missing on the replica that takes over. To close that gap:
+
+```bash
+REDIS_WAIT_REPLICAS=1          # after queueing a job, wait until 1 replica has it
+REDIS_WAIT_TIMEOUT_MS=500      # …but at most this long
+```
+
+Each enqueue then waits (usually about one network round trip to the replica) until that many replicas have the job, and the reply includes `"replicas": 1`. If fewer confirm in time, the job is still queued, the reply says how many did, and a warning is logged. *Settings → Performance* warns when fewer replicas are connected than you asked for. It applies to queueing jobs, where losing one matters most; a job's later status changes aren't waited for.
+
+### Workers
+
+Run at least two workers, on different machines if possible: if one dies, the other takes over its jobs (after `WORKER_HEARTBEAT_TTL`, 30 s) and keeps the cron schedule running.
+
 ## Passwords
 
 A wrong or missing Redis password stops a worker at startup with exit code 1 and the message *"Redis refused this worker … Check REDIS_URL / REDIS_PASSWORD"*, so Docker shows it as failed instead of running and doing nothing. `pytaskq ping` tests the connection settings without starting anything.
@@ -93,3 +144,5 @@ A wrong or missing Redis password stops a worker at startup with exit code 1 and
 - [ ] `appendonly yes`, and Redis's `/data` is on a volume that survives restarts.
 - [ ] Backups are taken and copied elsewhere ([DEPLOYMENT.md](DEPLOYMENT.md#backups)).
 - [ ] Monitoring watches `/health` for `"status": "degraded"`, not only for its HTTP status.
+- [ ] For production that must survive losing a machine: a replica with automatic failover (managed Redis or Sentinel), and two or more workers.
+- [ ] If several installations share one Redis, each has its own `REDIS_KEY_PREFIX`.

@@ -28,7 +28,11 @@ PyTaskQ runs Python functions in the background. Your app queues a job, a worker
 | `pytaskq/core/redis_health.py` | Is Redis safe? Memory and eviction checks, the data-loss marker, and the "works when Redis is full" rule for scripts |
 | `pytaskq/main.py`, `pytaskq/api/v1/` | The API: jobs, dead letters, workers, metrics, sign-in, the live WebSocket |
 | `pytaskq/core/auth.py`, `core/dependencies.py` | Accounts, sessions, API tokens, invites, roles |
-| `pytaskq/core/redis_client.py` | The shared Redis connection pool |
+| `pytaskq/core/redis_client.py` | The shared Redis connection pool (and Redis Sentinel) |
+| `pytaskq/core/keys.py` | Every key name, with the optional `REDIS_KEY_PREFIX` |
+| `pytaskq/core/fleet.py` | Comparing workers' versions and shared settings |
+| `pytaskq/context.py` | What a running task can ask: `progress()`, `cancelled()`, `current_task_id()` |
+| `pytaskq/services/prometheus.py` | `/metrics/prometheus` |
 | `pytaskq/core/pressure.py`, `services/performance.py` | Counting refused requests, and the advice in *Settings → Performance* |
 | `pytaskq/services/live.py` | Live dashboard updates |
 | `pytaskq/tracing.py` | Optional OpenTelemetry tracing |
@@ -36,6 +40,8 @@ PyTaskQ runs Python functions in the background. Your app queues a job, a worker
 | `frontend/` | The dashboard (React + Vite), built into `pytaskq/static/` |
 
 ## What's in Redis
+
+With `REDIS_KEY_PREFIX=shop`, every key below (and the pub/sub channel) starts with `{shop}:`. Without it, they have exactly these names.
 
 | Key | Type | Holds |
 |---|---|---|
@@ -48,10 +54,16 @@ PyTaskQ runs Python functions in the background. Your app queues a job, a worker
 | `dlq` | List | Dead letters: jobs that failed every retry, with their last error, and "(invalid job)" entries (the newest `DLQ_LIMIT`) |
 | `task:{id}` | Hash | One job's record: status, the job itself (`payload`, which holds its arguments), timings, result or error. Kept while the job waits or runs; expires `RESULT_TTL` (a day) after it finishes |
 | `tasks:recent` | List | The newest `HISTORY_LIMIT` job ids, for the Jobs list |
+| `pytaskq:finished` | Sorted set | Finished jobs by finish time. Beyond `FINISHED_JOBS_KEPT`, the oldest are removed together with their records. Searched by the History tab |
+| `pytaskq:wake:{queue}` | List | Wake-up tokens: queueing a job pushes one, an idle worker waits on them (at most 100 per queue) |
+| `pytaskq:paused` | Hash | Paused queues, with who paused them and when |
+| `cancel:{id}` | String | A request to stop a running job (expires after an hour) |
+| `limit:running:{task}`, `limit:rate:{task}` | Sorted set, String | `max_concurrency` leases (renewed by the worker's heartbeat) and the next free start time under `rate_limit` |
+| `pytaskq:cron`, `pytaskq:cron:missed` | Hash | The latest tick handled for each scheduled task, and how many runs each missed |
 | `fence:{id}` | String | The job's fence token (see *Fencing* below) |
-| `active_workers`, `worker:{id}` | Sorted set, Hash | Which workers are alive (heartbeat, on Redis's clock), and each one's counters and health |
+| `active_workers`, `worker:{id}` | Sorted set, Hash | Which workers are alive (heartbeat, on Redis's clock), and each one's counters, health, version and shared settings |
 | `pytaskq:workers` | Set | Every worker that may own a `processing_queue`, so the leader also finds the lists of workers that stopped without a heartbeat |
-| `pytaskq:leader_lock`, `cron_lock:{task}:{tick}` | String | Which worker runs the background loops; one run per cron tick |
+| `pytaskq:leader_lock`, `cron_lock:{task}:{tick}` | String | Which worker runs the background loops; one run per cron tick (kept 3 hours) |
 | `pytaskq:registry`, `pytaskq:registry:seen` | Hash, Sorted set | Tasks that running workers advertise, and when each was last advertised |
 | `idempotency:{key}` | String | Which job an `Idempotency-Key` created. Expires after `IDEMPOTENCY_TTL` (a day) |
 | `stats:completed`, `stats:failed` | String | All-time totals. Everything else the dashboard counts is read from the lists above |
@@ -75,12 +87,14 @@ stateDiagram-v2
     Queued --> Cancelled : cancelled
     Scheduled --> Cancelled : cancelled
     RetryScheduled --> Cancelled : cancelled
+    Processing --> Cancelled : cancelled (stopped by its worker)
     Success --> [*]
     Cancelled --> [*]
 ```
 
 1. **Queueing.** One Lua script checks the idempotency key and (for the API) the queue's capacity, then pushes the job onto its queue's priority list (or into `delayed_tasks`), creates its `task:{id}` record, adds it to the history and announces the change. Because it's one step, `QUEUE_CAPACITY` is exact even under hundreds of parallel requests. Before that, the API checks in one round trip that the task exists and accepts the arguments given. Jobs over `MAX_PAYLOAD_BYTES` are refused.
-2. **Taking a job.** A worker only takes jobs from the queues it serves (by default, the queues its own tasks live on). A Lua script pops from every served queue's `high` list, then `default`, then `low`, taking turns between queues at the same priority, and moves the job into the worker's own `processing_queue` in the same step. A job is never only in the worker's memory.
+2. **Taking a job.** A worker only takes jobs from the queues it serves (by default, the queues its own tasks live on) that aren't paused. A Lua script tries the priorities in the order the `PRIORITY_WEIGHTS` cycle gives for this turn (6 of 10 turns start with `high` by default), taking turns between queues at the same priority, skips paused queues, and moves the job into the worker's own `processing_queue` in the same step. A job is never only in the worker's memory. When there's nothing to take, the worker blocks on its queues' wake-up tokens (`BLPOP`), so a new job starts within milliseconds.
+   If the task has `rate_limit` or `max_concurrency` and it isn't its turn yet, the job goes back to `delayed_tasks` until its turn, without using a retry.
 3. **Running it.** Each task runs where it belongs: `async def` tasks on the worker's event loop, `type="io"` tasks in threads, and `type="cpu"` tasks in separate processes (separate cores, no GIL), one job per process. A worker holds up to *CPU processes + IO threads* jobs at once (`WORKER_CPU_WORKERS`, `WORKER_IO_WORKERS`). A job waits for a free process or thread, and only then is it marked *Processing* and its `timeout` starts. At the timeout a CPU job's process is stopped and replaced, an async task is cancelled, and an IO thread (which Python can't stop) keeps its slot until its code returns. [WORKERS.md](WORKERS.md) has the details.
 4. **Success.** One Lua script checks the fence token, saves the result (results over `MAX_RESULT_BYTES` are replaced by a note), starts the record's `RESULT_TTL`, and removes the job from the processing list. If Redis can't be reached at that moment, the worker keeps the result and retries until it can. If the job had an `on_success_url`, a signed webhook delivery is queued as a follow-up job.
 5. **Failure.** The worker schedules a retry after a random backoff of 1 to 30 seconds (decorrelated jitter, so many failing jobs don't all retry at the same moment). After `max_retries` the job becomes a dead letter, with its last error. Recording this and removing the job from the processing list are again one script.
@@ -92,7 +106,10 @@ stateDiagram-v2
 - **One leader.** The background loops run on a single worker at a time, elected with a Redis lock that expires if the leader dies (taken and renewed by one Lua script, so a leader can't renew someone else's lock). The loops are: moving due scheduled jobs and retries onto their queues (in batches of 500, and only while a queue is below `QUEUE_CAPACITY`), starting cron jobs, and recovering jobs from workers that are gone.
 - **Recovering jobs.** A job of a gone worker goes back to the front of its own queue, at its own priority, in one Lua script that does nothing if the job has just finished or failed. Workers that stopped without a heartbeat but still list jobs are found too. A worker with a fixed `WORKER_NAME` puts back its own unfinished jobs the moment it restarts.
 - **Named queues.** Each task lives on a queue and each worker serves a set of queues, so a kind of work can have its own workers ([QUEUES.md](QUEUES.md)). Every path a job takes keeps its queue: retries, crash recovery, dead-letter replays, cancellation, webhook follow-ups and cron.
-- **Cron.** Schedules are read in the task's `tz` (default `CRON_TIMEZONE`, UTC), not the machine's clock. Each run is claimed with a `SET NX` lock keyed by the local clock time, so a scheduled task runs once per tick across the whole fleet, and once when clocks go back. The lock, the job's record and the push are one script, so a fast worker can't finish the job before its record exists.
+- **Cron.** Schedules are read in the task's `tz` (default `CRON_TIMEZONE`, UTC), not the machine's clock. Each run is claimed with a `SET NX` lock keyed by the local clock time, so a scheduled task runs once per tick across the whole fleet, and once when clocks go back. The lock, the job's record and the push are one script, so a fast worker can't finish the job before its record exists. The leader remembers the latest tick it handled for each task (`pytaskq:cron`), so ticks that passed while no worker was running are noticed, counted and logged, and the latest one runs late (`catch_up`).
+- **Cancelling a running job.** The API sets `cancel:{id}`; the worker running the job checks once a second for its own jobs and stops it (process stopped, coroutine cancelled, or thread abandoned), then records `Cancelled` in one script that checks the fence token.
+- **Progress.** `progress()` stores the newest value in the worker's memory; the worker writes it to the job's record about once a second, only while the job is still running there.
+- **Fleet check.** Workers advertise their version and shared settings in their heartbeat; the dashboard compares them with its own.
 - **A worker without the task.** If two apps share a queue, a worker can take a job whose task it doesn't have. It hands the job back (through the delayed set) for a worker that has it, for up to 10 minutes, without counting a retry.
 - **Task registry.** Each worker advertises its tasks every minute, so the dashboard can build its *Run a task* forms and the API can reject unknown task names. Workers running different apps are all listed, and a task drops out about 5 minutes after nothing advertises it.
 
@@ -146,4 +163,7 @@ Spans record task names, job ids, attempts, workers, route patterns and status c
 | Redis is busy or briefly down | API requests wait for a connection, then answer `503` with `Retry-After`; a connection Redis closed is replaced and the request retried. Workers pause and retry until Redis is back. Open dashboards show "Redis unreachable" and resume by themselves. |
 | Redis is full (`maxmemory`) | New jobs get `503 Redis is full`. Workers, including ones starting now, keep taking and finishing jobs, which frees memory: the scripts that do that start with a write that needs no memory, which Redis always lets a script complete. |
 | Redis is set to evict keys, or loses its data | Logged at startup, in `/health` and in *Settings → Performance*. Lost data is noticed through a marker key, and a new setup code is printed so the admin can be created again. See [REDIS.md](REDIS.md). |
+| No worker runs when a cron tick is due | The missed runs are logged and counted; the latest one runs when a worker is back (`catch_up`). |
+| Workers run different versions or settings | The dashboard logs it and shows it in *Settings → Performance*. |
+| The Redis primary fails (with Sentinel) | PyTaskQ asks the Sentinels for the new primary and carries on within seconds; with `REDIS_WAIT_REPLICAS`, every confirmed job is on the replica. |
 | Ctrl+C or `docker stop` | The worker stops taking jobs and gives running ones `WORKER_SHUTDOWN_GRACE` (30 s) to finish. Whatever is still running is stopped and put back at the front of its queue. |

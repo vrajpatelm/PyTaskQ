@@ -62,6 +62,8 @@ Homepage = "https://github.com/vrajpatelm/PyTaskQ"
 Documentation = "https://github.com/vrajpatelm/PyTaskQ#readme"
 Issues = "https://github.com/vrajpatelm/PyTaskQ/issues"
 Changelog = "https://github.com/vrajpatelm/PyTaskQ/blob/main/CHANGELOG.md"
+"Release notes" = "https://github.com/vrajpatelm/PyTaskQ/releases"
+Upgrading = "https://github.com/vrajpatelm/PyTaskQ/blob/main/docs/UPGRADING.md"
 
 [tool.setuptools.dynamic]
 version = { attr = "pytaskq.__version__" }

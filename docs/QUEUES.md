@@ -1,6 +1,6 @@
 # Queues, workers and schedules
 
-This guide covers how jobs are routed to workers, how to give a kind of work its own workers, how scheduled (cron) tasks pick their time zone, and what happens to large results.
+This guide covers how jobs are routed to workers, how to give a kind of work its own workers, how priorities share a worker's time, pausing a queue, how scheduled (cron) tasks pick their time zone and what happens to runs that were missed, and large results.
 
 ## Named queues
 
@@ -47,9 +47,28 @@ pytaskq worker --app tasks:queue --queues images,default    # both, in that orde
 
 `WORKER_QUEUES=images` in the environment does the same. Its startup log lists the queues it serves, and the dashboard's **Workers** tab shows them too.
 
-### Order
+### Priorities
 
-A worker takes **every queue's `high` jobs first**, then `default`, then `low`. Between queues at the same priority it takes turns, so a queue with 10,000 waiting jobs can't starve one with 3.
+Within its queues, a worker shares its turns between priorities by weight. With the default `PRIORITY_WEIGHTS=6,3,1`, out of every 10 jobs it takes while all three priorities have work waiting, 6 are `high`, 3 `default` and 1 `low`, spread out (high, default, high, low, high, …). When a priority has nothing waiting, its turn goes to the next one, so with only one kind of work waiting every turn takes it.
+
+| `PRIORITY_WEIGHTS` | Behaviour |
+|---|---|
+| `6,3,1` (default) | High jobs go first most of the time; default and low jobs still move while high ones keep arriving |
+| `10,3,1` | Even more in favour of high |
+| `1,1,1` | Priorities only break ties |
+| `strict` | Every `high` job first, then `default`, then `low` (the behaviour before 0.5). A steady stream of high jobs keeps the others waiting forever. |
+
+Between queues at the same priority a worker takes turns, so a queue with 10,000 waiting jobs can't starve one with 3. Use the same `PRIORITY_WEIGHTS` everywhere; the dashboard warns when workers differ.
+
+### Pausing a queue
+
+Pause a queue to stop workers from starting new jobs from it, for example while a service its tasks call is down:
+
+- in the dashboard, the pause button next to the queue in the **Queues** row (operators and admins);
+- `POST /queues/emails/pause` and `POST /queues/emails/resume`;
+- `await app.pause_queue("emails")` and `await app.resume_queue("emails")`.
+
+It takes effect at once. Jobs already running finish normally. New jobs can still be queued and wait; scheduled jobs, retries and cron runs keep arriving. Resume it, and idle workers start on it within a couple of seconds. The pause is stored in Redis, so it survives restarts and applies to every worker, until someone resumes the queue.
 
 ### Example: a dedicated image worker
 
@@ -71,7 +90,7 @@ The limit protects the queue from outside traffic. Jobs your app queues with `.d
 
 ### What the dashboard shows
 
-- When you use more than one queue, a **Queues** row under the lifecycle strip shows how many jobs wait in each one and how many workers serve it. Click a queue to see its jobs.
+- A **Queues** row under the lifecycle strip shows how many jobs wait in each queue and how many workers serve it, and lets operators pause and resume each one. Click a queue to see its jobs. (Viewers see it once there is more than one queue.)
 - A queue with waiting jobs and **no worker** is marked, and *Settings → Performance* says how to start one for it.
 - The job details show each job's queue.
 
@@ -103,6 +122,25 @@ def india_digest(): ...
 - Each tick runs once across all workers, and a cron job goes onto its task's queue.
 
 `pytaskq tasks --app tasks:queue` lists each task's queue and, for cron tasks, its time zone.
+
+### Missed runs and catch-up
+
+The workers' leader queues each tick within about 10 seconds of its time. If no worker is running when a tick is due (every worker stopped, a long deploy, Redis down), that tick is **missed**. When a worker is back:
+
+- the log says which runs were missed: *"[Cron] nightly_report missed 3 run(s) between … and …: no worker was running the schedule then."*;
+- *Settings → Performance* shows it for a week, and Prometheus counts it (`pytaskq_cron_missed_runs_total`);
+- with catch-up on (the default), **the latest missed tick runs once, now**, with a note on the job saying so. Earlier missed ticks don't run: an every-minute task doesn't run 600 times after a 10-hour outage.
+
+Turn catch-up off where a late run would be wrong (a "good morning" message at 3 pm):
+
+```python
+@queue.task(cron="0 9 * * *", catch_up=False)
+def morning_message(): ...
+```
+
+or for every task with `CRON_CATCH_UP=false`. A task that is new starts counting from now: ticks before PyTaskQ first saw it never count as missed.
+
+Run at least two workers so one can take over the schedule when the other stops.
 
 **Changed in 0.4:** schedules used each worker's local time before. If your servers weren't on UTC and you relied on that, add `tz=` or set `CRON_TIMEZONE`.
 
