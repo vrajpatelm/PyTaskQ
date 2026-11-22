@@ -2,6 +2,69 @@
 
 All notable changes to PyTaskQ. Versions follow [semantic versioning](https://semver.org/).
 
+## 0.5.0 — 2026-11-22
+
+The first release on PyPI since 0.3.1: it includes everything from 0.4.0, 0.4.1 and 0.4.2 below, which were tagged on GitHub but never published. New in 0.5.0: a review of PyTaskQ from its foundations up (how jobs are stored, picked up, scheduled and kept), followed by the features that review called for. New guides: `docs/TASKS.md` (writing tasks), `docs/GUARANTEES.md` (what PyTaskQ promises and what it doesn't) and `docs/UPGRADING.md` (from 0.3.1).
+
+### Upgrading from 0.4.2
+- **Priorities are weighted**: out of every 10 jobs a worker takes while all priorities have work, about 6 are high, 3 default and 1 low (`PRIORITY_WEIGHTS=6,3,1`). Before, high jobs always went first and a steady stream of them kept low ones waiting forever. `PRIORITY_WEIGHTS=strict` restores that.
+- **At most `FINISHED_JOBS_KEPT` (50,000) finished jobs are kept**, the oldest going first, besides `RESULT_TTL`. Raise it if you look up older results.
+- **Missed cron runs now run once, late.** If no worker was running at a scheduled time, the latest missed tick runs when a worker is back. Set `catch_up=False` on a task (or `CRON_CATCH_UP=false`) to skip them as before.
+- **`POST /task/{id}/cancel` on a running job** now stops it (`202`, `"stopping": true`) instead of answering `409`. `app.cancel()` returns `True` for it.
+- Upgrade the dashboard and every worker together. *Settings → Performance* now says when versions or shared settings differ.
+- Coming from 0.3.1? Read `docs/UPGRADING.md`.
+
+### Added
+- **Progress**: `pytaskq.progress(percent, message)` inside any task (CPU tasks too); shown as a bar in the dashboard and returned by `GET /task/{id}`. Written about once a second however often it's called.
+- **Cancel running jobs** from the dashboard (*Stop job*), the API or `app.cancel()`: async tasks are cancelled, CPU tasks' processes stopped, and IO tasks told through `pytaskq.cancelled()` with their result ignored. A job a worker had taken but not started is cancelled without running.
+- **`max_concurrency=` and `rate_limit=`** on `@app.task`, enforced across all workers: at most N running at once, or starts spread evenly (`"10/s"`, `"100/m"`, `"1000/h"`). Waiting never uses a retry, and the dashboard shows why a job waits.
+- **Pause and resume queues** (dashboard button, `POST /queues/{name}/pause|resume`, `app.pause_queue()`). Takes effect at once; running jobs finish, new jobs wait. `GET /queues` lists queues with their state.
+- **History**: search every kept finished job by text (id, arguments, result, error), outcome, task, queue and time, in a new dashboard tab and `GET /tasks/history` (cursor-paged).
+- **Prometheus**: `GET /metrics/prometheus` (queue lengths, running, scheduled, dead letters, workers, succeeded and failed totals, missed cron runs, refusals, Redis memory).
+- **Redis Sentinel**: `REDIS_SENTINELS`, `REDIS_SENTINEL_MASTER`, `REDIS_SENTINEL_PASSWORD`. Tested with a real failover: queueing resumed within about 3 seconds with no confirmed job lost.
+- **`REDIS_WAIT_REPLICAS`** / `REDIS_WAIT_TIMEOUT_MS`: a queued job is confirmed only once that many replicas have it; the reply says how many did.
+- **`REDIS_KEY_PREFIX`**: every key under `{prefix}:`, so several installations can share one Redis; the braces make the layout Redis Cluster-compatible.
+- **Fleet check**: workers advertise their version and shared settings; the dashboard warns when they differ, and the Workers tab shows each version.
+- **Cron catch-up and missed-run reporting**: missed ticks are logged, counted (*Settings → Performance*, Prometheus) and the latest one runs once (`catch_up=` per task, `CRON_CATCH_UP`).
+- **Memory forecast** in *Settings → Performance*: warns when the kept finished jobs would fill Redis at the current rate, before anything is refused.
+- `pytaskq.current_task_id()`, `app.pause_queue()`, `app.resume_queue()`.
+- New settings: `FINISHED_JOBS_KEPT`, `PRIORITY_WEIGHTS`, `CRON_CATCH_UP`, `REDIS_KEY_PREFIX`, `REDIS_SENTINELS`, `REDIS_SENTINEL_MASTER`, `REDIS_SENTINEL_PASSWORD`, `REDIS_WAIT_REPLICAS`, `REDIS_WAIT_TIMEOUT_MS`.
+- Docs: `TASKS.md`, `GUARANTEES.md`, `UPGRADING.md`; high availability, sharing a Redis, monitoring, priorities, pausing and missed runs in the existing guides.
+
+### Changed
+- **Instant pickup**: queueing a job wakes an idle worker through a wake-up token, so jobs start within 1–3 ms instead of up to a second (about 475 ms on average), and an idle worker sends about 10–12 Redis commands a second instead of 15–65 (with 20 queues).
+- **Redis memory stays flat**: finished jobs are capped by count (above). With 100 jobs a second, memory used to grow to about 20 GB a day.
+- Cron tick locks are kept 3 hours instead of 30 days (an every-minute task left 43,200 keys behind).
+- `queue.wait()` checks every 20 ms at first, then less often, so quick jobs return quickly.
+- The Queues row is shown to operators even with a single queue, so it can be paused.
+
+## 0.4.2 — 2026-11-22
+
+Fixes from a second break test, on what happens when Redis itself misbehaves: full, set to evict keys, restarted, frozen, wiped, or given the wrong password. New guide: `docs/REDIS.md` (the three Redis settings that matter, and what PyTaskQ does when Redis is full, restarts or loses its data).
+
+### Upgrading from 0.4.1
+- **Set Redis to `maxmemory-policy noeviction` with a `maxmemory`.** Both compose files and `redis.conf` now do (`REDIS_MAXMEMORY`, default `400mb`, in the production `.env`). Managed Redis services often default to an eviction policy: change it. PyTaskQ now warns when it isn't `noeviction`.
+- **Through the API, `"queue"` must name an existing queue** (one a worker serves or a task lives on). New names get `422` with the list of known queues. Your app's `.delay(queue=...)` can still create queues; at most `MAX_QUEUES` (100) can exist.
+- **`apply_async(task_id=...)` with the id of a job that is still waiting or running raises `TaskIdInUse`** (a `ValueError`) instead of corrupting both jobs.
+- `/health` returns `"status": "degraded"` with `warnings` (still HTTP 200) when Redis is nearly full, set to evict, or lost its data; `503` (`"status": "down"`) only when Redis can't be reached.
+
+### Fixed
+- **A worker couldn't start while Redis was full**, so nothing ever took jobs to free memory (0.4.1 even crashed at startup). Workers now start and drain the queue; taking and finishing jobs, heartbeats and leader election work when Redis is full, while new jobs are refused.
+- **Eviction silently deleted queues, job records, idempotency keys and accounts.** The shipped configs use `noeviction` with a memory limit; workers and the dashboard log an error, and `/health` and *Settings → Performance* show it, when the policy is anything else or Redis is over 90% full.
+- **Open dashboards froze forever after a Redis restart** (the socket stayed open, updates had stopped). They now show "Redis unreachable" and resume by themselves; if updates ever stop, the socket is closed so the browser reconnects.
+- **Reusing a `task_id` broke the job**: its result was thrown away as stale and it stayed "Processing" for a day, and two schedules with the same id silently merged into one. A finished job's id is now reused cleanly; an active one is refused.
+- **Queue names piled up forever** (5,000 names made every dashboard refresh 48× slower). Unused names are forgotten, the API refuses unknown ones, and `MAX_QUEUES` caps them.
+- **After Redis lost its data, the dashboard asked for a setup code that didn't exist**, and nothing said why. PyTaskQ notices the loss (a marker key), logs it, shows it in `/health` and *Settings → Performance*, and prints a new setup code.
+- A frozen or full Redis gave `500`; now `503` with `Retry-After` (`"Redis is full"` when it's full), also for timeouts and a read-only replica during failover.
+- The first request after a Redis restart failed with `503`; a connection Redis closed is now replaced and the request retried (connection errors only, never timeouts, since a timed-out command may have run).
+- A worker with a wrong Redis password retried forever; it now stops with exit code 1 and says to check `REDIS_URL` / `REDIS_PASSWORD`. Stopping a worker during startup no longer logs "started and ready".
+- `redis.conf` claimed idempotency keys made a lost second of AOF data harmless; they don't. The comment now explains the real trade-off.
+
+### Added
+- `docs/REDIS.md`.
+- Settings: `MAX_QUEUES` (100), `REDIS_MAXMEMORY` (compose, 400mb).
+- `/health` reports Redis memory use and policy; *Settings → Performance* reports Redis memory problems, refusals because Redis was full, and data loss.
+
 ## 0.4.1 — 2026-11-21
 
 Reliability fixes from a break test of 0.4.0: crashed and hung tasks, Redis outages mid-job, frozen event loops, invalid jobs and request floods, on a real Redis with real worker processes. Every fix has a regression test, and the experiments were re-run. New guide: `docs/WORKERS.md` (how tasks run, timeouts per task type, what happens when things go wrong).

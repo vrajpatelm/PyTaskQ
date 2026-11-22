@@ -1,7 +1,7 @@
 import logging
 from typing import Any, Dict, List, Literal, Optional
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Query
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Response
 from pydantic import BaseModel, Field
 
 from pytaskq.app import argument_error
@@ -46,7 +46,9 @@ async def _validated_payload(req: EnqueueRequest):
                                                     "and can't be queued through the API.")
     async with redis_client.r.pipeline(transaction=False) as pipe:
         cutoff = queueing.queue_registry_lookup(pipe, req.task_name)
-        raw_spec, seen, count = await pipe.execute()
+        if req.queue:
+            pipe.sismember(queueing.QUEUES_KEY, req.queue)
+        raw_spec, seen, count, *queue_known = await pipe.execute()
     spec, advertised = queueing.parse_registry_lookup(raw_spec, seen, count, cutoff)
     if spec is None and advertised:
         registry = await queueing.registered_tasks(redis_client.r)
@@ -59,6 +61,13 @@ async def _validated_payload(req: EnqueueRequest):
         problem = argument_error(spec.get("params"), req.args, req.kwargs)
         if problem:
             raise HTTPException(status_code=422, detail=f"Wrong arguments for task '{req.task_name}': {problem}")
+    if req.queue and not queue_known[0] and req.queue != (spec or {}).get("queue"):
+        # A new queue name through the API is almost always a typo ("imgaes"): no worker would ever take
+        # the job. Queues exist once a worker serves them or a task lives on them.
+        known = sorted(await redis_client.r.smembers(queueing.QUEUES_KEY))
+        raise HTTPException(status_code=422, detail=(
+            f"Unknown queue '{req.queue}': no worker serves it and no task lives on it. Known queues: "
+            f"{', '.join(known[:20]) or 'none'}{' …' if len(known) > 20 else ''}."))
     queue = req.queue or (spec or {}).get("queue") or queueing.DEFAULT_QUEUE
     return queueing.new_payload(
         req.task_name, req.args, req.kwargs,
@@ -116,9 +125,18 @@ async def task_result_display(task_id: str):
 
 
 @router.post("/{task_id}/cancel")
-async def cancel_task(task_id: str, user: auth.User = Depends(require("operator"))):
-    """Cancel a task that is still waiting (queued, scheduled or awaiting retry)."""
+async def cancel_task(task_id: str, response: Response, user: auth.User = Depends(require("operator"))):
+    """Cancel a job.
+
+    A waiting job (queued, scheduled, awaiting a retry) is cancelled at once (200).
+    A running job is stopped by its worker within about a second (202, `"stopping": true`),
+    then shows as Cancelled: async tasks are cancelled, CPU tasks' processes are
+    stopped, IO tasks are told through `pytaskq.cancelled()` and their result is ignored.
+    """
     ok, status = await queueing.cancel(redis_client.r, task_id, by=user.username)
+    if ok and status == queueing.STOPPING:
+        response.status_code = 202
+        return {"task_id": task_id, "status": queueing.PROCESSING, "cancelled": False, "stopping": True}
     if ok:
         return {"task_id": task_id, "status": status, "cancelled": True}
     if status == "NotFound":
@@ -137,6 +155,30 @@ async def list_tasks(
     tasks = await queueing.recent_tasks(redis_client.r, limit=limit, status=status, task_name=task_name,
                                         queue=queue)
     return {"tasks": tasks, "count": len(tasks)}
+
+
+@list_router.get("/history")
+async def search_history(
+    status: Optional[str] = Query(None, description="Success, DeadLetter, Cancelled or Failed"),
+    task_name: Optional[str] = None,
+    queue: Optional[str] = None,
+    since: Optional[float] = Query(None, description="Finished at or after (Unix seconds)"),
+    until: Optional[float] = Query(None, description="Finished at or before (Unix seconds)"),
+    q: Optional[str] = Query(None, max_length=200,
+                             description="Text in the id, task name, arguments, result, error or note"),
+    cursor: Optional[str] = Query(None, max_length=100, description="`next` from the previous page"),
+    limit: int = Query(50, ge=1, le=500),
+):
+    """
+    Search finished jobs, newest first: the last FINISHED_JOBS_KEPT (50,000 by
+    default), not only the recent ones the job list shows. Each request looks at
+    up to 5,000 jobs; pass `next` back as `cursor` to continue.
+    """
+    try:
+        return await queueing.search_finished(redis_client.r, status=status, task_name=task_name, queue=queue,
+                                              since=since, until=until, text=q, cursor=cursor, limit=limit)
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e)) from None
 
 
 @list_router.get("/registered")

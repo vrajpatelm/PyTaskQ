@@ -21,10 +21,11 @@ from typing import Optional
 from pytaskq.core import redis_client
 from pytaskq.core.config import settings
 from pytaskq.services.dashboard_service import _get_dashboard_data
+from pytaskq.core.keys import k as rkey
 
 logger = logging.getLogger("api")
 
-CHANNEL = "events:global"
+CHANNEL = rkey("events:global")
 
 
 def min_interval() -> float:

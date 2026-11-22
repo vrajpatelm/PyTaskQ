@@ -2,6 +2,10 @@
 
 This guide explains where your task code runs, what a `timeout` really does for each kind of task, and what a worker does when something goes wrong: a crashed process, a stuck call, Redis going away for a moment, or a shutdown in the middle of a job. It ends with a short checklist for writing tasks that behave well.
 
+## How a worker takes jobs
+
+An idle worker waits for a wake-up token that queueing a job leaves on its queue, so it starts a new job within a few milliseconds and puts almost no load on Redis while idle. (It also looks every 5 seconds anyway, for jobs queued by older versions.) It takes jobs only from the queues it serves and that aren't paused, sharing its turns between priorities by `PRIORITY_WEIGHTS` ([QUEUES.md](QUEUES.md#priorities)).
+
 ## Where each task runs
 
 | Task | Runs in | How many at once (per worker) |
@@ -86,6 +90,16 @@ A job that finishes while Redis is unreachable keeps its result in memory, and t
 
 Saving the outcome and removing the job from the worker's processing list happen in one Redis step, so a job can't end up marked finished while still listed as running, or listed as running forever.
 
+## When Redis is full
+
+With `maxmemory` reached, Redis refuses new jobs, but workers keep taking, running and finishing the waiting ones, since that's what frees memory. A worker started while Redis is full starts anyway and says so:
+
+```
+[Startup] Redis is out of memory (402 MB used, maxmemory 400 MB). Starting anyway: taking and finishing waiting jobs frees memory.
+```
+
+A wrong Redis password stops the worker at startup with exit code 1, since retrying can't fix it. [REDIS.md](REDIS.md) covers the Redis settings that matter.
+
 ## Stopping a worker
 
 Ctrl+C, `docker stop` or SIGTERM:
@@ -113,6 +127,30 @@ In Docker, `WORKER_NAME={hostname}` uses the container's name, which survives re
 
 Heartbeat times come from Redis's clock, not each machine's, so a server whose clock is off doesn't make its workers look dead.
 
+## Cancelling a running job
+
+Cancelling a running job (dashboard, `POST /task/{id}/cancel`, `app.cancel()`) puts a request in Redis. Every worker checks for requests about its own running jobs once a second (one Redis command, only while it's running something) and stops the job the way it would at a timeout:
+
+| Task | When cancelled |
+|---|---|
+| `type="cpu"` | Its process is stopped and a fresh one takes its place. |
+| `async def` | The coroutine is cancelled. |
+| `type="io"` | The thread keeps running (Python can't stop it); `pytaskq.cancelled()` returns `True` from now on, and its result is ignored. |
+
+The job is recorded as `Cancelled`, isn't retried, and its record says who cancelled it. A job that a worker had taken but not yet started is cancelled without running. [TASKS.md](TASKS.md#cancelling-a-job) shows `cancelled()`.
+
+## Jobs that wait for their turn
+
+A task with `max_concurrency` or `rate_limit` ([TASKS.md](TASKS.md#limiting-how-many-run-and-how-fast)) can be taken by a worker before it may start. The worker doesn't hold on to it: it puts the job back in the schedule until its turn, with the reason shown in the dashboard, and takes other work meanwhile. Waiting never uses up a retry. Jobs on a paused queue simply aren't taken.
+
+## Progress
+
+`pytaskq.progress(percent, message)` inside a task stores the job's progress; the worker writes the newest value to Redis about once a second, and the dashboard shows it as a bar. CPU tasks send it from their process to the worker. [TASKS.md](TASKS.md#reporting-progress)
+
+## Versions and settings across workers
+
+Each worker's heartbeat includes its PyTaskQ version and the settings that must match everywhere (`RESULT_TTL`, `FINISHED_JOBS_KEPT`, `PRIORITY_WEIGHTS`, `TASK_TIMEOUT`, `MAX_RETRIES`, `WEBHOOK_SECRET` as a short fingerprint, and others). The dashboard compares them with its own, logs what differs, and lists it in *Settings → Performance*; the Workers tab shows each worker's version. Old and new versions side by side are expected for a few minutes during an upgrade, not for longer.
+
 ## Jobs that aren't valid
 
 Something that isn't a valid job can end up in a queue: a hand-written `LPUSH`, a payload from an incompatible tool, a field such as `"priority": "urgent"`. Before 0.4.1 such jobs vanished silently. Now each becomes a **dead letter** named "(invalid job)", with the reason and the text that was sent, so you can see where it came from. It can't be replayed, only deleted.
@@ -132,11 +170,12 @@ A job's record (status, arguments, result) never expires while the job is waitin
 
 ## Checklist for well-behaved tasks
 
-- **Safe to run twice.** A job can run again after a crash, a timeout or a shutdown. Use an idempotency key in the systems you call, or check whether the work is already done.
+- **Safe to run twice.** A job can run again after a crash, a timeout or a shutdown. Use an idempotency key in the systems you call, or check whether the work is already done. [GUARANTEES.md](GUARANTEES.md) lists exactly when.
 - **IO tasks set timeouts on their own network calls.**
 - **Async tasks never call blocking code.** Use `await`, or make the task a plain function with `type="io"`.
 - **Large inputs and outputs go in storage**, not in the job.
 - **CPU tasks that need a lot of memory get a machine with room**, or their own queue and worker (`@queue.task(queue="heavy")`, `--queues heavy`).
+- **Long tasks report progress** with `progress()`, and long IO tasks check `cancelled()`.
 
 ## Settings
 

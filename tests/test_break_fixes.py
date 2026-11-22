@@ -474,8 +474,9 @@ async def test_b6_job_finishing_during_the_sweep_isnt_queued_again(env):
         items = await real_lrange(key, *a)
         if items and key == "processing_queue:slow":
             # The slow worker saves its result right now.
-            await r.eval(worker.COMPLETE_SCRIPT, 5, "processing_queue:slow", "fence:race", "task:race",
-                         "worker:slow", "stats:completed", raw, "0", "0", "race", "1", "1", "1", "", 60)
+            await r.eval(worker.COMPLETE_SCRIPT, 6, "processing_queue:slow", "fence:race", "task:race",
+                         "worker:slow", "stats:completed", queueing.FINISHED_KEY,
+                         raw, "0", "0", "race", "1", "1", "1", "", 60, *queueing.keep_args())
         return items
     with patch.object(r, "lrange", side_effect=lrange_then_finish):
         assert await worker._sweep_dead_workers() == 0
@@ -494,9 +495,10 @@ async def test_b6_job_failing_during_the_sweep_isnt_queued_twice(env):
     async def lrange_then_fail(key, *a):
         items = await real_lrange(key, *a)
         if items and key == "processing_queue:slow":
-            await r.eval(worker.FAIL_SCRIPT, 6, "processing_queue:slow", "fence:race2", "task:race2",
-                         "delayed_tasks", "worker:slow", "stats:failed", raw, "0", "0", "retry", raw + " ",
-                         repr(time.time() + 5), "", 0, "status", "RetryScheduled")
+            await r.eval(worker.FAIL_SCRIPT, 7, "processing_queue:slow", "fence:race2", "task:race2",
+                         "delayed_tasks", "worker:slow", "stats:failed", queueing.FINISHED_KEY,
+                         raw, "0", "0", "retry", raw + " ", repr(time.time() + 5), "", 0,
+                         "race2", repr(time.time()), *queueing.keep_args(), "status", "RetryScheduled")
         return items
     with patch.object(r, "lrange", side_effect=lrange_then_fail):
         assert await worker._sweep_dead_workers() == 0
@@ -542,7 +544,7 @@ async def test_b7_cron_job_record_exists_before_it_can_be_taken(env):
         result = await real_eval(src, *args, **kw)
         if src == queueing.ENQUEUE_SCRIPT and "status" not in seen:
             # The instant the push happens, a hot worker could take the job: its record must exist.
-            tid = args[19]      # (numkeys, 9 keys, ARGV…): ARGV[10] is the task id
+            tid = json.loads(args[1 + args[0]])["task_id"]     # ARGV[1] is the job itself
             seen["status"] = await r.hget(f"task:{tid}", "status")
             seen["id"] = tid
         return result

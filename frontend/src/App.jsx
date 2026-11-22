@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   Play, ListChecks, Server, Skull, Search, X,
   RotateCcw, Trash2, Ban, Clock, Cpu, Zap, Waves, Terminal, ChevronRight,
-  Settings as SettingsIcon, UserRound, Pause, ArrowUp, AlertTriangle, Layers,
+  Settings as SettingsIcon, UserRound, Pause, ArrowUp, AlertTriangle, Layers, History as HistoryIcon,
 } from 'lucide-react'
 import {
   api, WS_URL, STATUS, FINAL, CANCELLABLE, timeAgo, formatDuration, formatClock,
@@ -17,6 +17,7 @@ const TABS = [
   { id: 'run', label: 'Run a task', icon: Play },
   { id: 'workers', label: 'Workers', icon: Server },
   { id: 'dead', label: 'Dead letters', icon: Skull },
+  { id: 'history', label: 'History', icon: HistoryIcon },
   { id: 'settings', label: 'Settings', icon: SettingsIcon },
 ];
 
@@ -27,7 +28,7 @@ const EMPTY_METRICS = {
 };
 
 // Queues that matter right now: they have jobs waiting or a worker serving them.
-const queuesInUse = m => (m.queues || []).filter(q => q.total > 0 || q.workers > 0);
+const queuesInUse = m => (m.queues || []).filter(q => q.total > 0 || q.workers > 0 || q.paused);
 const showsQueues = m => {
   const used = queuesInUse(m);
   return used.length > 1 || (used.length === 1 && used[0].name !== 'default');
@@ -38,6 +39,20 @@ const showsQueues = m => {
 function StatusBadge({ status }) {
   const s = STATUS[status] || { label: status || 'Unknown', tone: 'muted' };
   return <span className={`badge tone-${s.tone}`}>{s.label}</span>;
+}
+
+// A running job's own report of how far it got (pytaskq.progress()).
+function JobProgress({ t, wide }) {
+  if (t.status !== 'Processing' || t.progress === undefined || t.progress === null || t.progress === '') return null;
+  const pct = Math.max(0, Math.min(100, Number(t.progress) || 0));
+  return (
+    <div className={`job-progress ${wide ? 'wide' : ''}`} title={t.progress_message || `${pct}%`}>
+      <div className="capacity" role="progressbar" aria-valuenow={pct} aria-valuemin={0} aria-valuemax={100}>
+        <div style={{ width: `${pct}%` }} />
+      </div>
+      <span className="small muted">{pct}%{wide && t.progress_message ? ` · ${t.progress_message}` : ''}</span>
+    </div>
+  );
 }
 
 function TypeIcon({ type }) {
@@ -116,23 +131,44 @@ function Lifecycle({ m, onAdvice }) {
   );
 }
 
-function QueueStrip({ m, active, onPick }) {
+function QueueStrip({ m, active, onPick, canOperate, notify }) {
   const queues = queuesInUse(m);
+  const [busy, setBusy] = useState('');
+  const toggle = async q => {
+    setBusy(q.name);
+    try {
+      await api(`/queues/${encodeURIComponent(q.name)}/${q.paused ? 'resume' : 'pause'}`, { method: 'POST' });
+      notify('success', q.paused ? `Queue '${q.name}' resumed.`
+        : `Queue '${q.name}' paused. Running jobs finish; new jobs wait until you resume it.`);
+    } catch (e) { notify('error', e.message); }
+    finally { setBusy(''); }
+  };
   return (
     <section className="queue-strip" aria-label="Queues">
       <span className="queue-strip-label">Queues</span>
       {queues.map(q => {
-        const stranded = q.total > 0 && q.workers === 0;
+        const stranded = q.total > 0 && q.workers === 0 && !q.paused;
         return (
-          <button key={q.name} className={`queue-chip ${stranded ? 'stranded' : ''} ${active === q.name ? 'active' : ''}`}
-            aria-pressed={active === q.name} onClick={() => onPick(active === q.name ? '' : q.name)}
-            title={stranded ? 'Jobs are waiting but no running worker serves this queue' : `Show jobs on queue '${q.name}'`}>
-            <span className="queue-chip-name">{q.name}</span>
-            <span className="queue-chip-count">{q.total} waiting</span>
-            <span className="queue-chip-workers">
-              {stranded ? <><AlertTriangle size={12} /> no worker</> : `${q.workers} worker${q.workers === 1 ? '' : 's'}`}
-            </span>
-          </button>
+          <div key={q.name} className={`queue-chip-wrap ${q.paused ? 'paused' : ''}`}>
+            <button className={`queue-chip ${stranded ? 'stranded' : ''} ${q.paused ? 'paused' : ''} ${active === q.name ? 'active' : ''}`}
+              aria-pressed={active === q.name} onClick={() => onPick(active === q.name ? '' : q.name)}
+              title={q.paused ? `Paused: workers don't start new jobs from '${q.name}'`
+                : stranded ? 'Jobs are waiting but no running worker serves this queue' : `Show jobs on queue '${q.name}'`}>
+              <span className="queue-chip-name">{q.name}</span>
+              <span className="queue-chip-count">{q.total} waiting</span>
+              <span className="queue-chip-workers">
+                {q.paused ? <><Pause size={12} /> paused</>
+                  : stranded ? <><AlertTriangle size={12} /> no worker</> : `${q.workers} worker${q.workers === 1 ? '' : 's'}`}
+              </span>
+            </button>
+            {canOperate && (
+              <button className="icon-btn queue-pause" onClick={() => toggle(q)} disabled={busy === q.name}
+                aria-label={q.paused ? `Resume queue ${q.name}` : `Pause queue ${q.name}`}
+                title={q.paused ? 'Resume: workers take jobs from this queue again' : 'Pause: stop starting new jobs from this queue'}>
+                {q.paused ? <Play size={14} /> : <Pause size={14} />}
+              </button>
+            )}
+          </div>
         );
       })}
     </section>
@@ -193,7 +229,7 @@ function JobRow({ t, onOpen, nested }) {
       </td>
       <td className="args">{formatArgs(t.args, t.kwargs) || <span className="muted">none</span>}</td>
       <td title={formatClock(t.created_at)}>{timeAgo(t.created_at)}</td>
-      <td className="num">{formatDuration(t.duration_ms)}</td>
+      <td className="num">{t.status === 'Processing' && t.progress !== undefined ? <JobProgress t={t} /> : formatDuration(t.duration_ms)}</td>
       <td><span className={`prio prio-${t.priority}`}>{t.priority}</span></td>
     </tr>
   );
@@ -388,7 +424,11 @@ function TaskDrawer({ taskId, onClose, notify, refreshKey, canOperate }) {
 
   const cancel = async () => {
     setBusy(true);
-    try { await api(`/task/${taskId}/cancel`, { method: 'POST' }); notify('success', 'Job cancelled.'); load(); }
+    try {
+      const res = await api(`/task/${taskId}/cancel`, { method: 'POST' });
+      notify('success', res?.stopping ? 'Stopping the job. Its worker stops it within a second or two.' : 'Job cancelled.');
+      load();
+    }
     catch (e) { notify('error', e.message); }
     finally { setBusy(false); }
   };
@@ -414,6 +454,7 @@ function TaskDrawer({ taskId, onClose, notify, refreshKey, canOperate }) {
                 <span className="muted">Updates live</span>
               )}
             </div>
+            <JobProgress t={task} wide />
             <dl className="facts">
               <Field label="Priority"><span className={`prio prio-${task.priority}`}>{task.priority || 'default'}</span></Field>
               <Field label="Queue">{task.queue || 'default'}</Field>
@@ -426,6 +467,9 @@ function TaskDrawer({ taskId, onClose, notify, refreshKey, canOperate }) {
               {task.worker_id && <Field label="Worker"><code>{task.worker_id}</code></Field>}
               {task.created_by && <Field label="Queued by">{task.created_by}</Field>}
               {task.cancelled_by && <Field label="Cancelled by">{task.cancelled_by}</Field>}
+              {task.waiting_for && !FINAL.has(task.status) && task.status !== 'Processing' && (
+                <Field label="Waiting">{task.waiting_for}</Field>
+              )}
               {task.note && <Field label="Note">{task.note}</Field>}
             </dl>
 
@@ -439,14 +483,128 @@ function TaskDrawer({ taskId, onClose, notify, refreshKey, canOperate }) {
             <div className="drawer-actions">
               <CopyButton text={taskId} />
               {canOperate && CANCELLABLE.has(task.status) && (
-                <button className="btn btn-danger btn-sm" onClick={cancel} disabled={busy}>
-                  <Ban size={14} /> Cancel job
+                <button className="btn btn-danger btn-sm" onClick={cancel} disabled={busy || !!task.cancel_requested_at}>
+                  <Ban size={14} /> {task.status === 'Processing' ? (task.cancel_requested_at ? 'Stopping…' : 'Stop job') : 'Cancel job'}
                 </button>
               )}
             </div>
           </>
         )}
       </aside>
+    </div>
+  );
+}
+
+// ── History: search every kept finished job ──────────────────────────────────
+
+const HISTORY_STATUSES = [
+  { id: '', label: 'Any outcome' },
+  { id: 'Success', label: 'Succeeded' },
+  { id: 'DeadLetter', label: 'Dead letter' },
+  { id: 'Cancelled', label: 'Cancelled' },
+];
+
+const toUnix = local => (local ? new Date(local).getTime() / 1000 : null);
+
+function HistoryView({ taskNames, queueNames, onOpen }) {
+  const [form, setForm] = useState({ q: '', status: '', task_name: '', queue: '', since: '', until: '' });
+  const [rows, setRows] = useState([]);
+  const [page, setPage] = useState(null);      // { next, scanned, kept } of the last request
+  const [scanned, setScanned] = useState(0);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+  const [searched, setSearched] = useState(false);
+  const set = key => e => setForm(f => ({ ...f, [key]: e.target.value }));
+
+  const run = async (cursor = null) => {
+    setBusy(true); setError('');
+    const params = new URLSearchParams({ limit: '50' });
+    for (const k of ['q', 'status', 'task_name', 'queue']) if (form[k]) params.set(k, form[k]);
+    if (form.since) params.set('since', String(toUnix(form.since)));
+    if (form.until) params.set('until', String(toUnix(form.until)));
+    if (cursor) params.set('cursor', cursor);
+    try {
+      const d = await api(`/tasks/history?${params}`);
+      setRows(r => (cursor ? [...r, ...d.tasks] : d.tasks));
+      setScanned(s => (cursor ? s + d.scanned : d.scanned));
+      setPage(d);
+      setSearched(true);
+    } catch (e) { setError(e.message); }
+    finally { setBusy(false); }
+  };
+
+  return (
+    <div className="panel">
+      <form className="history-form" onSubmit={e => { e.preventDefault(); run(); }}>
+        <label className="lookup history-q">
+          <Search size={14} />
+          <input value={form.q} onChange={set('q')} placeholder="Text in the ID, arguments, result or error"
+            aria-label="Search text" />
+        </label>
+        <select value={form.status} onChange={set('status')} aria-label="Outcome">
+          {HISTORY_STATUSES.map(s => <option key={s.id} value={s.id}>{s.label}</option>)}
+        </select>
+        <select value={form.task_name} onChange={set('task_name')} aria-label="Task">
+          <option value="">All tasks</option>
+          {taskNames.map(n => <option key={n} value={n}>{n}</option>)}
+        </select>
+        {queueNames.length > 1 && (
+          <select value={form.queue} onChange={set('queue')} aria-label="Queue">
+            <option value="">All queues</option>
+            {queueNames.map(n => <option key={n} value={n}>{n}</option>)}
+          </select>
+        )}
+        <label className="history-time"><span>Finished after</span>
+          <input type="datetime-local" value={form.since} onChange={set('since')} /></label>
+        <label className="history-time"><span>and before</span>
+          <input type="datetime-local" value={form.until} onChange={set('until')} /></label>
+        <button className="btn btn-primary btn-sm" type="submit" disabled={busy}>{busy ? 'Searching…' : 'Search'}</button>
+      </form>
+
+      {error && <div className="notice notice-error">{error}</div>}
+      {!searched ? (
+        <div className="empty">
+          Search the finished jobs PyTaskQ keeps (the newest FINISHED_JOBS_KEPT, 50,000 by default),
+          not only the recent ones on the Jobs tab.
+        </div>
+      ) : rows.length === 0 && !page?.next ? (
+        <div className="empty">No finished jobs match. Try fewer filters or a wider time range.</div>
+      ) : (
+        <div className="table-wrap">
+          <table className="jobs">
+            <thead>
+              <tr><th>Status</th><th>Task</th><th>Arguments</th><th>Finished</th><th className="num">Duration</th></tr>
+            </thead>
+            <tbody>
+              {rows.map(t => (
+                <tr key={t.task_id} onClick={() => onOpen(t.task_id)} tabIndex={0}
+                  onKeyDown={e => { if (e.key === 'Enter') onOpen(t.task_id); }}>
+                  <td><StatusBadge status={t.status} /></td>
+                  <td>
+                    <div className="task-name">{t.task_name}</div>
+                    <div className="task-id">{t.task_id.slice(0, 8)}</div>
+                  </td>
+                  <td className="args">{formatArgs(t.args, t.kwargs) || <span className="muted">none</span>}</td>
+                  <td title={formatClock(t.finished_at)}>{formatClock(t.finished_at)}</td>
+                  <td className="num">{formatDuration(t.duration_ms)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+      {searched && page && (
+        <div className="history-foot">
+          <span className="muted small">
+            {rows.length} found · looked through {scanned.toLocaleString()} of {Number(page.kept || 0).toLocaleString()} kept jobs
+          </span>
+          {page.next && (
+            <button className="btn btn-ghost btn-sm" onClick={() => run(page.next)} disabled={busy}>
+              {busy ? 'Searching…' : 'Look further back'}
+            </button>
+          )}
+        </div>
+      )}
     </div>
   );
 }
@@ -546,6 +704,8 @@ function RunView({ registered, onQueued, notify }) {
               {spec.type === 'cpu' ? 'Runs in a separate process' : spec.type === 'async' ? 'Runs on the worker event loop' : 'Runs in a worker thread'}
               {' '}· retried up to {spec.max_retries}× · times out after {spec.timeout ? `${spec.timeout}s` : 'never'}
               {spec.queue && spec.queue !== 'default' && <> · queue <strong>{spec.queue}</strong></>}
+              {spec.max_concurrency && <> · at most <strong>{spec.max_concurrency}</strong> running at once</>}
+              {spec.rate_limit && <> · starts limited to <strong>{spec.rate_limit}</strong></>}
             </p>
             {params.length === 0 && <p className="muted">This task takes no arguments.</p>}
             {params.map(p => (
@@ -614,7 +774,7 @@ function WorkersView({ workers }) {
           <tbody>
             {workers.map(w => (
               <tr key={w.worker_id}>
-                <td><div className="task-name">{w.hostname || 'worker'}{w.pid ? ` · pid ${w.pid}` : ''}</div><div className="task-id">{w.worker_id}</div></td>
+                <td><div className="task-name">{w.hostname || 'worker'}{w.pid ? ` · pid ${w.pid}` : ''}</div><div className="task-id">{w.worker_id}</div><div className="muted small">{w.version ? `PyTaskQ ${w.version}` : 'PyTaskQ older than 0.5'}</div></td>
                 <td>{w.app || <span className="muted">—</span>}</td>
                 <td className="small">{(w.queues || ['default']).join(', ')}</td>
                 <td className="num">{w.active}</td>
@@ -724,6 +884,7 @@ function Dashboard({ me, authEnabled, onSignOut, theme, setTheme }) {
   const [metrics, setMetrics] = useState(EMPTY_METRICS);
   const [dlq, setDlq] = useState([]);
   const [connected, setConnected] = useState(false);
+  const [redisProblem, setRedisProblem] = useState(null);   // the server can't read Redis right now
   const [tick, setTick] = useState(0);          // bumps on every live update
   const [tasks, setTasks] = useState([]);
   const [loadingTasks, setLoadingTasks] = useState(true);
@@ -746,9 +907,11 @@ function Dashboard({ me, authEnabled, onSignOut, theme, setTheme }) {
     let ws, retry, alive = true;
     const connect = () => {
       ws = new WebSocket(WS_URL);
-      ws.onopen = () => setConnected(true);
+      ws.onopen = () => { setConnected(true); setRedisProblem(null); };
       ws.onmessage = ev => {
         const data = JSON.parse(ev.data);
+        setRedisProblem(data.degraded ? (data.detail || "Can't reach Redis right now.") : null);
+        if (data.degraded) return;
         if (data.metrics) setMetrics(data.metrics);
         if (data.dlq) setDlq(data.dlq);
         setTick(t => t + 1);
@@ -821,8 +984,8 @@ function Dashboard({ me, authEnabled, onSignOut, theme, setTheme }) {
       <header className="topbar">
         <Brand />
         <div className="topbar-right">
-          <span className={`conn ${connected ? 'live' : ''}`}>
-            <span className="dot" /> {connected ? 'Live' : 'Reconnecting…'}
+          <span className={`conn ${connected && !redisProblem ? 'live' : ''}`} title={redisProblem || undefined}>
+            <span className="dot" /> {!connected ? 'Reconnecting…' : redisProblem ? (redisProblem.startsWith('Redis is full') ? 'Redis is full' : 'Redis unreachable') : 'Live'}
           </span>
           <button className="user-chip" onClick={() => setTab('settings')} title="Account settings">
             <UserRound size={14} />
@@ -834,8 +997,9 @@ function Dashboard({ me, authEnabled, onSignOut, theme, setTheme }) {
       </header>
 
       <Lifecycle m={{ ...metrics, worker_count: workerCount }} onAdvice={() => setTab('settings')} />
-      {showsQueues(metrics) && (
-        <QueueStrip m={metrics} active={queueFilter} onPick={q => { setQueueFilter(q); setTab('jobs'); }} />
+      {(showsQueues(metrics) || canOperate || queuesInUse(metrics).some(q => q.paused)) && queuesInUse(metrics).length > 0 && (
+        <QueueStrip m={metrics} active={queueFilter} onPick={q => { setQueueFilter(q); setTab('jobs'); }}
+          canOperate={canOperate} notify={notify} />
       )}
       {workerCount === 0 && tab !== 'workers' && <GettingStarted />}
 
@@ -865,6 +1029,7 @@ function Dashboard({ me, authEnabled, onSignOut, theme, setTheme }) {
         )}
         {tab === 'workers' && <WorkersView workers={workers} />}
         {tab === 'dead' && <DeadLettersView items={dlq} notify={notify} onOpen={setOpenId} canOperate={canOperate} />}
+        {tab === 'history' && <HistoryView taskNames={taskNames} queueNames={queueNames} onOpen={setOpenId} />}
         {tab === 'settings' && <SettingsView me={me} authEnabled={authEnabled} onSignOut={onSignOut} notify={notify} />}
       </main>
 

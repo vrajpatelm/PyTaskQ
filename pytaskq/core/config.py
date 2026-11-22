@@ -18,17 +18,28 @@ class Settings(BaseSettings):
     REDIS_PASSWORD: str = ""
     REDIS_MAX_CONNECTIONS: int = 200   # per process; requests wait for a free one instead of failing
     REDIS_POOL_TIMEOUT: float = 5      # seconds a request waits for a free connection before a 503
+    # High availability (docs/REDIS.md): Redis Sentinel finds the current primary and follows failovers.
+    REDIS_SENTINELS: str = ""          # "host1:26379,host2:26379,host3:26379"; wins over REDIS_URL's host
+    REDIS_SENTINEL_MASTER: str = "mymaster"   # the name the Sentinels monitor
+    REDIS_SENTINEL_PASSWORD: str = ""  # if the Sentinels themselves need a password
+    REDIS_WAIT_REPLICAS: int = 0       # after queueing a job, wait until this many replicas have it (0 = don't)
+    REDIS_WAIT_TIMEOUT_MS: int = 500   # …but no longer than this; a warning is logged when fewer confirmed
 
     # ── Queue behaviour ──────────────────────────────────────────────────────
     QUEUE_CAPACITY: int = 500          # jobs that can wait in EACH queue before the API answers 429 (0 = no limit)
+    REDIS_KEY_PREFIX: str = ""         # put every PyTaskQ key under "{prefix}:" (share a Redis; Cluster-ready)
+    PRIORITY_WEIGHTS: str = "6,3,1"    # share of pops that prefer high,default,low jobs; "strict" = high always first
+    MAX_QUEUES: int = 100              # how many queue names may exist (0 = no limit); unused ones are forgotten
     TASK_TIMEOUT: float = 300          # default per-task timeout (seconds, 0 = none)
     MAX_RETRIES: int = 3               # default retries before a task is dead-lettered
     RESULT_TTL: int = 86400            # how long a FINISHED job's status/result is kept (seconds)
+    FINISHED_JOBS_KEPT: int = 50_000   # at most this many finished jobs are kept (the oldest go first); 0 = no cap
     HISTORY_LIMIT: int = 500           # how many recent tasks the dashboard can list
     MAX_RESULT_BYTES: int = 1_000_000  # larger results aren't stored (the job still succeeds); 0 = no limit
     MAX_PAYLOAD_BYTES: int = 1_000_000 # larger jobs (arguments) are refused: API 413, SDK ValueError; 0 = no limit
     DLQ_LIMIT: int = 10_000            # dead letters kept; the oldest are dropped beyond this (0 = no limit)
     CRON_TIMEZONE: str = "UTC"         # time zone for cron schedules (a task's own tz= wins)
+    CRON_CATCH_UP: bool = True         # run the latest missed cron tick once after an outage (a task's catch_up= wins)
 
     # ── Workers ──────────────────────────────────────────────────────────────
     WORKER_QUEUES: str = ""            # queues a worker serves, comma-separated (empty = its tasks' queues)

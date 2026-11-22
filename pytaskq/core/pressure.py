@@ -25,6 +25,7 @@ import asyncio
 import logging
 import time
 from collections import Counter
+from pytaskq.core.keys import k as rkey
 
 logger = logging.getLogger("api")
 
@@ -38,7 +39,7 @@ _suppressed: Counter = Counter()
 
 
 def _key(minute: int) -> str:
-    return f"stats:pressure:{minute}"
+    return rkey(f"stats:pressure:{minute}")
 
 
 def record(reason: str, detail: str = "") -> None:

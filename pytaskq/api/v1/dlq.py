@@ -7,11 +7,12 @@ from pytaskq.core import queueing, redis_client
 from pytaskq.core.config import settings
 from pytaskq.core.dependencies import require
 from pytaskq.services.dashboard_service import _notify_tenant
+from pytaskq.core.keys import k as rkey
 
 router = APIRouter(prefix="/dlq", tags=["dlq"], dependencies=[Depends(require("viewer"))])
 _operator = [Depends(require("operator"))]
 
-DLQ_KEY = "dlq"
+DLQ_KEY = rkey("dlq")
 _DLQ_ONLY_FIELDS = ("error", "failed_at")
 _NOT_REPLAYABLE = ("This entry isn't a valid job: it was found in a queue and kept here so you can see what was "
                    "sent (its text is in 'raw'). It can't run; delete it.")
@@ -23,11 +24,12 @@ _NOT_REPLAYABLE = ("This entry isn't a valid job: it was found in a queue and ke
 # KEYS: dlq, target queue list, task hash
 # ARGV: dead-letter entry, new payload, task_id, task_name, priority, note, (unused), queue name
 # The record has no expiry while the job waits again (it gets RESULT_TTL when it finishes).
-REPLAY_SCRIPT = """
+REPLAY_SCRIPT = queueing.WAKE_LUA + """
 if redis.call('LREM', KEYS[1], 1, ARGV[1]) == 0 then
     return 0
 end
 redis.call('RPUSH', KEYS[2], ARGV[2])
+pytaskq_wake(KEYS[5], 100)
 if ARGV[3] ~= '' then
     redis.call('HDEL', KEYS[3], 'started_at', 'finished_at', 'duration_ms', 'next_retry_at', 'result',
                'result_dropped')
@@ -35,6 +37,7 @@ if ARGV[3] ~= '' then
                'priority', ARGV[5], 'queue', ARGV[8], 'retry_count', 0, 'payload', ARGV[2], 'error', '',
                'note', ARGV[6])
     redis.call('PERSIST', KEYS[3])
+    redis.call('ZREM', KEYS[4], ARGV[3])     -- running again: not a finished job any more
 end
 return 1
 """
@@ -73,7 +76,7 @@ async def _fresh_payload(item: dict) -> dict:
     task["prev_delay"] = 1.0
     task["bounces"] = 0
     task.pop("handed_back_since", None)
-    current_fence = await redis_client.r.get(f"fence:{task.get('task_id')}")
+    current_fence = await redis_client.r.get(rkey(f"fence:{task.get('task_id')}"))
     if current_fence is not None:
         task["fence_token"] = int(current_fence)
     return task
@@ -86,8 +89,9 @@ async def _replay(raw: str, task: dict) -> bool:
     note = f"Replayed from dead letters at {time.strftime('%Y-%m-%d %H:%M:%S')}"
     queue = queueing.payload_queue(task)
     done = await redis_client.r.eval(
-        REPLAY_SCRIPT, 3,
-        DLQ_KEY, queueing.queue_key(priority, queue), queueing.task_key(task_id),
+        REPLAY_SCRIPT, 5,
+        DLQ_KEY, queueing.queue_key(priority, queue), queueing.task_key(task_id), queueing.FINISHED_KEY,
+        queueing.wake_key(queue),
         raw, json.dumps(task), task_id, task.get("task_name", ""), priority, note, int(settings.RESULT_TTL),
         queue,
     )

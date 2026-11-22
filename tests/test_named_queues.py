@@ -165,6 +165,12 @@ def test_worker_serves_its_tasks_queues_by_default(monkeypatch):
 
 
 def test_pop_order_is_priority_first_and_queues_take_turns():
+    """With PRIORITY_WEIGHTS=strict (weighted priorities, the 0.5 default, are tested in test_v050.py)."""
+    with patch.object(worker, "_SCHEDULE", ["high"]):
+        _check_strict_pop_order()
+
+
+def _check_strict_pop_order():
     keys = worker.pop_keys(["default", "images"], turn=0)
     assert keys == ["queue:high", "queue:images:high", "queue:default", "queue:images:default",
                     "queue:low", "queue:images:low"]
@@ -348,6 +354,9 @@ async def test_api_uses_the_tasks_queue_and_allows_an_override(client, r):
     a = await client.post("/task/enqueue", json={"task_name": "resize", "args": ["x.png"]})
     assert a.status_code == 200, a.text
     assert await r.llen("queue:images:default") == 1
+    typo = await client.post("/task/enqueue", json={"task_name": "resize", "args": ["y.png"], "queue": "bulk"})
+    assert typo.status_code == 422 and "Unknown queue 'bulk'" in typo.json()["detail"], "0.4.2: no silent new queues"
+    await r.sadd(queueing.QUEUES_KEY, "bulk")            # a worker serves it
     b = await client.post("/task/enqueue", json={"task_name": "resize", "args": ["y.png"], "queue": "bulk"})
     assert b.status_code == 200 and await r.llen("queue:bulk:default") == 1
     bad = await client.post("/task/enqueue", json={"task_name": "resize", "queue": "Not OK"})
@@ -416,6 +425,9 @@ def _at(year, month, day, hour, minute, second=30):
 
 
 async def cron_runs(r, tasks, now):
+    """These tests jump the clock around to check time-zone math; forget which ticks were handled
+    (since 0.5 PyTaskQ remembers that, to notice missed runs; catch-up is tested in test_v050.py)."""
+    await r.delete(worker.CRON_STATE_KEY)
     with patch.object(worker, "TASKS", tasks):
         return await worker.run_due_cron_jobs(now=now)
 

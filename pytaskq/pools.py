@@ -37,8 +37,10 @@ import signal
 import threading
 import time
 import traceback
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from typing import Any, Awaitable, Callable, Optional
+
+from pytaskq import context
 
 logger = logging.getLogger("worker")
 
@@ -106,9 +108,9 @@ def _child_main(conn, modules: tuple) -> None:
             continue
         if job is None:
             return
-        func, args, kwargs = job
+        func, args, kwargs, *rest = job
         try:
-            value = func(*args, **kwargs)
+            value = context.run_as(_child_job(conn, rest[0] if rest else None), func, args, kwargs)
         except BaseException as e:     # SystemExit too: a task calling sys.exit() fails, it doesn't end the process
             _send_error(conn, e)
             continue
@@ -116,6 +118,26 @@ def _child_main(conn, modules: tuple) -> None:
             conn.send(("ok", value))
         except Exception as e:
             _send_error(conn, e, prefix="The task finished, but its return value couldn't be sent back: ")
+
+
+PROGRESS_EVERY = 0.2     # seconds between two progress messages from a CPU process (newer ones replace older)
+
+
+def _child_job(conn, task_id):
+    """The job context inside a CPU process: progress() goes to the worker through the pipe."""
+    if not task_id:
+        return None
+    last = [0.0]
+
+    def report(_, percent, message):
+        now = time.monotonic()
+        if now - last[0] >= PROGRESS_EVERY:
+            last[0] = now
+            try:
+                conn.send(("progress", percent, message))
+            except Exception:
+                pass
+    return context.Job(task_id, report)
 
 
 def _raise_child_error(msg) -> None:
@@ -147,16 +169,20 @@ class _Child:
         self.conn = conn
         self.pid = process.pid
 
-    def call(self, func, args, kwargs):
+    def call(self, func, args, kwargs, job=None):
         """Runs in a helper thread: send the job, wait for the answer. Raises ProcessCrashed if the process dies."""
         try:
-            self.conn.send((func, tuple(args), dict(kwargs)))
+            self.conn.send((func, tuple(args), dict(kwargs), job.task_id if job else None))
         except (BrokenPipeError, EOFError, ConnectionError) as e:
             raise ProcessCrashed(f"The CPU process {describe_exit(self.exitcode())} before the task started ({e}).")
         while True:
             try:
                 if self.conn.poll(0.5):
                     msg = self.conn.recv()
+                    if isinstance(msg, tuple) and msg and msg[0] == "progress":
+                        if job is not None:
+                            job.report(job.task_id, msg[1], msg[2])
+                        continue
                     break
             except (EOFError, OSError):
                 raise ProcessCrashed(f"The process running this task {describe_exit(self.exitcode())}.") from None
@@ -293,7 +319,7 @@ class CpuPool:
 
     # ── running a job ────────────────────────────────────────────────────────
     async def execute(self, func: Callable, args, kwargs, timeout: float,
-                      started: Callable[[], Awaitable[None]]) -> Any:
+                      started: Callable[[], Awaitable[None]], job=None) -> Any:
         """Wait for a free process, call `started()`, then run the job with its timeout."""
         if self._idle is None:
             raise RuntimeError("CpuPool.start() wasn't called")
@@ -306,7 +332,7 @@ class CpuPool:
             self._idle.put_nowait(child)
             raise
         loop = asyncio.get_running_loop()
-        pending = loop.run_in_executor(self._threads, child.call, func, args, kwargs)
+        pending = loop.run_in_executor(self._threads, child.call, func, args, kwargs, job)
         try:
             if timeout and timeout > 0:
                 result = await asyncio.wait_for(asyncio.shield(pending), timeout)
@@ -372,8 +398,8 @@ class CpuPool:
 # IO threads
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _call(func, args, kwargs):
-    return func(*args, **kwargs)
+def _call(job, func, args, kwargs):
+    return context.run_as(job, func, args, kwargs)
 
 
 class IoPool:
@@ -407,13 +433,15 @@ class IoPool:
         return len(self.stuck)
 
     async def execute(self, func: Callable, args, kwargs, timeout: float,
-                      started: Callable[[], Awaitable[None]], label: tuple[str, str] = ("", "")) -> Any:
+                      started: Callable[[], Awaitable[None]], label: tuple[str, str] = ("", ""), job=None) -> Any:
         slots = self._slots()
         await slots.acquire()
         keep_slot = False
         try:
             await started()
-            cf = self.executor.submit(_call, func, args, kwargs)
+            if isinstance(self.executor, ProcessPoolExecutor):
+                job = None        # can't cross into another process (an embedder's own process pool)
+            cf = self.executor.submit(_call, job, func, args, kwargs)
             fut = asyncio.wrap_future(cf)
             try:
                 if timeout and timeout > 0:

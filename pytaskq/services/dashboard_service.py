@@ -3,10 +3,11 @@ import json
 
 from pytaskq.core import queueing, redis_client
 from pytaskq.core.config import settings
+from pytaskq.core.keys import k as rkey
 
 
 async def _notify_tenant(tenant_id: str, event_type: str) -> None:
-    await redis_client.r.publish("events:global", event_type)
+    await redis_client.r.publish(rkey("events:global"), event_type)
 
 
 def _reject_constant(name):
@@ -15,9 +16,9 @@ def _reject_constant(name):
 
 async def _totals_and_dlq(include_dlq: bool):
     async with redis_client.r.pipeline(transaction=False) as pipe:
-        pipe.mget("stats:completed", "stats:failed")
+        pipe.mget(rkey("stats:completed"), rkey("stats:failed"))
         if include_dlq:   # capped; the full list is at GET /dlq
-            pipe.lrange("dlq", 0, 99)
+            pipe.lrange(rkey("dlq"), 0, 99)
         return await pipe.execute()
 
 

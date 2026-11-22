@@ -36,8 +36,8 @@ Returns live cluster-wide queue and worker statistics.
       "queue_low": 0,
       "queue_total": 0,
       "queue_capacity": 500,
-      "queues": [{"name": "default", "high": 0, "default": 0, "low": 0, "total": 0, "workers": 2},
-                 {"name": "images", "high": 0, "default": 4, "low": 0, "total": 4, "workers": 1}],
+      "queues": [{"name": "default", "high": 0, "default": 0, "low": 0, "total": 0, "workers": 2, "paused": false},
+                 {"name": "images", "high": 0, "default": 4, "low": 0, "total": 4, "workers": 1, "paused": false}],
       "fullest_queue": {"name": "images", "total": 4},
       "worker_count": 3
     }
@@ -142,15 +142,15 @@ Delete all failed tasks permanently.
 }
 ```
 
-Response: `{"task_id": "…", "status": "queued"}` (or `"scheduled"` with `execute_in_seconds`).
+Response: `{"task_id": "…", "status": "queued"}` (or `"scheduled"` with `execute_in_seconds`). With `REDIS_WAIT_REPLICAS` set, also `"replicas": N`: how many Redis replicas confirmed the job ([REDIS.md](REDIS.md#waiting-for-a-replica-redis_wait_replicas)).
 
 Errors:
 * `403` — the task name starts with `_`: those are PyTaskQ's internal tasks (such as webhook delivery) and can't be queued through the API.
 * `404` — the task name isn't advertised by any running worker. The message lists the available tasks.
 * `413` — the job is over `MAX_PAYLOAD_BYTES` (1 MB) once encoded. Put large data in storage and pass its location.
-* `422` — invalid body: a task name over 200 characters, an unknown priority, an invalid queue name, a delay outside 0 to 1 year, `NaN`/`Infinity` in the arguments, a malformed `Idempotency-Key`, or a key already used for a different job. Also **arguments the task doesn't accept** (a missing required argument, an unknown keyword, too many positional ones), checked against the parameters the workers advertise: `"Wrong arguments for task 'send_receipt': missing a required argument: 'order_id'"`. Long rejected values are shortened in the reply.
+* `422` — invalid body: a task name over 200 characters, an unknown priority, an invalid queue name, **a queue that doesn't exist yet** (no worker serves it and no task lives on it: usually a typo; the message lists the known queues), a new queue beyond `MAX_QUEUES`, a delay outside 0 to 1 year, `NaN`/`Infinity` in the arguments, a malformed `Idempotency-Key`, or a key already used for a different job. Also **arguments the task doesn't accept** (a missing required argument, an unknown keyword, too many positional ones), checked against the parameters the workers advertise: `"Wrong arguments for task 'send_receipt': missing a required argument: 'order_id'"`. Long rejected values are shortened in the reply.
 * `429` — the job's queue already holds `QUEUE_CAPACITY` jobs (each queue has its own limit). The check and the push are one step, so the limit is exact under any load. Scheduled jobs (`delay_seconds` > 0) are refused too while their queue is full. Wait `Retry-After` seconds and try again.
-* `503` — the server couldn't reach Redis in time. Also carries `Retry-After`.
+* `503` — Redis can't take the job right now, with `Retry-After`: it couldn't be reached or didn't answer in time (`"error": "Redis is unavailable"`), or it's **full** (`"error": "Redis is full"`, `maxmemory` reached; see [REDIS.md](REDIS.md#when-redis-is-full)). Every endpoint answers 503 rather than 500 in these cases.
 
 `POST /task/schedule?delay_seconds=60` still works and takes the same body.
 
@@ -172,6 +172,26 @@ curl -X POST https://jobs.example.com/task/enqueue \
 * Keys are 1 to 255 printable characters without spaces, and shared by everyone using this server.
 
 The SDK takes the same option: `await send_receipt.delay(1042, idempotency_key="order-1042-receipt")`.
+
+### Choosing a job's id (Python SDK)
+
+`await task.apply_async(args, task_id="report-2026-11-22")` queues a job under your own id instead of a random one:
+
+* While a job with that id is **waiting, scheduled or running**, queueing another one raises `TaskIdInUse` (a `ValueError`). Two schedules with the same id used to merge silently into one.
+* Once that job has **finished** (succeeded, dead-lettered or cancelled), the id can be used again: the old record is replaced.
+* To make sure a job is queued **only once** however often you ask, use `idempotency_key=` instead.
+
+### Health — `GET /health`
+
+No sign-in needed. `503` with `"status": "down"` when Redis can't be reached. Otherwise `200`, with `"status": "ok"`, or `"status": "degraded"` and a `warnings` list when Redis is nearly full, is set to delete keys (`maxmemory-policy`), or lost its data in the last week:
+
+```json
+{"status": "degraded", "redis": "connected", "version": "0.5.0",
+ "redis_memory": {"used_bytes": 402653184, "max_bytes": 419430400, "percent": 96.0, "policy": "noeviction"},
+ "warnings": ["Redis is 96% full (384 MB of 400 MB)"]}
+```
+
+Point monitoring at the `status` field, not only the HTTP code: a degraded PyTaskQ still serves the dashboard, so Docker shouldn't restart it, but someone should look.
 
 ### Job status — `GET /task/{task_id}`
 
@@ -198,15 +218,46 @@ A job is visible from the moment it is queued:
 }
 ```
 
-Non-string results are stored as JSON. Results over `MAX_RESULT_BYTES` (1 MB) aren't stored: the job is still `Success`, `result` is empty and `result_dropped` explains why. The record also has `queue`, and a `note` while a job waits for a worker that has its task.
+Non-string results are stored as JSON. Results over `MAX_RESULT_BYTES` (1 MB) aren't stored: the job is still `Success`, `result` is empty and `result_dropped` explains why. The record also has:
+
+* `queue`;
+* `progress` (0–100) and `progress_message`, while it runs, if the task reports progress (`pytaskq.progress()`);
+* `waiting_for`, while a taken job waits for its turn under the task's `max_concurrency` or `rate_limit` (cleared when it starts);
+* `note`: why something unusual happened (waiting for a worker that has its task, a late cron run, how it was cancelled);
+* `cancel_requested_by` / `cancel_requested_at` after a running job was cancelled, and `cancelled_by` once it is.
 
 ### Cancel — `POST /task/{task_id}/cancel`
 
-Works for `Queued`, `Scheduled` and `RetryScheduled` jobs. Returns `409` for jobs that are running or finished, and `404` for unknown ones.
+* A waiting job (`Queued`, `Scheduled`, `RetryScheduled`): cancelled at once. `200 {"task_id", "status": "Cancelled", "cancelled": true}`.
+* A running job: `202 {"task_id", "status": "Processing", "cancelled": false, "stopping": true}`. Its worker stops it within about a second, then its status is `Cancelled` (see [TASKS.md](TASKS.md#cancelling-a-job) for how each task type is stopped).
+* A finished job: `409`. Unknown: `404`.
 
-### History — `GET /tasks`
+### Recent jobs — `GET /tasks`
 
-Query: `status`, `task_name`, `queue`, `limit` (1–500). Newest first, drawn from the last `HISTORY_LIMIT` jobs.
+Query: `status`, `task_name`, `queue`, `limit` (1–500). Newest first, drawn from the last `HISTORY_LIMIT` jobs (any status).
+
+### Search finished jobs — `GET /tasks/history`
+
+Searches every kept finished job (the newest `FINISHED_JOBS_KEPT`, 50,000 by default), newest first. Query:
+
+| Parameter | |
+|---|---|
+| `status` | `Success`, `DeadLetter`, `Cancelled` or `Failed` |
+| `task_name`, `queue` | Exact names |
+| `since`, `until` | Finished between these times (Unix seconds) |
+| `q` | Text found in the id, task name, arguments, result, error or note (case-insensitive) |
+| `limit` | 1–500 (default 50) |
+| `cursor` | The `next` value of the previous page |
+
+```json
+{"tasks": [ /* job records, as GET /task/{id} */ ], "next": "1795412000.41|1", "scanned": 5000, "kept": 48211}
+```
+
+One request looks at up to 5,000 jobs. When `next` isn't `null`, pass it as `cursor` to continue further back; it can be non-null even when `tasks` is empty (nothing matched among the 5,000 looked at). Jobs that finished before 0.5.0 aren't in this index.
+
+### Queues — `GET /queues`, `POST /queues/{name}/pause`, `POST /queues/{name}/resume`
+
+`GET /queues` lists every queue with its waiting jobs per priority, live workers serving it, `paused`, and `paused_by` / `paused_at` when paused. Pausing (operator) stops workers from starting new jobs from the queue at once; running jobs finish and new jobs still queue up. Both return `{"queue", "paused", "changed"}` (`changed` is `false` if it already was in that state).
 
 ### Registered tasks — `GET /tasks/registered`
 
@@ -214,14 +265,19 @@ What running workers (or `pytaskq dashboard --app …`) advertise, including eac
 
 ```json
 {"tasks": [{"name": "send_receipt", "type": "io", "queue": "default", "priority": "high", "max_retries": 3,
-            "timeout": 300, "cron": null, "tz": null, "doc": "Email a receipt.",
+            "timeout": 300, "cron": null, "tz": null, "max_concurrency": null, "rate_limit": "100/m",
+            "doc": "Email a receipt.",
             "params": [{"name": "order_id", "required": true, "annotation": "int"},
                        {"name": "email", "required": false, "default": "customer@example.com", "annotation": "str"}]}]}
 ```
 
 ### Workers — `GET /system/workers`
 
-Each worker reports `hostname`, `pid`, `app`, `queues` (the queues it serves), `active`, `processed`, `failed`, `cpu_workers`, `io_workers`, `uptime_seconds`, `last_heartbeat_seconds_ago`, `stuck_io` (IO threads still running timed-out tasks), `cpu_restarts` (CPU processes replaced after a timeout or crash), `loop_blocked_seconds` (how long an async task has blocked it right now, 0 if not) and `status` (`healthy` / `degraded` / `dead`).
+Each worker reports `hostname`, `pid`, `app`, `queues` (the queues it serves), `active`, `processed`, `failed`, `cpu_workers`, `io_workers`, `uptime_seconds`, `last_heartbeat_seconds_ago`, `stuck_io` (IO threads still running timed-out tasks), `cpu_restarts` (CPU processes replaced after a timeout or crash), `loop_blocked_seconds` (how long an async task has blocked it right now, 0 if not), `version` (its PyTaskQ version; empty before 0.5), `settings` (the shared settings it uses, compared with the dashboard's in `/system/performance`) and `status` (`healthy` / `degraded` / `dead`).
+
+### Prometheus — `GET /metrics/prometheus`
+
+The dashboard's numbers in the Prometheus text format (viewer role; scrape with a viewer's API token as a bearer token). Metrics: `pytaskq_queue_jobs{queue,priority}`, `pytaskq_queue_workers{queue}`, `pytaskq_queue_paused{queue}`, `pytaskq_jobs_waiting`, `pytaskq_jobs_running`, `pytaskq_jobs_scheduled`, `pytaskq_dead_letters`, `pytaskq_workers`, `pytaskq_jobs_succeeded_total`, `pytaskq_job_attempts_failed_total`, `pytaskq_finished_jobs_kept`, `pytaskq_cron_missed_runs_total{task}`, `pytaskq_requests_turned_away_last_hour{reason}`, `pytaskq_redis_used_memory_bytes`, `pytaskq_redis_max_memory_bytes`, `pytaskq_info{version}`. Example scrape config: [DEPLOYMENT.md](DEPLOYMENT.md#monitoring).
 
 ### Dead letters
 
@@ -239,7 +295,7 @@ Every route except `/health`, `/` (the dashboard page) and the public `/auth` ro
 | Script or service | `Authorization: Bearer ptq_…` (created under *Settings → API tokens*) | The token owner's role |
 | Automation | `Authorization: Bearer <MASTER_KEY>` (only if set, ≥ 16 characters) | Admin |
 
-Roles: **viewer** can use every `GET` route and the live WebSocket. **operator** can also enqueue, schedule and cancel jobs and replay or delete dead letters. **admin** can also use the `/auth/users` and `/auth/invites` management routes.
+Roles: **viewer** can use every `GET` route and the live WebSocket. **operator** can also enqueue, schedule and cancel jobs, pause and resume queues, and replay or delete dead letters. **admin** can also use the `/auth/users` and `/auth/invites` management routes.
 
 Errors: `401` means not signed in, or the token is invalid or revoked. `403` means the role is too low, or a cookie-authenticated write came from another website.
 

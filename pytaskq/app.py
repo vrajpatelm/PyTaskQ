@@ -45,6 +45,7 @@ import hmac
 import inspect
 import json
 import os
+import re
 import time
 from typing import Any, Callable, Optional
 
@@ -144,6 +145,8 @@ def describe_tasks(tasks: dict[str, dict]) -> dict[str, dict]:
             "queue": entry.get("queue") or queueing.DEFAULT_QUEUE,
             "max_retries": entry.get("max_retries") if entry.get("max_retries") is not None else settings.MAX_RETRIES,
             "timeout": entry.get("timeout") if entry.get("timeout") is not None else settings.TASK_TIMEOUT,
+            "max_concurrency": entry.get("max_concurrency"),
+            "rate_limit": entry.get("rate_limit"),
             "doc": doc.split("\n\n")[0].strip(),
             "params": _describe_params(fn),
             "internal": task_name.startswith("_"),
@@ -186,8 +189,11 @@ class PyTaskQ:
         priority: Optional[str] = None,
         queue: Optional[str] = None,
         tz: Optional[str] = None,
+        catch_up: Optional[bool] = None,
         max_retries: Optional[int] = None,
         timeout: Optional[float] = None,
+        max_concurrency: Optional[int] = None,
+        rate_limit: Optional[str] = None,
     ):
         """
         Register a function as a background task. Usable as `@queue.task` or
@@ -198,12 +204,21 @@ class PyTaskQ:
         cron        Standard 5-field cron expression; the fleet enqueues it on schedule.
         tz          Time zone the cron expression is read in, e.g. "Europe/London"
                     (default: the CRON_TIMEZONE setting, which is UTC).
+        catch_up    For cron tasks: after an outage (no worker running when a tick was
+                    due), run the latest missed tick once when workers are back
+                    (default: the CRON_CATCH_UP setting, True). Missed runs are always logged.
         priority    "high", "default" or "low" within its queue.
         queue       Named queue (default "default", or the app's default_queue). Only
                     workers serving this queue run the task: use it to give a kind of
                     work its own workers (e.g. heavy jobs on a big machine).
         max_retries Attempts after the first failure before dead-lettering (default 3).
         timeout     Seconds before the attempt is abandoned (default TASK_TIMEOUT).
+        max_concurrency  At most this many jobs of this task run at once, across every
+                    worker (e.g. 2 for a task that logs in to an account that allows two
+                    sessions). Extra jobs wait, without using retries.
+        rate_limit  At most this many starts per second/minute/hour across every worker,
+                    e.g. "10/s", "100/m", "1000/h". Starts are spread evenly ("60/m" =
+                    one a second). Extra jobs wait for their turn, without using retries.
         """
 
         if isinstance(func, str):  # legacy positional form: @queue.task("io")
@@ -229,9 +244,15 @@ class PyTaskQ:
                 if cron is None:
                     raise ValueError(f"{fn.__name__}: tz= only applies to cron tasks")
                 _check_time_zone(tz)
+            if catch_up is not None and cron is None:
+                raise ValueError(f"{fn.__name__}: catch_up= only applies to cron tasks")
             task_queue = queueing.check_queue_name(self.default_queue if queue is None else queue)
             if max_retries is not None and max_retries < 0:
                 raise ValueError("max_retries must be >= 0")
+            if max_concurrency is not None and (isinstance(max_concurrency, bool)
+                                                or not isinstance(max_concurrency, int) or max_concurrency < 1):
+                raise ValueError(f"{fn.__name__}: max_concurrency must be a whole number >= 1")
+            rate_interval = parse_rate_limit(rate_limit) if rate_limit is not None else None
 
             task_name = name or fn.__name__
             if task_name in self.TASKS and self.TASKS[task_name]["handler"] is not fn:
@@ -244,10 +265,14 @@ class PyTaskQ:
                 "type": task_type,
                 "cron": cron,
                 "tz": tz,
+                "catch_up": catch_up,
                 "priority": prio,
                 "queue": task_queue,
                 "max_retries": retries,
                 "timeout": limit,
+                "max_concurrency": max_concurrency,
+                "rate_limit": rate_limit.strip() if rate_limit else None,
+                "rate_interval": rate_interval,
             }
             own_params = set(inspect.signature(fn).parameters)
 
@@ -319,23 +344,65 @@ class PyTaskQ:
         return queueing.public_view(meta) if meta else None
 
     async def wait(self, task_id: str, timeout: float = 30, poll_interval: float = 0.25) -> dict:
-        """Wait until the task reaches a final state; raises TimeoutError otherwise."""
+        """Wait until the task reaches a final state; raises TimeoutError otherwise.
+
+        Checks often at first (every 20 ms) and less often as time passes (up to
+        `poll_interval`), so a quick job's result comes back quickly without a
+        long wait hammering Redis.
+        """
         deadline = time.monotonic() + timeout
+        delay = min(0.02, poll_interval)
         while True:
             info = await self.status(task_id)
             if info and info.get("status") in queueing.FINAL_STATES:
                 return info
             if time.monotonic() >= deadline:
                 raise TimeoutError(f"Task {task_id} did not finish within {timeout}s")
-            await asyncio.sleep(poll_interval)
+            await asyncio.sleep(min(delay, max(0.0, deadline - time.monotonic())))
+            delay = min(delay * 1.5, poll_interval)
 
     async def cancel(self, task_id: str) -> bool:
-        """Cancel a task that has not started yet."""
+        """
+        Cancel a job. A waiting job won't run; a running one is stopped by its
+        worker within about a second (then its status is Cancelled). False if
+        it already finished or doesn't exist.
+        """
         ok, _ = await queueing.cancel(_redis(), task_id)
         return ok
 
+    async def pause_queue(self, queue: str) -> bool:
+        """
+        Stop workers from starting new jobs from `queue`, at once.
+        Running jobs finish; new jobs still queue up. False if it was already paused.
+        """
+        return await queueing.pause_queue(_redis(), queue)
+
+    async def resume_queue(self, queue: str) -> bool:
+        """Let workers take jobs from `queue` again. False if it wasn't paused."""
+        return await queueing.resume_queue(_redis(), queue)
+
     def __repr__(self) -> str:
         return f"<PyTaskQ {self.name!r} tasks={sorted(self.TASKS)}>"
+
+
+_RATE_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*/\s*(\d*(?:\.\d+)?)\s*"
+                      r"(s|sec|secs|second|seconds|m|min|mins|minute|minutes|h|hr|hour|hours)\s*$", re.I)
+_RATE_UNITS = {"s": 1, "m": 60, "h": 3600}
+
+
+def parse_rate_limit(text: str) -> float:
+    """
+    Seconds between two starts for a rate limit like "10/s", "100/m", "1000/h"
+    or "5/10s" (5 every 10 seconds). Raises ValueError otherwise.
+    """
+    m = _RATE_RE.match(text) if isinstance(text, str) else None
+    if not m:
+        raise ValueError(f"rate_limit {text!r} isn't valid: use a count per second, minute or hour, "
+                         f"like '10/s', '100/m' or '1000/h'")
+    count, every, unit = float(m.group(1)), float(m.group(2) or 1), m.group(3)[0].lower()
+    if count <= 0 or every <= 0:
+        raise ValueError(f"rate_limit {text!r} must allow at least some jobs")
+    return every * _RATE_UNITS[unit] / count
 
 
 def _check_time_zone(name: str) -> None:

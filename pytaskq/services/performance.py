@@ -11,8 +11,9 @@ never change anything by themselves.
 from __future__ import annotations
 
 import os
+import time
 
-from pytaskq.core import pressure, queueing, redis_client
+from pytaskq.core import pressure, queueing, redis_client, redis_health
 from pytaskq.core.config import settings
 
 WINDOW_MINUTES = 15
@@ -163,13 +164,31 @@ async def build_report(workers: list[dict]) -> dict:
     cores = os.cpu_count() or 1
     processes = api_processes()
     live = [w for w in workers if w.get("status") != "dead"]
+    mem = await redis_health.memory(r)
+    found = suggestions(
+        turned_away=turned_away, workers=workers, queues=overview["queues"],
+        cores=cores, processes=processes, pool_max=pool["max_connections"],
+    )
+    found = await _redis_suggestions(r, mem, turned_away) + found
+    from pytaskq.core import fleet
+    found += [_suggest(p["level"], p["title"], p["detail"]) for p in fleet.compare(live)]
+    found += await _missed_cron(r)
+    try:
+        kept = await redis_health.retention(r)
+    except Exception:
+        kept = {}
+    if any(x["level"] != "ok" for x in found):
+        found = [x for x in found if x["level"] != "ok"]
     return {
         "window_minutes": WINDOW_MINUTES,
+        "redis_memory": mem,
+        "finished_jobs": kept,
         "turned_away": {
             "queue_full": turned_away.get("queue_full", 0),
             "redis_busy": turned_away.get("redis_busy", 0),
             "redis_down": turned_away.get("redis_down", 0),
             "handed_back": turned_away.get("handed_back", 0),
+            "redis_full": turned_away.get("redis_full", 0),
         },
         "api": {
             "processes": processes,
@@ -184,8 +203,78 @@ async def build_report(workers: list[dict]) -> dict:
             "slots": sum((w.get("cpu_workers") or 0) + (w.get("io_workers") or 0) for w in live),
             "running": sum(w.get("active") or 0 for w in live),
         },
-        "suggestions": suggestions(
-            turned_away=turned_away, workers=workers, queues=overview["queues"],
-            cores=cores, processes=processes, pool_max=pool["max_connections"],
-        ),
+        "suggestions": found,
     }
+
+
+async def _missed_cron(r) -> list[dict]:
+    """Cron runs missed in the last week because no worker was running the schedule."""
+    from pytaskq.core.keys import k as rkey
+    try:
+        missed = await r.hgetall(rkey("pytaskq:cron:missed"))
+    except Exception:
+        return []
+    out = []
+    for name, count in missed.items():
+        if name.endswith(":at"):
+            continue
+        try:
+            at = float(missed.get(f"{name}:at") or 0)
+        except ValueError:
+            at = 0
+        if not at or time.time() - at > 7 * 86400:
+            continue
+        out.append(_suggest(
+            "warning", f"Scheduled task {name} missed {int(count):,} run(s)",
+            f"Last noticed {time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime(at))}. No worker was running the "
+            f"schedule when they were due (all workers stopped, or Redis was down). The latest missed run was "
+            f"run late unless the task has catch_up=False. Keep at least one worker running, or run two so one "
+            f"can take over.",
+        ))
+    return out
+
+
+async def _redis_suggestions(r, mem: dict, turned_away: dict) -> list[dict]:
+    """Problems with Redis itself: set up to delete keys, (nearly) full, or its data was lost."""
+    out = [_suggest(p["level"], p["title"], p["detail"]) for p in redis_health.problems(mem)]
+    if not any("full" in x["title"] for x in out):
+        try:
+            ret = await redis_health.retention(r)
+        except Exception:
+            ret = {}
+        out += [_suggest(p["level"], p["title"], p["detail"]) for p in redis_health.retention_problems(mem, ret)]
+    full = turned_away.get("redis_full", 0)
+    if full and not any("full" in x["title"] for x in out):
+        out.append(_suggest(
+            "critical", f"{full:,} requests were refused because Redis was full (last {WINDOW_MINUTES} min)",
+            "Redis reached `maxmemory`. Workers keep taking and finishing waiting jobs, which frees memory; raise "
+            "`maxmemory` or add workers if it happens again.",
+        ))
+    wanted = max(0, int(settings.REDIS_WAIT_REPLICAS or 0))
+    if wanted:
+        try:
+            info = await r.info("replication")
+            have = int(info.get("connected_slaves") or 0)
+        except Exception:
+            have = None
+        if have is not None and have < wanted:
+            out.append(_suggest(
+                "warning", f"REDIS_WAIT_REPLICAS is {wanted}, but Redis has {have} replica(s) connected",
+                f"Every new job waits up to REDIS_WAIT_TIMEOUT_MS ({settings.REDIS_WAIT_TIMEOUT_MS} ms) for replicas "
+                f"that aren't there, and isn't protected against losing the primary. Bring the replicas back "
+                f"(INFO replication on the primary), or lower REDIS_WAIT_REPLICAS.",
+            ))
+    try:
+        lost = await r.hget(redis_health.INSTALL_KEY, "data_lost_at")
+        lost_at = float(lost) if lost else 0
+    except Exception:
+        lost_at = 0
+    if lost_at and time.time() - lost_at < 7 * 86400:
+        out.append(_suggest(
+            "critical", f"Redis lost its data {time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime(lost_at))}",
+            "Every job, the history, dead letters, accounts and API tokens were gone at that moment: Redis was "
+            "restarted without its data volume, flushed, or it evicted keys. Check that Redis keeps its data "
+            "(a volume for /data, appendonly yes) and that maxmemory-policy is noeviction. With sign-in on, a new "
+            "setup code was printed in the dashboard's log.",
+        ))
+    return out
