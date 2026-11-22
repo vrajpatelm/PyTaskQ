@@ -481,18 +481,40 @@ return 0
 """
 
 
+# Ask the worker running a job to stop it. KEYS: task hash, cancel request   ARGV: who, now, ttl
+CANCEL_REQUEST_SCRIPT = """
+local status = redis.call('HGET', KEYS[1], 'status')
+if not status then return 'NotFound' end
+if status == 'Success' or status == 'Failed' or status == 'DeadLetter' or status == 'Cancelled' then
+    return status
+end
+redis.call('SET', KEYS[2], ARGV[1], 'EX', tonumber(ARGV[3]))
+redis.call('HSET', KEYS[1], 'cancel_requested_at', ARGV[2], 'cancel_requested_by', ARGV[1])
+redis.call('PUBLISH', '__PYTASKQ__events:global', 'update')
+return 'Stopping'
+"""
+CANCEL_REQUEST_TTL = 3600
+STOPPING = "Stopping"     # cancel() result: the job is running; its worker stops it within a second or two
+
+
 async def cancel(r, task_id: str, by: Optional[str] = None) -> tuple[bool, str]:
     """
-    Cancel a task that has not started yet. Returns (cancelled, status).
-    Running or finished tasks cannot be cancelled.
+    Cancel a job. Returns (accepted, status):
+
+      (True, "Cancelled")   it was waiting (queued, scheduled, awaiting a retry) and won't run
+      (True, "Stopping")    it's running: its worker stops it within about a second, then it
+                            shows as Cancelled (see pytaskq.cancelled() for IO tasks)
+      (False, status)       it already finished (or "NotFound")
     """
     meta = await r.hgetall(task_key(task_id))
     if not meta:
         return False, "NotFound"
     status = meta.get("status", "")
     payload = meta.get("payload")
-    if status in FINAL_STATES or status == PROCESSING or not payload:
+    if status in FINAL_STATES:
         return False, status
+    if status == PROCESSING or not payload:
+        return await _request_stop(r, task_id, by)
     ok = await r.eval(
         CANCEL_SCRIPT, 6,
         *queue_keys(payload_queue(meta)), rkey("delayed_tasks"), task_key(task_id), FINISHED_KEY,
@@ -503,8 +525,14 @@ async def cancel(r, task_id: str, by: Optional[str] = None) -> tuple[bool, str]:
             await r.hset(task_key(task_id), "cancelled_by", by)
         await r.publish(EVENTS_CHANNEL, "update")
         return True, CANCELLED
-    # Payload was picked up between the read and the script — report fresh state
-    return False, (await r.hget(task_key(task_id), "status")) or status
+    # Not on its queue any more: a worker took it just now. Ask that worker to stop it.
+    return await _request_stop(r, task_id, by)
+
+
+async def _request_stop(r, task_id: str, by: Optional[str]) -> tuple[bool, str]:
+    outcome = await r.eval(CANCEL_REQUEST_SCRIPT, 2, task_key(task_id), rkey(f"cancel:{task_id}"),
+                           by or "app", str(clock.now()), CANCEL_REQUEST_TTL)
+    return (True, STOPPING) if outcome == STOPPING else (False, outcome)
 
 
 def _reject_constant(name):

@@ -44,7 +44,7 @@ export const STATUS = {
 };
 
 export const FINAL = new Set(['Success', 'Failed', 'DeadLetter', 'Cancelled']);
-export const CANCELLABLE = new Set(['Queued', 'Scheduled', 'RetryScheduled']);
+export const CANCELLABLE = new Set(['Queued', 'Scheduled', 'RetryScheduled', 'Processing']);
 
 export function timeAgo(ts) {
   if (!ts) return '—';

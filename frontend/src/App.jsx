@@ -402,7 +402,11 @@ function TaskDrawer({ taskId, onClose, notify, refreshKey, canOperate }) {
 
   const cancel = async () => {
     setBusy(true);
-    try { await api(`/task/${taskId}/cancel`, { method: 'POST' }); notify('success', 'Job cancelled.'); load(); }
+    try {
+      const res = await api(`/task/${taskId}/cancel`, { method: 'POST' });
+      notify('success', res?.stopping ? 'Stopping the job. Its worker stops it within a second or two.' : 'Job cancelled.');
+      load();
+    }
     catch (e) { notify('error', e.message); }
     finally { setBusy(false); }
   };
@@ -454,8 +458,8 @@ function TaskDrawer({ taskId, onClose, notify, refreshKey, canOperate }) {
             <div className="drawer-actions">
               <CopyButton text={taskId} />
               {canOperate && CANCELLABLE.has(task.status) && (
-                <button className="btn btn-danger btn-sm" onClick={cancel} disabled={busy}>
-                  <Ban size={14} /> Cancel job
+                <button className="btn btn-danger btn-sm" onClick={cancel} disabled={busy || !!task.cancel_requested_at}>
+                  <Ban size={14} /> {task.status === 'Processing' ? (task.cancel_requested_at ? 'Stopping…' : 'Stop job') : 'Cancel job'}
                 </button>
               )}
             </div>

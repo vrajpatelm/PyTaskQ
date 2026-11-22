@@ -106,6 +106,10 @@ CONCURRENCY = CPU_WORKERS + IO_WORKERS
 REDIS_DOWN = (redis_errors.ConnectionError, redis_errors.TimeoutError, ConnectionError, OSError)
 
 
+class JobCancelled(Exception):
+    """Someone cancelled the job while this worker was running it."""
+
+
 class UnknownTaskError(Exception):
     """Raised when a payload names a task this worker does not know."""
 
@@ -372,6 +376,25 @@ if redis.call('LREM', KEYS[1], 1, ARGV[1]) == 0 then return 0 end
 redis.call('ZADD', KEYS[2], ARGV[3], ARGV[2])
 redis.call('HSET', KEYS[3], 'status', 'Queued', 'payload', ARGV[2], 'note', ARGV[4])
 redis.call('PERSIST', KEYS[3])
+return 1
+"""
+
+# A cancelled job stopped while running. KEYS: processing list, fence, task hash, finished set, cancel request
+# ARGV: payload as listed, fence token, retrying after a lost reply, task id, now, ttl, keep limit, task key
+# prefix, note, duration (ms)
+CANCELLED_RUN_SCRIPT = queueing.KEEP_LUA + """
+local removed = redis.call('LREM', KEYS[1], 1, ARGV[1])
+if removed == 0 and ARGV[3] == '1' then return -1 end
+local current = redis.call('GET', KEYS[2])
+if current and current ~= ARGV[2] then return 0 end
+local by = redis.call('GET', KEYS[5])
+redis.call('HSET', KEYS[3], 'status', 'Cancelled', 'finished_at', ARGV[5], 'note', ARGV[9], 'error', '',
+           'duration_ms', ARGV[10])
+if by then redis.call('HSET', KEYS[3], 'cancelled_by', by) end
+redis.call('EXPIRE', KEYS[3], tonumber(ARGV[6]))
+pytaskq_keep(KEYS[4], ARGV[4], ARGV[5], tonumber(ARGV[7]), ARGV[8])
+redis.call('DEL', KEYS[5])
+redis.call('PUBLISH', '__PYTASKQ__events:global', 'update')
 return 1
 """
 
@@ -1228,7 +1251,85 @@ def _renew_leases(c, now: float) -> None:
     pipe.execute()
 
 
-_jobs: dict[str, context.Job] = {}     # task id → the context of each job running here
+_jobs: dict[str, context.Job] = {}     # task id → the context of each job this worker has popped
+CANCEL_CHECK = 1.0                     # seconds between two checks for cancel requests of running jobs
+
+
+def cancel_key(task_id: str) -> str:
+    """Set by the API when someone cancels a job that a worker is running (expires after an hour)."""
+    return rkey(f"cancel:{task_id}")
+
+
+async def _stoppable(execute, ctx: context.Job):
+    """
+    Run a job's coroutine so that a cancel request can stop it: an async task
+    is cancelled, a CPU task's process is stopped and replaced, an IO task's
+    thread is left to finish on its own (Python can't stop a thread; its
+    `cancelled()` returns True from now on) and its result ignored.
+    """
+    job = asyncio.ensure_future(execute)
+    ctx.stop = job.cancel
+    if ctx.cancel.is_set():
+        job.cancel()
+    try:
+        await asyncio.wait({job})
+    except asyncio.CancelledError:      # the worker is stopping: the job goes back on its queue
+        job.cancel()
+        await asyncio.gather(job, return_exceptions=True)
+        raise
+    finally:
+        ctx.stop = None
+    if job.cancelled():
+        if ctx.cancel.is_set():
+            raise JobCancelled()
+        raise RuntimeError("The task was cancelled from inside (asyncio.CancelledError).")
+    return job.result()
+
+
+async def _record_cancelled(r, tasks, task_json, started_at) -> None:
+    task_id = tasks.task_id
+    finished_at = clock.now()
+    duration = repr(round((finished_at - started_at) * 1000, 1)) if started_at else ""
+    note = "Stopped while running: someone cancelled it." if started_at else "Cancelled before it started."
+
+    async def save(attempt):
+        return int(await r.eval(
+            CANCELLED_RUN_SCRIPT, 5,
+            _processing_key(), rkey(f"fence:{task_id}"), queueing.task_key(task_id), queueing.FINISHED_KEY,
+            cancel_key(task_id),
+            task_json, str(tasks.fence_token), "1" if attempt else "0", task_id, repr(finished_at),
+            int(settings.RESULT_TTL), *queueing.keep_args(), note, duration,
+        ))
+    if await _with_retries(save, "record a cancelled job", task_id) != 0:
+        logger.info(f"Task {task_id} ({tasks.task_name}) cancelled{' while running' if started_at else ''}.")
+
+
+async def _check_cancel_requests() -> int:
+    """Stop running jobs that someone cancelled (one MGET, only while jobs are running here)."""
+    ids = [t for t, ctx in list(_jobs.items()) if not ctx.cancel.is_set()]
+    if not ids:
+        return 0
+    found = await redis_client.r.mget([cancel_key(t) for t in ids])
+    stopped = 0
+    for task_id, by in zip(ids, found):
+        ctx = _jobs.get(task_id)
+        if by is None or ctx is None:
+            continue
+        ctx.cancel.set()
+        stopped += 1
+        logger.info(f"Cancel requested for running task {task_id} (by {by}); stopping it.")
+        if ctx.stop is not None:
+            ctx.stop()
+    return stopped
+
+
+async def _cancel_watcher():
+    while True:
+        await asyncio.sleep(CANCEL_CHECK)
+        try:
+            await _check_cancel_requests()
+        except Exception as e:
+            logger.debug(f"[Cancel] Couldn't check for cancel requests ({e})")
 _progress = context.Latest()           # the newest progress() of each running job, not yet written
 PROGRESS_EVERY = 1.0                   # seconds between two progress writes
 
@@ -1270,7 +1371,7 @@ async def _leave_for_other_workers(r, tasks, task_json) -> None:
     names = sorted({name for _, name, _ in io_pool.stuck.values()}) if io_pool else []
     await _with_retries(
         lambda _: _put_back(r, WORKER_ID, task_json,
-                            f"Put back by worker {WORKER_ID}: all its IO threads are busy with timed-out tasks.",
+                            f"Put back by worker {WORKER_ID}: all its IO threads are busy with timed-out or cancelled tasks.",
                             side="back"),
         "put a job back", tasks.task_id)
     _pause_popping_until = time.monotonic() + 1.0
@@ -1278,6 +1379,7 @@ async def _leave_for_other_workers(r, tasks, task_json) -> None:
         _last_stuck_warning = time.monotonic()
         logger.error(
             f"[IO pool] All {io_pool.size if io_pool else '?'} IO threads are still running tasks that timed out "
+            f"or were cancelled "
             f"({', '.join(names) or 'unknown'}); Python can't stop them. IO jobs are left for other workers until "
             f"one finishes. Give the network calls in these tasks their own timeouts, or restart this worker."
         )
@@ -1348,6 +1450,7 @@ async def handle_task(task_json, sem, loop, process_pool, thread_pool):
                                 "move an invalid job to dead letters")
             return
         _running[tasks.task_id] = tasks.task_name
+        _jobs[tasks.task_id] = context.Job(tasks.task_id, _progress.put)
         try:
             await _run(r, tasks, task_json, process_pool, thread_pool)
         finally:
@@ -1419,10 +1522,10 @@ async def _run(r, tasks, task_json, process_pool, thread_pool) -> None:
             func = entry["handler"]
             task_type = entry.get("type", "cpu")
             args, kwargs = tasks.args, tasks.kwargs
-            ctx = _jobs[task_id] = context.Job(task_id, _progress.put)
+            ctx = _jobs.get(task_id) or context.Job(task_id, _progress.put)
 
             if inspect.iscoroutinefunction(func):
-                result = await _run_async(func, args, kwargs, timeout, task_id, tasks.task_name, started, ctx)
+                execute = _run_async(func, args, kwargs, timeout, task_id, tasks.task_name, started, ctx)
             else:
                 pool = _pool_for(task_type, process_pool, thread_pool)
                 if isinstance(pool, IoPool) and pool.all_stuck:
@@ -1430,10 +1533,16 @@ async def _run(r, tasks, task_json, process_pool, thread_pool) -> None:
                     span.set_attribute("task.status", "PutBack")
                     return
                 if isinstance(pool, IoPool):
-                    result = await pool.execute(func, args, kwargs, timeout, started, (task_id, tasks.task_name),
-                                                job=ctx)
+                    execute = pool.execute(func, args, kwargs, timeout, started, (task_id, tasks.task_name),
+                                           job=ctx)
                 else:
-                    result = await pool.execute(func, args, kwargs, timeout, started, job=ctx)
+                    execute = pool.execute(func, args, kwargs, timeout, started, job=ctx)
+            result = await _stoppable(execute, ctx)
+
+        except JobCancelled:
+            await _record_cancelled(r, tasks, task_json, started_at)
+            span.set_attribute("task.status", "Cancelled")
+            return
 
         except PoolBroken as e:
             # Not the job's fault: leave it for a healthy worker. This worker is stopping.
@@ -1747,6 +1856,7 @@ async def consumer_task():
         asyncio.create_task(_loop_ticker()),
         asyncio.create_task(_periodic()),
         asyncio.create_task(_progress_writer()),
+        asyncio.create_task(_cancel_watcher()),
     ]
     if cpu_pool is not None:
         background.append(asyncio.create_task(_watch_cpu_pool(cpu_pool)))

@@ -1,7 +1,7 @@
 import logging
 from typing import Any, Dict, List, Literal, Optional
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Query
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Response
 from pydantic import BaseModel, Field
 
 from pytaskq.app import argument_error
@@ -125,9 +125,18 @@ async def task_result_display(task_id: str):
 
 
 @router.post("/{task_id}/cancel")
-async def cancel_task(task_id: str, user: auth.User = Depends(require("operator"))):
-    """Cancel a task that is still waiting (queued, scheduled or awaiting retry)."""
+async def cancel_task(task_id: str, response: Response, user: auth.User = Depends(require("operator"))):
+    """Cancel a job.
+
+    A waiting job (queued, scheduled, awaiting a retry) is cancelled at once (200).
+    A running job is stopped by its worker within about a second (202, `"stopping": true`),
+    then shows as Cancelled: async tasks are cancelled, CPU tasks' processes are
+    stopped, IO tasks are told through `pytaskq.cancelled()` and their result is ignored.
+    """
     ok, status = await queueing.cancel(redis_client.r, task_id, by=user.username)
+    if ok and status == queueing.STOPPING:
+        response.status_code = 202
+        return {"task_id": task_id, "status": queueing.PROCESSING, "cancelled": False, "stopping": True}
     if ok:
         return {"task_id": task_id, "status": status, "cancelled": True}
     if status == "NotFound":

@@ -121,20 +121,24 @@ async def test_cancel_queued_and_scheduled(client, r):
     assert (await client.post(f"/task/{a}/cancel")).status_code == 409
 
 
-async def test_cancel_running_task_is_409(client, r):
+async def test_cancel_running_task_asks_its_worker_to_stop_it(client, r):
+    """Since 0.5: a running job can be cancelled; its worker stops it (tested in test_v050.py)."""
     tid = (await client.post("/task/enqueue", json={"task_name": "x"})).json()["task_id"]
     await r.hset(f"task:{tid}", "status", "Processing")
     res = await client.post(f"/task/{tid}/cancel")
-    assert res.status_code == 409
-    assert "Processing" in res.json()["detail"]
+    assert res.status_code == 202 and res.json()["stopping"] is True
+    assert await r.get(f"cancel:{tid}") and await r.hget(f"task:{tid}", "cancel_requested_at")
+    await r.hset(f"task:{tid}", "status", "Success")
+    res = await client.post(f"/task/{tid}/cancel")
+    assert res.status_code == 409 and "Success" in res.json()["detail"]
 
 
 async def test_cancel_after_worker_popped_it(client, r):
-    """Race: the payload left the queue just before cancel → refuse, and the job is still counted."""
+    """Race: the payload left the queue just before cancel → the worker is asked to stop it."""
     tid = (await client.post("/task/enqueue", json={"task_name": "x"})).json()["task_id"]
     await r.rpoplpush("queue:default", "processing_queue:w")
     res = await client.post(f"/task/{tid}/cancel")
-    assert res.status_code == 409
+    assert res.status_code == 202
     await r.zadd("active_workers", {"w": time.time() + 30})
     m = (await client.get("/metrics")).json()
     assert (m["pending"], m["processing"]) == (0, 1), "running on worker w, not waiting"

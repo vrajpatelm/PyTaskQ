@@ -362,7 +362,11 @@ class PyTaskQ:
             delay = min(delay * 1.5, poll_interval)
 
     async def cancel(self, task_id: str) -> bool:
-        """Cancel a task that has not started yet."""
+        """
+        Cancel a job. A waiting job won't run; a running one is stopped by its
+        worker within about a second (then its status is Cancelled). False if
+        it already finished or doesn't exist.
+        """
         ok, _ = await queueing.cancel(_redis(), task_id)
         return ok
 

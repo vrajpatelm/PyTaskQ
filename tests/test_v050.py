@@ -743,3 +743,151 @@ async def test_7c_a_retry_starts_from_zero(r):
                                      "progress_at": "1"})
     await r.eval(worker.STARTED_SCRIPT, 1, "task:f1", "status", "Processing")
     assert await r.hmget("task:f1", "progress", "progress_message", "progress_at") == [None, None, None]
+
+
+# ── 7d. cancelling running jobs ──────────────────────────────────────────────
+
+async def _cancel(client, task_id):
+    res = await client.post(f"/task/{task_id}/cancel")
+    assert res.status_code == 202, res.text
+    return await worker._check_cancel_requests()
+
+
+async def _cancelled_properly(r, task_id):
+    info = await r.hgetall(f"task:{task_id}")
+    assert info["status"] == "Cancelled", info
+    assert info["cancelled_by"] and "cancelled" in info["note"].lower()
+    assert await r.llen(worker._processing_key()) == 0
+    assert await r.zscore(queueing.FINISHED_KEY, task_id) is not None
+    assert not await r.exists(f"cancel:{task_id}")
+    return info
+
+
+async def test_7d_a_running_async_job_is_cancelled(env, client):
+    r = env
+    seen = []
+
+    async def slow():
+        try:
+            await asyncio.sleep(30)
+        except asyncio.CancelledError:
+            seen.append("cancelled")
+            raise
+
+    tasks = {"slow": {"handler": slow, "type": "async", "max_retries": 3}}
+    await queueing.enqueue(r, queueing.new_payload("slow", [], task_id="a1"))
+    _, job = await _start(r, tasks)
+    assert await _cancel(client, "a1") == 1
+    await asyncio.wait_for(job, 2)
+    info = await _cancelled_properly(r, "a1")
+    assert seen == ["cancelled"] and info["note"].startswith("Stopped while running")
+    assert info.get("retry_count", "0") == "0" and not await r.zcard("delayed_tasks"), "no retry"
+
+
+async def test_7d_a_running_cpu_job_has_its_process_stopped(env, client, cpu_pool):
+    r = env
+    from tests import v050_tasks
+    pool = await cpu_pool(1)
+    before = {c.pid for c in pool._children} if hasattr(pool, "_children") else None
+    tasks = {"spin": {"handler": v050_tasks.spin, "type": "cpu", "max_retries": 0}}
+    await queueing.enqueue(r, queueing.new_payload("spin", [30], task_id="c1"))
+    raw = await pop(r)
+    sem = asyncio.Semaphore(1)
+    await sem.acquire()
+
+    async def go():
+        with patch.object(worker, "TASKS", tasks):
+            await worker.handle_task(raw, sem, asyncio.get_running_loop(), pool, ThreadPoolExecutor(2))
+    job = asyncio.create_task(go())
+    await asyncio.sleep(0.5)
+    began = time.monotonic()
+    assert await _cancel(client, "c1") == 1
+    await asyncio.wait_for(job, 5)
+    assert time.monotonic() - began < 3, "stopped, not left to run for 30 s"
+    await _cancelled_properly(r, "c1")
+    # The pool gets a fresh process and keeps working.
+    tasks["steps"] = {"handler": v050_tasks.steps, "type": "cpu", "max_retries": 0}
+    await queueing.enqueue(r, queueing.new_payload("steps", [1, 0], task_id="c2"))
+    raw = await pop(r)
+    await sem.acquire()
+    with patch.object(worker, "TASKS", tasks):
+        await worker.handle_task(raw, sem, asyncio.get_running_loop(), pool, ThreadPoolExecutor(2))
+    assert await r.hget("task:c2", "status") == "Success"
+    if before is not None:
+        assert before.isdisjoint({c.pid for c in pool._children})
+
+
+async def test_7d_io_jobs_are_told_through_cancelled_and_their_result_is_ignored(env, client):
+    r = env
+    from tests import v050_tasks
+    from pytaskq.pools import IoPool
+    io = IoPool(2)
+    tasks = {"polite": {"handler": v050_tasks.polite, "type": "io", "max_retries": 0},
+             "spin": {"handler": v050_tasks.spin, "type": "io", "max_retries": 0}}
+    await queueing.enqueue(r, queueing.new_payload("polite", [30], task_id="i1"))
+    await queueing.enqueue(r, queueing.new_payload("spin", [1.0], task_id="i2"))
+    for _ in range(2):
+        raw = await pop(r)
+        sem = asyncio.Semaphore(1)
+        await sem.acquire()
+
+        async def go(raw=raw, sem=sem):
+            with patch.object(worker, "TASKS", tasks):
+                await worker.handle_task(raw, sem, asyncio.get_running_loop(), None, io)
+        asyncio.create_task(go())
+    await asyncio.sleep(0.2)
+    assert await _cancel(client, "i1") == 1
+    assert await _cancel(client, "i2") == 1
+    await asyncio.sleep(0.2)
+    for tid in ("i1", "i2"):
+        await _cancelled_properly(r, tid)
+    assert len(io.stuck) >= 1, "a thread that ignores cancelled() keeps its slot until it returns"
+    await asyncio.sleep(1.2)
+    assert len(io.stuck) == 0
+    for tid in ("i1", "i2"):
+        assert await r.hget(f"task:{tid}", "status") == "Cancelled", "its late result isn't saved"
+    io.close()
+
+
+async def test_7d_a_job_cancelled_just_after_a_worker_took_it_never_starts(env, client):
+    r = env
+    ran = []
+    tasks = {"ok": {"handler": lambda: ran.append(1), "type": "io", "max_retries": 0}}
+    await queueing.enqueue(r, queueing.new_payload("ok", [], task_id="q1"))
+    raw = await pop(r)                                  # taken, not started yet
+    res = await client.post("/task/q1/cancel")
+    assert res.status_code == 202
+    # The worker noticed the request while the job waited for a free thread or process.
+    from pytaskq.context import Job
+    ctx = worker._jobs["q1"] = Job("q1", worker._progress.put)
+    assert await worker._check_cancel_requests() == 1 and ctx.cancel.is_set()
+    sem = asyncio.Semaphore(1)
+    await sem.acquire()
+    with patch.object(worker, "TASKS", tasks), patch.object(worker.context, "Job", lambda *a, **k: ctx):
+        await worker.handle_task(raw, sem, asyncio.get_running_loop(), None, ThreadPoolExecutor(1))
+    info = await _cancelled_properly(r, "q1")
+    assert ran == [] and info["note"] == "Cancelled before it started."
+
+
+async def test_7d_stopping_the_worker_still_puts_jobs_back(env):
+    r = env
+    tasks = {"slow": {"handler": lambda: time.sleep(0.3), "type": "io", "max_retries": 0}}
+    await queueing.enqueue(r, queueing.new_payload("slow", [], task_id="s1"))
+    _, job = await _start(r, tasks)
+    job.cancel()                                         # the shutdown grace period ran out
+    await asyncio.gather(job, return_exceptions=True)
+    assert await r.hget("task:s1", "status") == "Processing", "not marked Cancelled"
+    assert await r.llen(worker._processing_key()) == 1, "stays listed, so it's put back"
+
+
+async def test_7d_finished_jobs_cant_be_cancelled_and_app_cancel_reports_it(env):
+    r = env
+    q = PyTaskQ()
+    await queueing.enqueue(r, queueing.new_payload("ok", [], task_id="d1"))
+    await run_one(r, OK)
+    with patch("pytaskq.app._redis", lambda: r):
+        assert await q.cancel("d1") is False
+        await queueing.enqueue(r, queueing.new_payload("ok", [], task_id="d2"))
+        await pop(r)
+        await r.hset("task:d2", "status", "Processing")
+        assert await q.cancel("d2") is True
