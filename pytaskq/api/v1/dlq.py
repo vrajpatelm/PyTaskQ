@@ -35,6 +35,7 @@ if ARGV[3] ~= '' then
                'priority', ARGV[5], 'queue', ARGV[8], 'retry_count', 0, 'payload', ARGV[2], 'error', '',
                'note', ARGV[6])
     redis.call('PERSIST', KEYS[3])
+    redis.call('ZREM', KEYS[4], ARGV[3])     -- running again: not a finished job any more
 end
 return 1
 """
@@ -86,8 +87,8 @@ async def _replay(raw: str, task: dict) -> bool:
     note = f"Replayed from dead letters at {time.strftime('%Y-%m-%d %H:%M:%S')}"
     queue = queueing.payload_queue(task)
     done = await redis_client.r.eval(
-        REPLAY_SCRIPT, 3,
-        DLQ_KEY, queueing.queue_key(priority, queue), queueing.task_key(task_id),
+        REPLAY_SCRIPT, 4,
+        DLQ_KEY, queueing.queue_key(priority, queue), queueing.task_key(task_id), queueing.FINISHED_KEY,
         raw, json.dumps(task), task_id, task.get("task_name", ""), priority, note, int(settings.RESULT_TTL),
         queue,
     )

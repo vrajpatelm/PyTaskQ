@@ -170,11 +170,16 @@ async def build_report(workers: list[dict]) -> dict:
         cores=cores, processes=processes, pool_max=pool["max_connections"],
     )
     found = await _redis_suggestions(r, mem, turned_away) + found
+    try:
+        kept = await redis_health.retention(r)
+    except Exception:
+        kept = {}
     if any(x["level"] != "ok" for x in found):
         found = [x for x in found if x["level"] != "ok"]
     return {
         "window_minutes": WINDOW_MINUTES,
         "redis_memory": mem,
+        "finished_jobs": kept,
         "turned_away": {
             "queue_full": turned_away.get("queue_full", 0),
             "redis_busy": turned_away.get("redis_busy", 0),
@@ -202,6 +207,12 @@ async def build_report(workers: list[dict]) -> dict:
 async def _redis_suggestions(r, mem: dict, turned_away: dict) -> list[dict]:
     """Problems with Redis itself: set up to delete keys, (nearly) full, or its data was lost."""
     out = [_suggest(p["level"], p["title"], p["detail"]) for p in redis_health.problems(mem)]
+    if not any("full" in x["title"] for x in out):
+        try:
+            ret = await redis_health.retention(r)
+        except Exception:
+            ret = {}
+        out += [_suggest(p["level"], p["title"], p["detail"]) for p in redis_health.retention_problems(mem, ret)]
     full = turned_away.get("redis_full", 0)
     if full and not any("full" in x["title"] for x in out):
         out.append(_suggest(

@@ -25,6 +25,7 @@ class Settings(BaseSettings):
     TASK_TIMEOUT: float = 300          # default per-task timeout (seconds, 0 = none)
     MAX_RETRIES: int = 3               # default retries before a task is dead-lettered
     RESULT_TTL: int = 86400            # how long a FINISHED job's status/result is kept (seconds)
+    FINISHED_JOBS_KEPT: int = 50_000   # at most this many finished jobs are kept (the oldest go first); 0 = no cap
     HISTORY_LIMIT: int = 500           # how many recent tasks the dashboard can list
     MAX_RESULT_BYTES: int = 1_000_000  # larger results aren't stored (the job still succeeds); 0 = no limit
     MAX_PAYLOAD_BYTES: int = 1_000_000 # larger jobs (arguments) are refused: API 413, SDK ValueError; 0 = no limit

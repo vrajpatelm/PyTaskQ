@@ -224,11 +224,11 @@ return 0
 """
 
 # A job succeeded: save the result and take it off this worker's processing list.
-# KEYS: processing list, fence, task hash, worker hash, completed counter
+# KEYS: processing list, fence, task hash, worker hash, completed counter, finished-jobs set
 # ARGV: payload, my fence token, strict (1 = a retry after a lost reply), task id, result,
-#       finished_at, duration_ms, result_dropped, result TTL
+#       finished_at, duration_ms, result_dropped, result TTL, jobs kept, task-key prefix
 # Returns 1 saved, 0 stale attempt (a newer one owns the job), -1 nothing to do (already done).
-COMPLETE_SCRIPT = """
+COMPLETE_SCRIPT = queueing.KEEP_LUA + """
 local removed = redis.call('LREM', KEYS[1], 1, ARGV[1])
 if removed == 0 and ARGV[3] == '1' then return -1 end
 local current = redis.call('GET', KEYS[2])
@@ -244,6 +244,7 @@ else
     redis.call('HDEL', KEYS[3], 'result_dropped')
 end
 redis.call('EXPIRE', KEYS[3], tonumber(ARGV[9]))
+pytaskq_keep(KEYS[6], ARGV[4], ARGV[6], tonumber(ARGV[10]), ARGV[11])
 redis.call('INCR', KEYS[5])
 redis.call('HINCRBY', KEYS[4], 'processed', 1)
 redis.call('PUBLISH', 'events:global', 'update')
@@ -251,11 +252,12 @@ return 1
 """
 
 # A job failed: schedule its retry or dead-letter it, and take it off the processing list.
-# KEYS: processing list, fence, task hash, dlq or delayed set, worker hash, failed counter
+# KEYS: processing list, fence, task hash, dlq or delayed set, worker hash, failed counter, finished-jobs set
 # ARGV: payload, my fence token, strict, "dead" | "retry", dlq entry or retry payload, retry due time,
-#       hash TTL ("" = keep until finished), dead-letter limit, then task hash fields (name, value, …)
+#       hash TTL ("" = keep until finished), dead-letter limit, task id, now, jobs kept, task-key prefix,
+#       then task hash fields (name, value, …)
 # Returns 1 recorded, 2 recorded and old dead letters trimmed, 0 stale attempt, -1 already done.
-FAIL_SCRIPT = """
+FAIL_SCRIPT = queueing.KEEP_LUA + """
 local unpack = unpack or table.unpack
 local removed = redis.call('LREM', KEYS[1], 1, ARGV[1])
 if removed == 0 and ARGV[3] == '1' then return -1 end
@@ -277,11 +279,12 @@ if ARGV[4] == 'dead' then
 else
     redis.call('ZADD', KEYS[4], ARGV[6], ARGV[5])
 end
-redis.call('HSET', KEYS[3], unpack(ARGV, 9))
+redis.call('HSET', KEYS[3], unpack(ARGV, 13))
 if ARGV[7] == '' then
     redis.call('PERSIST', KEYS[3])
 else
     redis.call('EXPIRE', KEYS[3], tonumber(ARGV[7]))
+    pytaskq_keep(KEYS[7], ARGV[9], ARGV[10], tonumber(ARGV[11]), ARGV[12])
 end
 redis.call('PUBLISH', 'events:global', 'update')
 return 1 + trimmed
@@ -375,9 +378,10 @@ return {moved, full}
 
 # Something that isn't a valid job reached a queue or the delayed set: keep it
 # as a dead letter (so it can be looked at) instead of dropping it.
-# KEYS: source (list or delayed set), dlq, task hash, history, failed counter
-# ARGV: raw text, "list" | "zset", dead-letter entry, task id, error, time, result TTL, history limit, dlq limit
-INVALID_SCRIPT = """
+# KEYS: source (list or delayed set), dlq, task hash, history, failed counter, finished-jobs set
+# ARGV: raw text, "list" | "zset", dead-letter entry, task id, error, time, result TTL, history limit, dlq limit,
+#       jobs kept, task-key prefix
+INVALID_SCRIPT = queueing.KEEP_LUA + """
 local removed
 if ARGV[2] == 'zset' then
     removed = redis.call('ZREM', KEYS[1], ARGV[1])
@@ -391,6 +395,7 @@ if limit > 0 and redis.call('LLEN', KEYS[2]) > limit then redis.call('LTRIM', KE
 redis.call('HSET', KEYS[3], 'task_id', ARGV[4], 'task_name', '(invalid job)', 'status', 'DeadLetter',
            'queue', 'default', 'error', ARGV[5], 'created_at', ARGV[6], 'finished_at', ARGV[6])
 redis.call('EXPIRE', KEYS[3], tonumber(ARGV[7]))
+pytaskq_keep(KEYS[6], ARGV[4], ARGV[6], tonumber(ARGV[10]), ARGV[11])
 redis.call('LPUSH', KEYS[4], ARGV[4])
 redis.call('LTRIM', KEYS[4], 0, tonumber(ARGV[8]) - 1)
 redis.call('INCR', KEYS[5])
@@ -500,6 +505,9 @@ async def cron_scheduler():
         await asyncio.sleep(10)
 
 
+CRON_LOCK_TTL = 3 * 3600
+
+
 async def run_due_cron_jobs(now: float = None) -> int:
     """Queue every cron task whose latest tick was in the last minute (once per tick, fleet-wide).
 
@@ -527,7 +535,10 @@ async def run_due_cron_jobs(now: float = None) -> int:
             lock = f"cron_lock:{task_name}:{zone_name}:{prev_tick.strftime('%Y-%m-%dT%H:%M')}"
             queue = task_info.get("queue") or queueing.DEFAULT_QUEUE
             payload = queueing.new_payload(task_name, priority=task_info.get("priority") or "default", queue=queue)
-            if await queueing.enqueue(redis_client.r, payload, lock=lock, max_bytes=0) is not None:
+            # The lock only has to outlive the tick (and clocks going back an hour): 3 hours, not 30 days
+            # (an every-minute task used to leave 43,200 lock keys behind).
+            if await queueing.enqueue(redis_client.r, payload, lock=lock, lock_ttl=CRON_LOCK_TTL,
+                                      max_bytes=0) is not None:
                 queued += 1
                 logger.info(f"[Cron] Queued {task_name} for {prev_tick.isoformat()}")
         except Exception as e:
@@ -864,11 +875,11 @@ async def _dead_letter_invalid(r, raw: str, error: str, *, source: str) -> bool:
     if len(text) > INVALID_KEEP_BYTES:
         entry["raw_truncated_from"] = len(text)
     done = await r.eval(
-        INVALID_SCRIPT, 5,
-        source, "dlq", queueing.task_key(task_id), queueing.RECENT_KEY, "stats:failed",
+        INVALID_SCRIPT, 6,
+        source, "dlq", queueing.task_key(task_id), queueing.RECENT_KEY, "stats:failed", queueing.FINISHED_KEY,
         raw, "zset" if source == "delayed_tasks" else "list", json.dumps(entry), task_id,
         f"Invalid job: {error}", repr(now), int(settings.RESULT_TTL), max(1, settings.HISTORY_LIMIT),
-        max(0, settings.DLQ_LIMIT),
+        max(0, settings.DLQ_LIMIT), *queueing.keep_args(),
     )
     if done:
         logger.error(f"[Invalid job] Found in {source} and moved to dead letters as {task_id}: {error}")
@@ -922,11 +933,12 @@ async def _record_failure(r, tasks, task_json, task_id, error, max_retries) -> s
 
     async def save(attempt):
         return int(await r.eval(
-            FAIL_SCRIPT, 6,
+            FAIL_SCRIPT, 7,
             _processing_key(), f"fence:{task_id}", queueing.task_key(task_id), target,
-            f"worker:{WORKER_ID}", "stats:failed",
+            f"worker:{WORKER_ID}", "stats:failed", queueing.FINISHED_KEY,
             task_json, str(tasks.fence_token), "1" if attempt else "0", "dead" if dead else "retry",
-            entry, due, ttl, max(0, settings.DLQ_LIMIT), *flat,
+            entry, due, ttl, max(0, settings.DLQ_LIMIT), task_id, repr(finished_at), *queueing.keep_args(),
+            *flat,
         ))
 
     outcome = await _with_retries(save, "record a failure", task_id)
@@ -1186,11 +1198,11 @@ async def _run(r, tasks, task_json, process_pool, thread_pool) -> None:
 
         async def save(attempt):
             return int(await r.eval(
-                COMPLETE_SCRIPT, 5,
+                COMPLETE_SCRIPT, 6,
                 _processing_key(), f"fence:{task_id}", queueing.task_key(task_id),
-                f"worker:{WORKER_ID}", "stats:completed",
+                f"worker:{WORKER_ID}", "stats:completed", queueing.FINISHED_KEY,
                 task_json, str(tasks.fence_token), "1" if attempt else "0", task_id, encoded,
-                repr(finished_at), repr(duration_ms), dropped, int(settings.RESULT_TTL),
+                repr(finished_at), repr(duration_ms), dropped, int(settings.RESULT_TTL), *queueing.keep_args(),
             ))
 
         saved = await _with_retries(save, "save a result", task_id)

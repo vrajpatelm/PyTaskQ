@@ -71,7 +71,7 @@ def test_c1_scripts_that_drain_jobs_work_when_redis_is_full():
     # These already start with a write that needs no memory (LREM, ZREM, PERSIST).
     for name, first in (("COMPLETE_SCRIPT", "LREM"), ("FAIL_SCRIPT", "LREM"), ("PUT_BACK_SCRIPT", "LREM"),
                         ("HAND_BACK_SCRIPT", "LREM"), ("STARTED_SCRIPT", "PERSIST"), ("INVALID_SCRIPT", "REM")):
-        src = getattr(worker, name)
+        src = getattr(worker, name).replace(queueing.KEEP_LUA, "")   # a function definition; runs later
         writes = [w for w in ("'LREM'", "'ZREM'", "'PERSIST'", "'HSET'", "'ZADD'", "'LPUSH'", "'RPUSH'", "'SET'",
                               "'INCR'", "'SADD'") if w in src]
         firsts = sorted(writes, key=src.index)

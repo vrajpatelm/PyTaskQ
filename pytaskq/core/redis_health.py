@@ -149,3 +149,76 @@ def reset_marker_state() -> None:
     """For tests."""
     global _seen_marker
     _seen_marker = False
+
+
+# ── how much memory finished jobs will need ──────────────────────────────────
+
+AVG_RECORD_BYTES = 2300          # measured: a small finished job's record (used when MEMORY USAGE isn't available)
+RATE_WINDOW = 600                # seconds of finished jobs used to measure the current rate
+
+
+async def retention(r) -> dict:
+    """
+    Where memory for finished-job records is heading at the current rate.
+
+    Finished jobs are kept for RESULT_TTL, but at most FINISHED_JOBS_KEPT of
+    them, so their memory settles at min(rate × RESULT_TTL, FINISHED_JOBS_KEPT)
+    records. Comparing that with what's stored now says how much more memory
+    Redis will need, before it runs out instead of after.
+    """
+    from pytaskq.core import clock, queueing
+    from pytaskq.core.config import settings
+    now = clock.now()
+    async with r.pipeline(transaction=False) as pipe:
+        pipe.zcard(queueing.FINISHED_KEY)
+        pipe.zcount(queueing.FINISHED_KEY, now - RATE_WINDOW, "+inf")
+        pipe.zrevrange(queueing.FINISHED_KEY, 0, 9)
+        records, recent, sample = await pipe.execute()
+    sizes = []
+    for task_id in sample:
+        try:
+            size = await r.memory_usage(queueing.task_key(task_id))
+        except Exception:
+            break                                  # MEMORY USAGE not available (managed Redis, fakeredis)
+        if size:
+            sizes.append(int(size))
+    # MEMORY USAGE counts the record itself; its entry in the finished set, the history and the
+    # allocator's overhead roughly double it (measured: ~1.0 KB reported vs ~2.3 KB per job in total).
+    avg = round(sum(sizes) / len(sizes) * 2 + 100) if sizes else AVG_RECORD_BYTES
+    rate = recent / RATE_WINDOW
+    steady = rate * max(0, settings.RESULT_TTL)
+    cap = max(0, settings.FINISHED_JOBS_KEPT)
+    if cap:
+        steady = min(steady, cap)
+    return {
+        "finished_per_minute": round(rate * 60, 1),
+        "records": int(records),
+        "avg_record_bytes": avg,
+        "steady_records": int(steady),
+        "growth_bytes": int(max(0.0, steady - records) * avg),
+        "rate_bytes_per_second": rate * avg,
+        "cap": cap,
+    }
+
+
+def retention_problems(mem: dict, ret: dict) -> list[dict]:
+    """Warn when finished-job records will fill Redis at the current rate."""
+    limit, used = mem.get("max_bytes") or 0, mem.get("used_bytes") or 0
+    if not limit or not ret:
+        return []
+    projected = used + ret["growth_bytes"]
+    if projected < limit * MEMORY_WARN_RATIO:
+        return []
+    when = ""
+    if ret["rate_bytes_per_second"] > 0 and ret["growth_bytes"] > 0 and used < limit:
+        seconds = (limit - used) / ret["rate_bytes_per_second"]
+        when = (f" in about {seconds / 60:.0f} minutes" if seconds < 7200 else f" in about {seconds / 3600:.0f} hours")
+    return [{
+        "level": "critical" if projected >= limit else "warning",
+        "title": f"Redis will be full{when} at the current rate",
+        "detail": (f"{ret['finished_per_minute']:,.0f} jobs finish per minute and each finished job is kept "
+                   f"(about {ret['avg_record_bytes']:,} bytes) for RESULT_TTL, up to FINISHED_JOBS_KEPT "
+                   f"({ret['cap']:,}) jobs: that settles at about {_mb(ret['steady_records'] * ret['avg_record_bytes'])}, "
+                   f"and Redis's limit is {_mb(limit)} ({_mb(used)} used now). Lower FINISHED_JOBS_KEPT or "
+                   f"RESULT_TTL, or raise maxmemory."),
+    }]

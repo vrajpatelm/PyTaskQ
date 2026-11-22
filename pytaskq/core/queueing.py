@@ -174,6 +174,33 @@ class TooManyQueues(ValueError):
 
 FINAL_STATUSES = ("Success", "DeadLetter", "Cancelled", "Failed")
 
+# Every finished job (succeeded, dead-lettered, cancelled, invalid) is listed here
+# by finish time. Records are kept for RESULT_TTL, but never more than
+# FINISHED_JOBS_KEPT of them: the oldest are deleted first. Without the cap,
+# Redis memory grew with jobs-per-second × RESULT_TTL (about 2.3 KB per job, so
+# a day of 140 jobs/s needed 27 GB). The set also gives the job history its
+# time order (searching finished jobs).
+FINISHED_KEY = "pytaskq:finished"
+
+# Lua: list a finished job and delete the oldest records beyond the cap.
+KEEP_LUA = """
+local function pytaskq_keep(zkey, id, now, limit, task_prefix)
+    redis.call('ZADD', zkey, now, id)
+    if limit > 0 then
+        local extra = redis.call('ZCARD', zkey) - limit
+        if extra > 0 then
+            local old = redis.call('ZPOPMIN', zkey, extra)
+            for i = 1, #old, 2 do redis.call('DEL', task_prefix .. old[i]) end
+        end
+    end
+end
+"""
+
+
+def keep_args() -> list:
+    """The ARGV values KEEP_LUA needs besides the id and time: the cap and the task-key prefix."""
+    return [max(0, int(settings.FINISHED_JOBS_KEPT)), task_key("")]
+
 
 class QueueFull(Exception):
     """The queue already holds QUEUE_CAPACITY jobs (only callers that ask for a capacity check get this)."""
@@ -277,7 +304,8 @@ async def find_duplicate(r, key: Optional[str], payload: dict, delay_seconds: fl
 
 # Queue one job in a single atomic step.
 #   KEYS: 1 target (queue list or delayed zset), 2 task hash, 3 history list, 4 queue-name set,
-#         5 idempotency key, 6 cron tick lock, 7-9 the queue's three lists (capacity), 10 the job's fence
+#         5 idempotency key, 6 cron tick lock, 7-9 the queue's three lists (capacity), 10 the job's fence,
+#         11 the finished-jobs set
 #   ARGV: 1 payload, 2 "list" | "delayed", 3 due time, 4 queue name, 5 history limit, 6 capacity (0 = none),
 #         7 idempotency record ("" = none), 8 idempotency TTL, 9 lock TTL ("" = no lock), 10 task id,
 #         11 "1" = may run when Redis is full (internal follow-ups), 12 MAX_QUEUES (0 = none),
@@ -315,6 +343,7 @@ end
 if previous then
     redis.call('DEL', KEYS[2], KEYS[10])
     redis.call('LREM', KEYS[3], 0, ARGV[10])
+    redis.call('ZREM', KEYS[11], ARGV[10])
 end
 if ARGV[7] ~= '' then redis.call('SET', KEYS[5], ARGV[7], 'EX', tonumber(ARGV[8])) end
 if ARGV[2] == 'delayed' then
@@ -379,10 +408,10 @@ async def enqueue(r, payload: dict, delay_seconds: float = 0, created_by: Option
         record = json.dumps({"fingerprint": fingerprint, "response": result}) if idem else ""
         fields = [str(x) for kv in meta.items() for x in kv]
         reply = await r.eval(
-            ENQUEUE_SCRIPT, 10,
+            ENQUEUE_SCRIPT, 11,
             "delayed_tasks" if delay_seconds > 0 else queue_key(priority, queue),
             task_key(task_id), RECENT_KEY, QUEUES_KEY, idem or _NO_KEY, lock or _NO_KEY,
-            *queue_keys(queue), f"fence:{task_id}",
+            *queue_keys(queue), f"fence:{task_id}", FINISHED_KEY,
             raw, "delayed" if delay_seconds > 0 else "list", repr(now + delay_seconds), queue,
             max(1, settings.HISTORY_LIMIT), int(capacity or 0), record, max(1, settings.IDEMPOTENCY_TTL),
             str(int(lock_ttl)) if lock else "", task_id, "1" if oom_ok else "0", max(0, settings.MAX_QUEUES),
@@ -408,7 +437,7 @@ async def enqueue(r, payload: dict, delay_seconds: float = 0, created_by: Option
 # "high"; a later retry goes back to the original priority).
 # KEYS: the queue's 3 lists, delayed zset, task hash
 # ARGV: exact payload JSON, cancelled timestamp, result TTL
-CANCEL_SCRIPT = """
+CANCEL_SCRIPT = KEEP_LUA + """
 local removed = 0
 for i = 1, 3 do
     removed = redis.call('LREM', KEYS[i], 1, ARGV[1])
@@ -420,6 +449,7 @@ end
 if removed > 0 then
     redis.call('HSET', KEYS[5], 'status', 'Cancelled', 'finished_at', ARGV[2])
     redis.call('EXPIRE', KEYS[5], tonumber(ARGV[3]))
+    pytaskq_keep(KEYS[6], ARGV[4], ARGV[2], tonumber(ARGV[5]), ARGV[6])
     return 1
 end
 return 0
@@ -439,9 +469,9 @@ async def cancel(r, task_id: str, by: Optional[str] = None) -> tuple[bool, str]:
     if status in FINAL_STATES or status == PROCESSING or not payload:
         return False, status
     ok = await r.eval(
-        CANCEL_SCRIPT, 5,
-        *queue_keys(payload_queue(meta)), "delayed_tasks", task_key(task_id),
-        payload, str(clock.now()), int(settings.RESULT_TTL),
+        CANCEL_SCRIPT, 6,
+        *queue_keys(payload_queue(meta)), "delayed_tasks", task_key(task_id), FINISHED_KEY,
+        payload, str(clock.now()), int(settings.RESULT_TTL), task_id, *keep_args(),
     )
     if ok:
         if by:
