@@ -997,3 +997,35 @@ async def test_7e_the_worker_logs_pauses_of_its_own_queues(env, caplog):
     assert "Queue 'mail' was paused" in caplog.text
     await queueing.resume_queue(r, "mail")
     assert await worker._refresh_paused() is True and "Queue 'mail' was resumed" in caplog.text
+
+
+# ── 7f. Prometheus ───────────────────────────────────────────────────────────
+
+async def test_7f_prometheus_metrics(env, client):
+    import re
+    r = env
+    for i in range(3):
+        await queueing.enqueue(r, queueing.new_payload("ok", [i], priority="high" if i else "default"))
+    await queueing.enqueue(r, queueing.new_payload("bad", []))
+    await run_one(r, OK)                       # one success
+    await queueing.pause_queue(r, "default")
+    await r.hset(worker.CRON_MISSED_KEY, mapping={"nightly": 2, "nightly:at": time.time()})
+    res = await client.get("/metrics/prometheus")
+    assert res.status_code == 200 and res.headers["content-type"].startswith("text/plain; version=0.0.4")
+    body = res.text
+    sample = re.compile(r'^[a-z_]+(\{([a-z_]+="[^"]*",?)*\})? -?[0-9.e+]+$')
+    for line in body.splitlines():
+        assert line.startswith("# HELP ") or line.startswith("# TYPE ") or sample.match(line), line
+    assert 'pytaskq_queue_jobs{queue="default",priority="high"} 1' in body    # one of the two was run
+    assert 'pytaskq_queue_jobs{queue="default",priority="default"} 2' in body
+    assert 'pytaskq_queue_paused{queue="default"} 1' in body
+    assert "pytaskq_jobs_succeeded_total 1" in body
+    assert 'pytaskq_cron_missed_runs_total{task="nightly"} 2' in body and "nightly:at" not in body
+    assert f'pytaskq_info{{version="{__import__("pytaskq").__version__}"}} 1' in body
+
+
+async def test_7f_prometheus_needs_sign_in_when_auth_is_on(r):
+    from pytaskq.main import app
+    with patch("pytaskq.core.redis_client.r", r), patch.object(settings, "PYTASKQ_AUTH", "on"):
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as c:
+            assert (await c.get("/metrics/prometheus")).status_code == 401

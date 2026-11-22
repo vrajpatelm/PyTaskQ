@@ -3,6 +3,7 @@ import logging
 import time
 
 from fastapi import APIRouter, Depends, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi.responses import PlainTextResponse
 from pytaskq.core import redis_client
 from pytaskq.core.config import settings
 from pytaskq.core.dependencies import _same_origin, authenticate_request, require
@@ -24,6 +25,16 @@ def _redis_problem(e: Exception) -> str:
 async def metrics(req: Request):
     data = await _get_dashboard_data("global", include_dlq=False)
     return data["metrics"]
+
+@router.get("/metrics/prometheus", dependencies=[Depends(require("viewer"))], response_class=PlainTextResponse)
+async def prometheus_metrics():
+    """
+    The dashboard's numbers in the Prometheus text format. With sign-in on,
+    scrape with a viewer API token (Settings → API tokens) as a bearer token.
+    """
+    from pytaskq.services import prometheus
+    return PlainTextResponse(await prometheus.render(redis_client.r), media_type=prometheus.CONTENT_TYPE)
+
 
 @router.websocket("/ws/dashboard")
 async def dashboard_websocket(websocket: WebSocket):
