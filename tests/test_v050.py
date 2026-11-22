@@ -536,7 +536,7 @@ async def test_7a_max_concurrency_holds_across_workers_and_waiting_uses_no_retri
     _, c = await _start(r, tasks)
     assert c.done(), "the third job doesn't wait inside the worker: it goes back to the delayed set"
     assert [await r.hget(f"task:l{i}", "status") for i in range(3)] == ["Processing", "Processing", "Queued"]
-    assert "2 'login' job(s) are already running (max_concurrency=2)" in await r.hget("task:l2", "note")
+    assert "2 'login' job(s) are already running (max_concurrency=2)" in await r.hget("task:l2", "waiting_for")
     assert await r.zcard("delayed_tasks") == 1 and await r.zcard(worker.limit_key("running", "login")) == 2
     gate.set()
     await asyncio.gather(a, b)
@@ -546,6 +546,7 @@ async def test_7a_max_concurrency_holds_across_workers_and_waiting_uses_no_retri
     await c
     info = await r.hgetall("task:l2")
     assert info["status"] == "Success" and info.get("retry_count", "0") == "0"
+    assert "waiting_for" not in info, "why it waited is cleared once it starts"
 
 
 async def test_7a_a_dead_workers_places_free_up_and_live_ones_are_renewed(env):
@@ -594,7 +595,7 @@ async def test_7b_rate_limit_reserves_one_start_time_per_job(env):
     assert await r.hget("task:c0", "status") == "Success"
     slots = sorted(score for _, score in await r.zrange("delayed_tasks", 0, -1, withscores=True))
     assert slots == [t0 + 0.5, t0 + 1.0], "evenly spread, reserved once"
-    assert "Waiting for its turn under rate_limit=2/s" in await r.hget("task:c1", "note")
+    assert "Waiting for its turn under rate_limit=2/s" in await r.hget("task:c1", "waiting_for")
     # At its time the job runs without reserving another turn.
     await worker._promote_due_tasks(now=t0 + 0.6)
     with patch.object(clock, "now", lambda: t0 + 0.6):
@@ -1029,3 +1030,96 @@ async def test_7f_prometheus_needs_sign_in_when_auth_is_on(r):
     with patch("pytaskq.core.redis_client.r", r), patch.object(settings, "PYTASKQ_AUTH", "on"):
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as c:
             assert (await c.get("/metrics/prometheus")).status_code == 401
+
+
+# ── 7g. searchable history ───────────────────────────────────────────────────
+
+async def _finish(r, n, *, task="ok", start=1_700_000_000.0, **extra):
+    """n finished jobs, one a second, written the way workers write them."""
+    ids = []
+    for i in range(n):
+        tid = f"{task}-{i:04d}"
+        at = start + i
+        await r.hset(f"task:{tid}", mapping={"task_id": tid, "task_name": task, "status": "Success",
+                                             "finished_at": at, "queue": "default", **extra,
+                                             "payload": json.dumps({"args": [i], "kwargs": {}})})
+        await r.zadd(queueing.FINISHED_KEY, {tid: at})
+        ids.append(tid)
+    return ids
+
+
+async def _all_pages(client, **params):
+    seen, cursor, pages = [], None, 0
+    while True:
+        res = await client.get("/tasks/history", params={**params, **({"cursor": cursor} if cursor else {})})
+        assert res.status_code == 200, res.text
+        body = res.json()
+        seen += [t["task_id"] for t in body["tasks"]]
+        pages += 1
+        assert pages < 100, "the cursor doesn't move forward"
+        cursor = body["next"]
+        if not cursor:
+            return seen, pages
+
+
+async def test_7g_history_pages_through_every_finished_job_newest_first(client, r):
+    ids = await _finish(r, 120)
+    seen, pages = await _all_pages(client, limit=50)
+    assert seen == ids[::-1] and pages == 3
+
+
+async def test_7g_jobs_finished_at_the_same_moment_are_neither_lost_nor_repeated(client, r):
+    for i in range(30):
+        await r.hset(f"task:t{i:02d}", mapping={"task_id": f"t{i:02d}", "task_name": "ok", "status": "Success"})
+        await r.zadd(queueing.FINISHED_KEY, {f"t{i:02d}": 1_700_000_000.0 + (i // 10)})   # ties of ten
+    seen, _ = await _all_pages(client, limit=7)
+    assert sorted(seen) == [f"t{i:02d}" for i in range(30)] and len(seen) == 30
+
+
+async def test_7g_filters_and_text_search(client, r):
+    await _finish(r, 20)
+    await _finish(r, 5, task="report", start=1_700_000_100.0, status="DeadLetter", error="ValueError: bad invoice 7")
+    body = (await client.get("/tasks/history", params={"status": "DeadLetter"})).json()
+    assert len(body["tasks"]) == 5 and body["next"] is None and body["kept"] == 25
+    assert len((await client.get("/tasks/history", params={"task_name": "ok"})).json()["tasks"]) == 20
+    found = (await client.get("/tasks/history", params={"q": "INVOICE 7"})).json()["tasks"]
+    assert {t["task_id"] for t in found} == {f"report-{i:04d}" for i in range(5)}
+    window = (await client.get("/tasks/history", params={"since": 1_700_000_005, "until": 1_700_000_009})).json()
+    assert [t["task_id"] for t in window["tasks"]] == [f"ok-{i:04d}" for i in range(9, 4, -1)]
+    assert (await client.get("/tasks/history", params={"cursor": "nonsense"})).status_code == 422
+
+
+async def test_7g_one_request_looks_at_a_bounded_number_of_jobs(client, r):
+    await _finish(r, 30)
+    with patch.object(queueing, "SEARCH_SCAN_MAX", 10), patch.object(queueing, "SEARCH_BATCH", 4):
+        body = (await client.get("/tasks/history", params={"q": "no such text"})).json()
+        assert body["tasks"] == [] and body["scanned"] == 10 and body["next"], "says where to continue"
+        seen, pages = await _all_pages(client, q="no such text")
+        assert seen == [] and pages == 3
+
+
+async def test_7g_jobs_finished_by_workers_are_searchable(env, client):
+    r = env
+    await queueing.enqueue(r, queueing.new_payload("ok", [41], task_id="w1"))
+    await queueing.enqueue(r, queueing.new_payload("bad", [], task_id="w2"))
+    await run_one(r, OK)
+    await run_one(r, OK)
+    found = (await client.get("/tasks/history", params={"q": "ZeroDivision"})).json()["tasks"]
+    assert [t["task_id"] for t in found] == ["w2"]
+    found = (await client.get("/tasks/history", params={"status": "Success"})).json()["tasks"]
+    assert [t["task_id"] for t in found] == ["w1"] and found[0]["args"] == [41]
+
+
+async def test_7e_pausing_takes_effect_at_once_even_before_workers_notice(env):
+    r = env
+    await queueing.enqueue(r, queueing.new_payload("ok", [1], queue="mail", task_id="m1"))
+    await queueing.pause_queue(r, "mail")
+    assert worker._paused == set(), "this worker hasn't refreshed its copy yet"
+    for turn in range(3):
+        assert await r.eval(worker.PRIORITY_POP_SCRIPT, *worker.pop_call(["default", "mail"], turn)) is None
+    await queueing.enqueue(r, queueing.new_payload("ok", [2], task_id="d1"))
+    raw = await r.eval(worker.PRIORITY_POP_SCRIPT, *worker.pop_call(["default", "mail"], 0))
+    assert json.loads(raw)["task_id"] == "d1", "other queues are not affected"
+    await queueing.resume_queue(r, "mail")
+    raw = await r.eval(worker.PRIORITY_POP_SCRIPT, *worker.pop_call(["mail", "default"], 0))
+    assert json.loads(raw)["task_id"] == "m1"

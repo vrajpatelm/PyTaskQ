@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   Play, ListChecks, Server, Skull, Search, X,
   RotateCcw, Trash2, Ban, Clock, Cpu, Zap, Waves, Terminal, ChevronRight,
-  Settings as SettingsIcon, UserRound, Pause, ArrowUp, AlertTriangle, Layers,
+  Settings as SettingsIcon, UserRound, Pause, ArrowUp, AlertTriangle, Layers, History as HistoryIcon,
 } from 'lucide-react'
 import {
   api, WS_URL, STATUS, FINAL, CANCELLABLE, timeAgo, formatDuration, formatClock,
@@ -17,6 +17,7 @@ const TABS = [
   { id: 'run', label: 'Run a task', icon: Play },
   { id: 'workers', label: 'Workers', icon: Server },
   { id: 'dead', label: 'Dead letters', icon: Skull },
+  { id: 'history', label: 'History', icon: HistoryIcon },
   { id: 'settings', label: 'Settings', icon: SettingsIcon },
 ];
 
@@ -466,6 +467,9 @@ function TaskDrawer({ taskId, onClose, notify, refreshKey, canOperate }) {
               {task.worker_id && <Field label="Worker"><code>{task.worker_id}</code></Field>}
               {task.created_by && <Field label="Queued by">{task.created_by}</Field>}
               {task.cancelled_by && <Field label="Cancelled by">{task.cancelled_by}</Field>}
+              {task.waiting_for && !FINAL.has(task.status) && task.status !== 'Processing' && (
+                <Field label="Waiting">{task.waiting_for}</Field>
+              )}
               {task.note && <Field label="Note">{task.note}</Field>}
             </dl>
 
@@ -487,6 +491,120 @@ function TaskDrawer({ taskId, onClose, notify, refreshKey, canOperate }) {
           </>
         )}
       </aside>
+    </div>
+  );
+}
+
+// ── History: search every kept finished job ──────────────────────────────────
+
+const HISTORY_STATUSES = [
+  { id: '', label: 'Any outcome' },
+  { id: 'Success', label: 'Succeeded' },
+  { id: 'DeadLetter', label: 'Dead letter' },
+  { id: 'Cancelled', label: 'Cancelled' },
+];
+
+const toUnix = local => (local ? new Date(local).getTime() / 1000 : null);
+
+function HistoryView({ taskNames, queueNames, onOpen }) {
+  const [form, setForm] = useState({ q: '', status: '', task_name: '', queue: '', since: '', until: '' });
+  const [rows, setRows] = useState([]);
+  const [page, setPage] = useState(null);      // { next, scanned, kept } of the last request
+  const [scanned, setScanned] = useState(0);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+  const [searched, setSearched] = useState(false);
+  const set = key => e => setForm(f => ({ ...f, [key]: e.target.value }));
+
+  const run = async (cursor = null) => {
+    setBusy(true); setError('');
+    const params = new URLSearchParams({ limit: '50' });
+    for (const k of ['q', 'status', 'task_name', 'queue']) if (form[k]) params.set(k, form[k]);
+    if (form.since) params.set('since', String(toUnix(form.since)));
+    if (form.until) params.set('until', String(toUnix(form.until)));
+    if (cursor) params.set('cursor', cursor);
+    try {
+      const d = await api(`/tasks/history?${params}`);
+      setRows(r => (cursor ? [...r, ...d.tasks] : d.tasks));
+      setScanned(s => (cursor ? s + d.scanned : d.scanned));
+      setPage(d);
+      setSearched(true);
+    } catch (e) { setError(e.message); }
+    finally { setBusy(false); }
+  };
+
+  return (
+    <div className="panel">
+      <form className="history-form" onSubmit={e => { e.preventDefault(); run(); }}>
+        <label className="lookup history-q">
+          <Search size={14} />
+          <input value={form.q} onChange={set('q')} placeholder="Text in the ID, arguments, result or error"
+            aria-label="Search text" />
+        </label>
+        <select value={form.status} onChange={set('status')} aria-label="Outcome">
+          {HISTORY_STATUSES.map(s => <option key={s.id} value={s.id}>{s.label}</option>)}
+        </select>
+        <select value={form.task_name} onChange={set('task_name')} aria-label="Task">
+          <option value="">All tasks</option>
+          {taskNames.map(n => <option key={n} value={n}>{n}</option>)}
+        </select>
+        {queueNames.length > 1 && (
+          <select value={form.queue} onChange={set('queue')} aria-label="Queue">
+            <option value="">All queues</option>
+            {queueNames.map(n => <option key={n} value={n}>{n}</option>)}
+          </select>
+        )}
+        <label className="history-time"><span>Finished after</span>
+          <input type="datetime-local" value={form.since} onChange={set('since')} /></label>
+        <label className="history-time"><span>and before</span>
+          <input type="datetime-local" value={form.until} onChange={set('until')} /></label>
+        <button className="btn btn-primary btn-sm" type="submit" disabled={busy}>{busy ? 'Searching…' : 'Search'}</button>
+      </form>
+
+      {error && <div className="notice notice-error">{error}</div>}
+      {!searched ? (
+        <div className="empty">
+          Search the finished jobs PyTaskQ keeps (the newest FINISHED_JOBS_KEPT, 50,000 by default),
+          not only the recent ones on the Jobs tab.
+        </div>
+      ) : rows.length === 0 && !page?.next ? (
+        <div className="empty">No finished jobs match. Try fewer filters or a wider time range.</div>
+      ) : (
+        <div className="table-wrap">
+          <table className="jobs">
+            <thead>
+              <tr><th>Status</th><th>Task</th><th>Arguments</th><th>Finished</th><th className="num">Duration</th></tr>
+            </thead>
+            <tbody>
+              {rows.map(t => (
+                <tr key={t.task_id} onClick={() => onOpen(t.task_id)} tabIndex={0}
+                  onKeyDown={e => { if (e.key === 'Enter') onOpen(t.task_id); }}>
+                  <td><StatusBadge status={t.status} /></td>
+                  <td>
+                    <div className="task-name">{t.task_name}</div>
+                    <div className="task-id">{t.task_id.slice(0, 8)}</div>
+                  </td>
+                  <td className="args">{formatArgs(t.args, t.kwargs) || <span className="muted">none</span>}</td>
+                  <td title={formatClock(t.finished_at)}>{formatClock(t.finished_at)}</td>
+                  <td className="num">{formatDuration(t.duration_ms)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+      {searched && page && (
+        <div className="history-foot">
+          <span className="muted small">
+            {rows.length} found · looked through {scanned.toLocaleString()} of {Number(page.kept || 0).toLocaleString()} kept jobs
+          </span>
+          {page.next && (
+            <button className="btn btn-ghost btn-sm" onClick={() => run(page.next)} disabled={busy}>
+              {busy ? 'Searching…' : 'Look further back'}
+            </button>
+          )}
+        </div>
+      )}
     </div>
   );
 }
@@ -911,6 +1029,7 @@ function Dashboard({ me, authEnabled, onSignOut, theme, setTheme }) {
         )}
         {tab === 'workers' && <WorkersView workers={workers} />}
         {tab === 'dead' && <DeadLettersView items={dlq} notify={notify} onOpen={setOpenId} canOperate={canOperate} />}
+        {tab === 'history' && <HistoryView taskNames={taskNames} queueNames={queueNames} onOpen={setOpenId} />}
         {tab === 'settings' && <SettingsView me={me} authEnabled={authEnabled} onSignOut={onSignOut} notify={notify} />}
       </main>
 

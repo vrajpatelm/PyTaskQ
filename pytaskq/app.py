@@ -372,7 +372,7 @@ class PyTaskQ:
 
     async def pause_queue(self, queue: str) -> bool:
         """
-        Stop workers from starting new jobs from `queue` (within about 2 seconds).
+        Stop workers from starting new jobs from `queue`, at once.
         Running jobs finish; new jobs still queue up. False if it was already paused.
         """
         return await queueing.pause_queue(_redis(), queue)

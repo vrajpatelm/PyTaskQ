@@ -157,6 +157,30 @@ async def list_tasks(
     return {"tasks": tasks, "count": len(tasks)}
 
 
+@list_router.get("/history")
+async def search_history(
+    status: Optional[str] = Query(None, description="Success, DeadLetter, Cancelled or Failed"),
+    task_name: Optional[str] = None,
+    queue: Optional[str] = None,
+    since: Optional[float] = Query(None, description="Finished at or after (Unix seconds)"),
+    until: Optional[float] = Query(None, description="Finished at or before (Unix seconds)"),
+    q: Optional[str] = Query(None, max_length=200,
+                             description="Text in the id, task name, arguments, result, error or note"),
+    cursor: Optional[str] = Query(None, max_length=100, description="`next` from the previous page"),
+    limit: int = Query(50, ge=1, le=500),
+):
+    """
+    Search finished jobs, newest first: the last FINISHED_JOBS_KEPT (50,000 by
+    default), not only the recent ones the job list shows. Each request looks at
+    up to 5,000 jobs; pass `next` back as `cursor` to continue.
+    """
+    try:
+        return await queueing.search_finished(redis_client.r, status=status, task_name=task_name, queue=queue,
+                                              since=since, until=until, text=q, cursor=cursor, limit=limit)
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e)) from None
+
+
 @list_router.get("/registered")
 async def list_registered_tasks(include_internal: bool = False):
     """Tasks advertised by running workers (with their parameters, used by the dashboard)."""

@@ -27,7 +27,7 @@ def _name(name: str) -> str:
 @router.post("/{name}/pause")
 async def pause_queue(name: str, user: auth.User = Depends(require("operator"))):
     """
-    Stop workers from starting new jobs from this queue (within about 2 seconds).
+    Stop workers from starting new jobs from this queue, at once.
     Jobs already running finish normally; new jobs can still be queued and wait
     until the queue is resumed. Scheduled and cron jobs keep arriving too.
     """

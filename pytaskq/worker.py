@@ -186,6 +186,17 @@ def pop_keys(queues: list[str], turn: int = 0) -> list[str]:
     return [queueing.queue_key(p, q) for p in order for q in rotated]
 
 
+def pop_call(queues: list[str], turn: int = 0) -> list:
+    """Arguments for PRIORITY_POP_SCRIPT that also skip paused queues: numkeys, keys…, names…."""
+    keys = pop_keys(queues, turn)
+    if not keys:
+        return [1, _processing_key()]
+    start = turn % len(queues)
+    rotated = queues[start:] + queues[:start]
+    names = rotated * (len(keys) // len(rotated))      # pop_keys lists each priority over `rotated`
+    return [len(keys) + 2, _processing_key(), *keys, queueing.PAUSED_KEY, *names]
+
+
 def cron_zone(name: str):
     """A tzinfo for a cron time zone name ("UTC" works even without a time zone database)."""
     if not name or name.strip().upper() == "UTC":
@@ -248,12 +259,25 @@ return -1
 
 # Starts with OOM_PROBE: taking a job must work when Redis is full, since
 # finishing jobs is what frees memory (moving a job uses no extra memory).
+# KEYS: processing list, the queue lists in order [, paused-queues hash]
+# ARGV (optional): the queue name of each list. With it, a paused queue is skipped here, in the same
+# step as the pop, so pausing takes effect at once (workers' cached copy only saves them idle checks).
 PRIORITY_POP_SCRIPT = OOM_PROBE + """
 local dest = KEYS[1]
-for i = 2, #KEYS do
-    local val = redis.call('RPOPLPUSH', KEYS[i], dest)
-    if val then
-        return val
+local last, paused, skip = #KEYS, nil, {}
+if #ARGV > 0 then
+    paused, last = KEYS[#KEYS], #KEYS - 1
+end
+for i = 2, last do
+    local name = ARGV[i - 1]
+    if paused and skip[name] == nil then
+        skip[name] = redis.call('HEXISTS', paused, name) == 1
+    end
+    if not (paused and skip[name]) then
+        local val = redis.call('RPOPLPUSH', KEYS[i], dest)
+        if val then
+            return val
+        end
     end
 end
 return nil
@@ -370,11 +394,12 @@ return 1
 """
 
 # This worker lacks the job's task: send it back through the delayed set.
-# KEYS: processing list, delayed set, task hash   ARGV: payload as listed, new payload, due, note
+# KEYS: processing list, delayed set, task hash
+# ARGV: payload as listed, new payload, due, note [, the field to write it to (default "note")]
 HAND_BACK_SCRIPT = """
 if redis.call('LREM', KEYS[1], 1, ARGV[1]) == 0 then return 0 end
 redis.call('ZADD', KEYS[2], ARGV[3], ARGV[2])
-redis.call('HSET', KEYS[3], 'status', 'Queued', 'payload', ARGV[2], 'note', ARGV[4])
+redis.call('HSET', KEYS[3], 'status', 'Queued', 'payload', ARGV[2], ARGV[5] or 'note', ARGV[4])
 redis.call('PERSIST', KEYS[3])
 return 1
 """
@@ -514,7 +539,7 @@ return 1
 STARTED_SCRIPT = """
 local unpack = unpack or table.unpack
 redis.call('PERSIST', KEYS[1])
-redis.call('HDEL', KEYS[1], 'progress', 'progress_message', 'progress_at')   -- a retry starts again from zero
+redis.call('HDEL', KEYS[1], 'progress', 'progress_message', 'progress_at', 'waiting_for')   -- a retry starts from zero
 redis.call('HSET', KEYS[1], unpack(ARGV))
 redis.call('PUBLISH', '__PYTASKQ__events:global', 'update')
 return 1
@@ -1176,12 +1201,16 @@ def limit_key(kind: str, task_name: str) -> str:
 
 
 async def _wait_in_delayed_set(r, tasks, task_json, due: float, changes: dict, note: str) -> None:
-    """Put a popped job back in the delayed set until `due`, without counting a retry."""
+    """
+    Put a popped job back in the delayed set until `due`, without counting a retry.
+    Why it waits goes in the `waiting_for` field, which is cleared when the job starts.
+    """
     payload = json.loads(task_json)
     payload.update(changes)
     raw = json.dumps(payload)
     await _with_retries(lambda _: r.eval(HAND_BACK_SCRIPT, 3, _processing_key(), rkey("delayed_tasks"),
-                                         queueing.task_key(tasks.task_id), task_json, raw, repr(due), note),
+                                         queueing.task_key(tasks.task_id), task_json, raw, repr(due), note,
+                                         "waiting_for"),
                         "put a job back to wait", tasks.task_id)
 
 
@@ -1890,11 +1919,9 @@ async def consumer_task():
                 sem.release()
                 await _wait_for_work([])
                 continue
-            keys = pop_keys(serving, turn)
+            call = pop_call(serving, turn)
             turn += 1
-            task_json = await redis_client.r.eval(
-                PRIORITY_POP_SCRIPT, 1 + len(keys), _processing_key(), *keys,
-            )
+            task_json = await redis_client.r.eval(PRIORITY_POP_SCRIPT, *call)
 
             if not task_json:
                 sem.release()

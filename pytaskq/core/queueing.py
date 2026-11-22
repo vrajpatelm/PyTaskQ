@@ -617,6 +617,84 @@ async def recent_tasks(r, limit: int = 50, status: Optional[str] = None, task_na
     return out
 
 
+SEARCH_BATCH = 500
+SEARCH_SCAN_MAX = 5000      # finished jobs one search request looks at; the cursor continues from there
+
+
+def _matches_text(meta: dict, text: str) -> bool:
+    hay = " ".join(str(meta.get(f, "")) for f in ("task_id", "task_name", "error", "note", "result", "payload"))
+    return text in hay.lower()
+
+
+async def search_finished(r, *, status: Optional[str] = None, task_name: Optional[str] = None,
+                          queue: Optional[str] = None, since: Optional[float] = None,
+                          until: Optional[float] = None, text: Optional[str] = None,
+                          cursor: Optional[str] = None, limit: int = 50) -> dict:
+    """
+    Search finished jobs (the FINISHED_JOBS_KEPT newest ones), newest first.
+
+    Filters: status, task name, queue, finished between `since` and `until`
+    (Unix seconds), and `text` found in the id, task name, arguments, result,
+    error or note (case-insensitive). One request looks at up to
+    SEARCH_SCAN_MAX jobs; `next` is the cursor for the following page (None at
+    the end). Jobs that finished before 0.5.0 aren't in this index.
+    """
+    limit = max(1, min(int(limit), 500))
+    text = (text or "").strip().lower()[:200]
+    top = float("inf") if until is None else float(until)
+    bottom = "-inf" if since is None else repr(float(since))
+    skip = 0
+    if cursor:
+        # "score|n": continue below finish time `score`, after the first n jobs finished at exactly that time.
+        try:
+            score, n = cursor.split("|", 1)
+            top, skip = min(top, float(score)), max(0, int(n))
+        except ValueError:
+            raise ValueError("cursor isn't valid: use the `next` value of the previous page") from None
+    top_arg = "+inf" if top == float("inf") else repr(top)
+
+    out: list[dict] = []
+    position = skip                # how far into ZREVRANGEBYSCORE(top, bottom) we've read
+    same_score, same = top, skip   # jobs read so far that finished at exactly `same_score`
+    scanned = 0
+    at_end = False
+    while scanned < SEARCH_SCAN_MAX and len(out) < limit:
+        chunk = await r.zrevrangebyscore(FINISHED_KEY, top_arg, bottom, start=position,
+                                         num=min(SEARCH_BATCH, SEARCH_SCAN_MAX - scanned), withscores=True)
+        if not chunk:
+            at_end = True
+            break
+        async with r.pipeline(transaction=False) as pipe:
+            for tid, _ in chunk:
+                pipe.hgetall(task_key(tid))
+            rows = await pipe.execute()
+        for (tid, score), meta in zip(chunk, rows):
+            position += 1
+            scanned += 1
+            same, same_score = (same + 1, score) if score == same_score else (1, score)
+            if not meta:
+                continue
+            if status and meta.get("status", "").lower() != status.lower():
+                continue
+            if task_name and meta.get("task_name") != task_name:
+                continue
+            if queue and payload_queue(meta) != queue:
+                continue
+            if text and not _matches_text(meta, text):
+                continue
+            out.append(public_view(meta))
+            if len(out) >= limit:
+                break
+    if not at_end:
+        at_end = not await r.zrevrangebyscore(FINISHED_KEY, top_arg, bottom, start=position, num=1)
+    return {
+        "tasks": out,
+        "next": None if at_end or not scanned else f"{same_score!r}|{same}",
+        "scanned": scanned,
+        "kept": await r.zcard(FINISHED_KEY),
+    }
+
+
 async def registered_tasks(r) -> list[dict]:
     """Tasks advertised in the last REGISTRY_TTL seconds by any worker (or the dashboard's --app).
 
@@ -701,8 +779,9 @@ return redis.call('SREM', KEYS[1], ARGV[1])
 
 
 # ── Pausing queues ───────────────────────────────────────────────────────────
-# HASH queue name → JSON {"by", "at"}. Workers read it every PAUSE_CHECK seconds and
-# don't start new jobs from a paused queue; running jobs finish, new jobs still queue up.
+# HASH queue name → JSON {"by", "at"}. The workers' pop script skips paused queues (so a pause
+# takes effect at once); workers also keep a copy, refreshed every PAUSE_CHECK seconds, so they
+# wait quietly instead of asking again and again. Running jobs finish; new jobs still queue up.
 PAUSED_KEY = rkey("pytaskq:paused")
 PAUSE_CHECK = 2.0
 
@@ -719,7 +798,7 @@ async def paused_queues(r) -> dict[str, dict]:
 
 
 async def pause_queue(r, name: str, by: Optional[str] = None) -> bool:
-    """Stop workers from starting new jobs from `name` (within PAUSE_CHECK seconds). False if already paused."""
+    """Stop workers from starting new jobs from `name` (at once). False if already paused."""
     check_queue_name(name)
     added = await r.hsetnx(PAUSED_KEY, name, json.dumps({"by": by or "app", "at": clock.now()}))
     await r.publish(EVENTS_CHANNEL, "update")
