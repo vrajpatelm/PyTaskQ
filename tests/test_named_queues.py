@@ -165,6 +165,12 @@ def test_worker_serves_its_tasks_queues_by_default(monkeypatch):
 
 
 def test_pop_order_is_priority_first_and_queues_take_turns():
+    """With PRIORITY_WEIGHTS=strict (weighted priorities, the 0.5 default, are tested in test_v050.py)."""
+    with patch.object(worker, "_SCHEDULE", ["high"]):
+        _check_strict_pop_order()
+
+
+def _check_strict_pop_order():
     keys = worker.pop_keys(["default", "images"], turn=0)
     assert keys == ["queue:high", "queue:images:high", "queue:default", "queue:images:default",
                     "queue:low", "queue:images:low"]

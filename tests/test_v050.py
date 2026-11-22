@@ -229,3 +229,49 @@ async def test_2_queue_wait_returns_quickly(r):
         started = time.monotonic()
         await q.wait("w", timeout=5)
     assert time.monotonic() - started < 0.15
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 3. Weighted priorities
+# ═════════════════════════════════════════════════════════════════════════════
+
+def test_3_default_cycle_is_6_3_1_spread_out():
+    cycle = worker.priority_schedule("6,3,1")
+    assert len(cycle) == 10
+    assert [cycle.count(p) for p in ("high", "default", "low")] == [6, 3, 1]
+    assert "high,high,high" not in ",".join(cycle), "spread out, not in blocks"
+    assert worker.priority_schedule("strict") == ["high"]
+    assert worker.priority_schedule("1,1,1") == ["high", "default", "low"]
+
+
+@pytest.mark.parametrize("bad", ["6,3", "a,b,c", "-1,1,1", "0,0,0", "high"])
+def test_3_bad_weights_stop_the_worker_with_a_clear_message(bad):
+    with pytest.raises(SystemExit, match="PRIORITY_WEIGHTS"):
+        worker.priority_schedule(bad)
+
+
+async def _drain(r, n, schedule):
+    taken = []
+    with patch.object(worker, "_SCHEDULE", schedule):
+        for turn in range(n):
+            keys = worker.pop_keys(["default"], turn)
+            raw = await r.eval(worker.PRIORITY_POP_SCRIPT, 1 + len(keys), "processing_queue:x", *keys)
+            taken.append(json.loads(raw)["priority"])
+    return taken
+
+
+async def test_3_low_priority_jobs_are_not_starved(r):
+    for p in ("high", "default", "low"):
+        for i in range(30):
+            await queueing.enqueue(r, queueing.new_payload("ok", priority=p))
+    taken = await _drain(r, 20, worker.priority_schedule("6,3,1"))
+    assert [taken.count(p) for p in ("high", "default", "low")] == [12, 6, 2]
+
+
+async def test_3_strict_mode_and_empty_priorities(r):
+    for p in ("high", "low"):
+        for i in range(5):
+            await queueing.enqueue(r, queueing.new_payload("ok", priority=p))
+    assert await _drain(r, 5, ["high"]) == ["high"] * 5, "strict: high first"
+    assert await _drain(r, 5, worker.priority_schedule("6,3,1")) == ["low"] * 5, \
+        "a preferred priority with nothing waiting falls back to the next"

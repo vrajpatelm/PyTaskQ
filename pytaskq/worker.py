@@ -125,18 +125,58 @@ def resolve_queues(explicit: str = "") -> list[str]:
     return list(dict.fromkeys(names))
 
 
+def priority_schedule(setting: str = None) -> list[str]:
+    """
+    Which priority each pop prefers, in turn: the PRIORITY_WEIGHTS cycle.
+
+    "6,3,1" (the default) gives a cycle of 10 where 6 pops prefer high, 3
+    default and 1 low, spread out (smooth weighted round-robin:
+    high, default, high, low, high, default, high, high, default, high…).
+    A pop whose preferred priority is empty takes the next one, so with only
+    one kind of job waiting, every pop takes it. Strict priority ("strict")
+    made low and default jobs wait forever while high ones kept arriving.
+    """
+    raw = (settings.PRIORITY_WEIGHTS if setting is None else setting).strip().lower()
+    if raw == "strict":
+        return ["high"]
+    try:
+        weights = [int(x) for x in raw.split(",")]
+    except ValueError:
+        weights = []
+    if len(weights) != 3 or any(w < 0 for w in weights) or sum(weights) == 0 or sum(weights) > 1000:
+        raise SystemExit(f"PRIORITY_WEIGHTS={raw!r} isn't valid: use three whole numbers for high,default,low "
+                         f"(like 6,3,1), or 'strict' to always take high-priority jobs first.")
+    current = [0, 0, 0]
+    cycle = []
+    for _ in range(sum(weights)):
+        current = [c + w for c, w in zip(current, weights)]
+        best = max(range(3), key=lambda i: current[i])
+        current[best] -= sum(weights)
+        cycle.append(queueing.PRIORITIES[best])
+    return cycle
+
+
+_SCHEDULE: list[str] = []
+
+
 def pop_keys(queues: list[str], turn: int = 0) -> list[str]:
     """
-    The lists to pop from, in order: every queue's high list, then default, then low.
+    The lists to pop from, in order.
 
-    Within one priority the starting queue rotates with `turn`, so a busy queue
-    can't starve the others.
+    The preferred priority comes from the PRIORITY_WEIGHTS cycle; after it, the
+    others in the usual order (high, default, low). Within one priority the
+    starting queue rotates with `turn`, so a busy queue can't starve the others.
     """
+    global _SCHEDULE
     if not queues:
         return []
+    if not _SCHEDULE:
+        _SCHEDULE = priority_schedule()
+    first = _SCHEDULE[turn % len(_SCHEDULE)]
+    order = [first] + [p for p in queueing.PRIORITIES if p != first]
     start = turn % len(queues)
     rotated = queues[start:] + queues[:start]
-    return [queueing.queue_key(p, q) for p in queueing.PRIORITIES for q in rotated]
+    return [queueing.queue_key(p, q) for p in order for q in rotated]
 
 
 def cron_zone(name: str):
@@ -1398,7 +1438,9 @@ async def consumer_task():
     EXIT_CODE = THREADS_LEFT_RUNNING = 0
     _hard_stop.clear()
     concurrency = CPU_WORKERS + IO_WORKERS
+    global _SCHEDULE
     QUEUES = resolve_queues(QUEUES_OVERRIDE)
+    _SCHEDULE = priority_schedule()          # checked here: a bad value stops the worker at startup
     check_cron_zones()
     named = NAME_OVERRIDE or settings.WORKER_NAME
     if named:
