@@ -40,6 +40,20 @@ function StatusBadge({ status }) {
   return <span className={`badge tone-${s.tone}`}>{s.label}</span>;
 }
 
+// A running job's own report of how far it got (pytaskq.progress()).
+function JobProgress({ t, wide }) {
+  if (t.status !== 'Processing' || t.progress === undefined || t.progress === null || t.progress === '') return null;
+  const pct = Math.max(0, Math.min(100, Number(t.progress) || 0));
+  return (
+    <div className={`job-progress ${wide ? 'wide' : ''}`} title={t.progress_message || `${pct}%`}>
+      <div className="capacity" role="progressbar" aria-valuenow={pct} aria-valuemin={0} aria-valuemax={100}>
+        <div style={{ width: `${pct}%` }} />
+      </div>
+      <span className="small muted">{pct}%{wide && t.progress_message ? ` · ${t.progress_message}` : ''}</span>
+    </div>
+  );
+}
+
 function TypeIcon({ type }) {
   if (type === 'cpu') return <Cpu size={14} aria-label="CPU task" />;
   if (type === 'async') return <Waves size={14} aria-label="Async task" />;
@@ -193,7 +207,7 @@ function JobRow({ t, onOpen, nested }) {
       </td>
       <td className="args">{formatArgs(t.args, t.kwargs) || <span className="muted">none</span>}</td>
       <td title={formatClock(t.created_at)}>{timeAgo(t.created_at)}</td>
-      <td className="num">{formatDuration(t.duration_ms)}</td>
+      <td className="num">{t.status === 'Processing' && t.progress !== undefined ? <JobProgress t={t} /> : formatDuration(t.duration_ms)}</td>
       <td><span className={`prio prio-${t.priority}`}>{t.priority}</span></td>
     </tr>
   );
@@ -414,6 +428,7 @@ function TaskDrawer({ taskId, onClose, notify, refreshKey, canOperate }) {
                 <span className="muted">Updates live</span>
               )}
             </div>
+            <JobProgress t={task} wide />
             <dl className="facts">
               <Field label="Priority"><span className={`prio prio-${task.priority}`}>{task.priority || 'default'}</span></Field>
               <Field label="Queue">{task.queue || 'default'}</Field>

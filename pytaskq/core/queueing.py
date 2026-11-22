@@ -531,7 +531,7 @@ def public_view(meta: dict) -> dict:
                 out[field] = json.loads(out[field], parse_constant=_reject_constant)
             except (TypeError, ValueError):
                 pass   # leave unreadable values as the stored text
-    for field in ("created_at", "scheduled_for", "started_at", "finished_at", "duration_ms"):
+    for field in ("created_at", "scheduled_for", "started_at", "finished_at", "duration_ms", "progress", "progress_at"):
         if field in out:
             try:
                 out[field] = float(out[field])

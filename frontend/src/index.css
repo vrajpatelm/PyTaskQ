@@ -146,6 +146,10 @@ h3 { font-size: 0.85rem; margin: 1.25rem 0 0.4rem; color: var(--text-secondary);
 .tone-text-danger { color: var(--danger-color); }
 .capacity { height: 4px; border-radius: 99px; background: var(--border-color); overflow: hidden; margin: 0.25rem 0 0.35rem; }
 .capacity > div { height: 100%; background: var(--accent-color); transition: width 0.4s ease; }
+.job-progress { min-width: 4.5rem; text-align: left; }
+.job-progress .capacity { margin: 0 0 0.15rem; }
+.job-progress.wide { margin: 0.25rem 0 0.75rem; }
+.job-progress.wide .capacity { height: 6px; }
 .cap-warning > div { background: var(--warning-color); }
 .cap-danger > div { background: var(--danger-color); }
 .pulse { width: 8px; height: 8px; border-radius: 50%; background: var(--border-color); }

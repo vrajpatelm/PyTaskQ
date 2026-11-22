@@ -47,6 +47,7 @@ import croniter
 from opentelemetry import trace
 from redis import exceptions as redis_errors
 
+from pytaskq import context
 from pytaskq.core import clock
 from pytaskq.core import fleet
 from pytaskq.core import queueing
@@ -374,6 +375,18 @@ redis.call('PERSIST', KEYS[3])
 return 1
 """
 
+# A running job's latest progress, only while it's still this worker's and running.
+# KEYS: task hash   ARGV: worker id, percent ("" = unchanged), message ("" = unchanged), when
+PROGRESS_SCRIPT = """
+if redis.call('HGET', KEYS[1], 'status') ~= 'Processing' or redis.call('HGET', KEYS[1], 'worker_id') ~= ARGV[1] then
+  return 0
+end
+if ARGV[2] ~= '' then redis.call('HSET', KEYS[1], 'progress', ARGV[2]) end
+if ARGV[3] ~= '' then redis.call('HSET', KEYS[1], 'progress_message', ARGV[3]) end
+redis.call('HSET', KEYS[1], 'progress_at', ARGV[4])
+return 1
+"""
+
 # max_concurrency: a fleet-wide count of running jobs per task, as leases that run out if a worker
 # dies (its heartbeat renews them while the job runs). KEYS: the task's lease set
 # ARGV: task id, now, lease expiry, limit, key ttl (ms).   Returns 1 (go) or 0 (full).
@@ -478,6 +491,7 @@ return 1
 STARTED_SCRIPT = """
 local unpack = unpack or table.unpack
 redis.call('PERSIST', KEYS[1])
+redis.call('HDEL', KEYS[1], 'progress', 'progress_message', 'progress_at')   -- a retry starts again from zero
 redis.call('HSET', KEYS[1], unpack(ARGV))
 redis.call('PUBLISH', '__PYTASKQ__events:global', 'update')
 return 1
@@ -1214,6 +1228,38 @@ def _renew_leases(c, now: float) -> None:
     pipe.execute()
 
 
+_jobs: dict[str, context.Job] = {}     # task id → the context of each job running here
+_progress = context.Latest()           # the newest progress() of each running job, not yet written
+PROGRESS_EVERY = 1.0                   # seconds between two progress writes
+
+
+async def _flush_progress() -> int:
+    """Write the latest progress of running jobs (one script per job, one round trip)."""
+    pending = _progress.take()
+    if not pending:
+        return 0
+    r = redis_client.r
+    try:
+        async with r.pipeline(transaction=False) as pipe:
+            for task_id, (percent, message, at) in pending.items():
+                pipe.eval(PROGRESS_SCRIPT, 1, queueing.task_key(task_id), WORKER_ID,
+                          "" if percent is None else repr(percent), message or "", repr(at))
+            written = sum(int(x or 0) for x in await pipe.execute())
+        if written:
+            await r.publish(queueing.EVENTS_CHANNEL, "update")
+        return written
+    except Exception as e:
+        # Progress is only informative: never let it disturb the job. Newer values come in a second.
+        logger.debug(f"[Progress] Couldn't write progress ({e})")
+        return 0
+
+
+async def _progress_writer():
+    while True:
+        await asyncio.sleep(PROGRESS_EVERY)
+        await _flush_progress()
+
+
 _last_stuck_warning = 0.0
 
 
@@ -1259,11 +1305,15 @@ def _wrap_executor(executor):
     return pool
 
 
-async def _run_async(func, args, kwargs, timeout, task_id, task_name, started):
+async def _run_async(func, args, kwargs, timeout, task_id, task_name, started, ctx=None):
     await started()
     _running_async[task_id] = task_name
     began = time.monotonic()
-    job = asyncio.ensure_future(func(*args, **kwargs))
+    token = context._current.set(ctx)       # the task (and anything it starts) sees its own job
+    try:
+        job = asyncio.ensure_future(func(*args, **kwargs))
+    finally:
+        context._current.reset(token)
     try:
         if timeout and timeout > 0:
             done, _ = await asyncio.wait({job}, timeout=timeout)
@@ -1302,6 +1352,8 @@ async def handle_task(task_json, sem, loop, process_pool, thread_pool):
             await _run(r, tasks, task_json, process_pool, thread_pool)
         finally:
             _running.pop(tasks.task_id, None)
+            _jobs.pop(tasks.task_id, None)
+            _progress.drop(tasks.task_id)
             await _release_lease(r, tasks.task_id)
     except asyncio.CancelledError:
         # The shutdown grace period ran out. The job stays in this worker's
@@ -1367,9 +1419,10 @@ async def _run(r, tasks, task_json, process_pool, thread_pool) -> None:
             func = entry["handler"]
             task_type = entry.get("type", "cpu")
             args, kwargs = tasks.args, tasks.kwargs
+            ctx = _jobs[task_id] = context.Job(task_id, _progress.put)
 
             if inspect.iscoroutinefunction(func):
-                result = await _run_async(func, args, kwargs, timeout, task_id, tasks.task_name, started)
+                result = await _run_async(func, args, kwargs, timeout, task_id, tasks.task_name, started, ctx)
             else:
                 pool = _pool_for(task_type, process_pool, thread_pool)
                 if isinstance(pool, IoPool) and pool.all_stuck:
@@ -1377,9 +1430,10 @@ async def _run(r, tasks, task_json, process_pool, thread_pool) -> None:
                     span.set_attribute("task.status", "PutBack")
                     return
                 if isinstance(pool, IoPool):
-                    result = await pool.execute(func, args, kwargs, timeout, started, (task_id, tasks.task_name))
+                    result = await pool.execute(func, args, kwargs, timeout, started, (task_id, tasks.task_name),
+                                                job=ctx)
                 else:
-                    result = await pool.execute(func, args, kwargs, timeout, started)
+                    result = await pool.execute(func, args, kwargs, timeout, started, job=ctx)
 
         except PoolBroken as e:
             # Not the job's fault: leave it for a healthy worker. This worker is stopping.
@@ -1692,6 +1746,7 @@ async def consumer_task():
         asyncio.create_task(zombie_sweeper()),
         asyncio.create_task(_loop_ticker()),
         asyncio.create_task(_periodic()),
+        asyncio.create_task(_progress_writer()),
     ]
     if cpu_pool is not None:
         background.append(asyncio.create_task(_watch_cpu_pool(cpu_pool)))

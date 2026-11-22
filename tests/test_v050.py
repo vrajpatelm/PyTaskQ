@@ -636,3 +636,110 @@ def test_7_limits_are_checked_when_the_task_is_registered():
     assert entry["max_concurrency"] == 3 and entry["rate_interval"] == pytest.approx(0.6)
     spec = describe_tasks(q.TASKS)["sync_crm"]
     assert spec["max_concurrency"] == 3 and spec["rate_limit"] == "100/m"
+
+
+# ── 7c. progress ─────────────────────────────────────────────────────────────
+
+@pytest.fixture
+async def cpu_pool():
+    import multiprocessing
+    from pytaskq.pools import CpuPool
+    pools = []
+
+    async def make(size=1):
+        ctx = "fork" if "fork" in multiprocessing.get_all_start_methods() else None
+        pool = CpuPool(size, modules=("tests.v050_tasks",), mp_context=multiprocessing.get_context(ctx))
+        await pool.start()
+        pools.append(pool)
+        return pool
+
+    yield make
+    for pool in pools:
+        await pool.close(grace=0)
+
+
+def test_7c_progress_outside_a_job_does_nothing_and_checks_its_input():
+    from pytaskq import cancelled, current_task_id, progress
+    assert progress(50, "half") is False and cancelled() is False and current_task_id() is None
+    from pytaskq.context import Job, run_as
+    seen = []
+    job = Job("t1", lambda tid, p, m: seen.append((tid, p, m)))
+    run_as(job, progress, (150,), {"message": "x" * 500})
+    run_as(job, progress, (-3,), {})
+    assert seen == [("t1", 100.0, "x" * 200), ("t1", 0.0, None)]
+    for bad in ("50%", True, float("nan")):
+        with pytest.raises(ValueError):
+            run_as(job, progress, (bad,), {})
+
+
+def test_7c_only_the_latest_progress_is_kept_between_writes():
+    from pytaskq.context import Latest
+    latest = Latest()
+    for i in range(1000):
+        latest.put("t1", i / 10, None)
+    latest.put("t1", None, "almost done")
+    assert latest.take() == {"t1": (99.9, "almost done", pytest.approx(time.time(), abs=5))}
+    assert latest.take() == {}
+
+
+@pytest.mark.parametrize("kind", ["io", "async"])
+async def test_7c_running_jobs_report_progress(env, client, kind):
+    r = env
+    from pytaskq import progress
+    gate = asyncio.Event() if kind == "async" else __import__("threading").Event()
+
+    if kind == "async":
+        async def handler():
+            progress(40, "loading")
+            await gate.wait()
+            return "done"
+    else:
+        def handler():
+            progress(40, "loading")
+            gate.wait(5)
+            return "done"
+
+    tasks = {"work": {"handler": handler, "type": kind, "max_retries": 0}}
+    await queueing.enqueue(r, queueing.new_payload("work", [], task_id="p1"))
+    _, job = await _start(r, tasks)
+    assert await worker._flush_progress() == 1
+    info = (await client.get("/task/p1")).json()["result"]
+    assert info["progress"] == 40.0 and info["progress_message"] == "loading"
+    gate.set()
+    await job
+    worker._progress.put("p1", 99, "late")              # a value that arrives after the job ended
+    assert await worker._flush_progress() == 0, "a finished job's progress isn't overwritten"
+    assert await r.hget("task:p1", "status") == "Success" and await r.hget("task:p1", "progress") == "40.0"
+
+
+async def test_7c_cpu_tasks_report_progress_from_their_process(env, cpu_pool):
+    r = env
+    from tests import v050_tasks
+    pool = await cpu_pool(1)
+    tasks = {"steps": {"handler": v050_tasks.steps, "type": "cpu", "max_retries": 0}}
+    await queueing.enqueue(r, queueing.new_payload("steps", [3, 0.3], task_id="cpu1"))
+    raw = await pop(r)
+    sem = asyncio.Semaphore(1)
+    await sem.acquire()
+
+    async def go():
+        with patch.object(worker, "TASKS", tasks):
+            await worker.handle_task(raw, sem, asyncio.get_running_loop(), pool, ThreadPoolExecutor(2))
+    job = asyncio.create_task(go())
+    seen = set()
+    while not job.done():
+        await asyncio.sleep(0.1)
+        await worker._flush_progress()
+        p = await r.hget("task:cpu1", "progress")
+        if p and await r.hget("task:cpu1", "status") == "Processing":
+            seen.add(p)
+    await job
+    assert {"33.3", "66.7"} <= seen
+    assert await r.hget("task:cpu1", "result") == "cpu1", "current_task_id() works in the process"
+
+
+async def test_7c_a_retry_starts_from_zero(r):
+    await r.hset("task:f1", mapping={"status": "RetryScheduled", "progress": "80.0", "progress_message": "x",
+                                     "progress_at": "1"})
+    await r.eval(worker.STARTED_SCRIPT, 1, "task:f1", "status", "Processing")
+    assert await r.hmget("task:f1", "progress", "progress_message", "progress_at") == [None, None, None]
