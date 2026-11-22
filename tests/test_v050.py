@@ -1021,6 +1021,8 @@ async def test_7f_prometheus_metrics(env, client):
     assert 'pytaskq_queue_jobs{queue="default",priority="default"} 2' in body
     assert 'pytaskq_queue_paused{queue="default"} 1' in body
     assert "pytaskq_jobs_succeeded_total 1" in body
+    await r.set("stats:completed", 123456789)
+    assert "pytaskq_jobs_succeeded_total 123456789\n" in (await client.get("/metrics/prometheus")).text
     assert 'pytaskq_cron_missed_runs_total{task="nightly"} 2' in body and "nightly:at" not in body
     assert f'pytaskq_info{{version="{__import__("pytaskq").__version__}"}} 1' in body
 

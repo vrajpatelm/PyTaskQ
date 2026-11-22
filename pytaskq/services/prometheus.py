@@ -34,7 +34,8 @@ class _Writer:
             samples = [({}, samples)]
         for labels, value in samples:
             inner = ",".join(f'{k}="{_label(v)}"' for k, v in labels.items())
-            self.lines.append(f"{name}{{{inner}}} {float(value):g}" if inner else f"{name} {float(value):g}")
+            number = str(int(value)) if float(value).is_integer() else repr(float(value))   # exact, never 1.2e+07
+            self.lines.append(f"{name}{{{inner}}} {number}" if inner else f"{name} {number}")
 
     def text(self) -> str:
         return "\n".join(self.lines) + "\n"
