@@ -416,3 +416,83 @@ async def test_5_worker_advertises_and_dashboard_reports(env, client, caplog):
     assert {w["version"] for w in workers} == {__import__("pytaskq").__version__}
     perf = (await client.get("/system/performance")).json()["suggestions"]
     assert any(s["title"] == "RESULT_TTL is set differently on some workers" for s in perf)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 6. Cron catch-up
+# ═════════════════════════════════════════════════════════════════════════════
+
+from datetime import datetime, timezone  # noqa: E402
+
+
+def _utc(day, hour, minute=0, second=30):
+    return datetime(2026, 11, day, hour, minute, second, tzinfo=timezone.utc).timestamp()
+
+
+async def _cron(r, tasks, now):
+    with patch.object(worker, "TASKS", tasks):
+        return await worker.run_due_cron_jobs(now=now)
+
+
+HOURLY = {"report": {"handler": print, "cron": "0 * * * *", "type": "io"}}
+
+
+async def test_6_on_time_ticks_run_once(env):
+    r = env
+    assert await _cron(r, HOURLY, _utc(22, 9)) == 1
+    assert await _cron(r, HOURLY, _utc(22, 9, 0, 40)) == 0, "same tick"
+    assert await _cron(r, HOURLY, _utc(22, 10)) == 1
+    assert not await r.hgetall(worker.CRON_MISSED_KEY)
+
+
+async def test_6_missed_ticks_are_logged_and_the_latest_runs_once(env, caplog):
+    r = env
+    assert await _cron(r, HOURLY, _utc(22, 9)) == 1
+    # The workers were down from 09:30 to 13:20: the 10:00, 11:00, 12:00 and 13:00 runs were missed.
+    assert await _cron(r, HOURLY, _utc(22, 13, 20)) == 1
+    assert "report missed 4 run(s)" in caplog.text and "Running the latest one now" in caplog.text
+    assert await r.hget(worker.CRON_MISSED_KEY, "report") == "4"
+    job_id = (await r.lrange(queueing.RECENT_KEY, 0, 0))[0]
+    assert "Late run for the 2026-11-22T13:00:00+00:00 tick" in await r.hget(f"task:{job_id}", "note")
+    assert await _cron(r, HOURLY, _utc(22, 13, 50)) == 0, "caught up: nothing more until 14:00"
+    assert await _cron(r, HOURLY, _utc(22, 14)) == 1
+
+
+async def test_6_catch_up_can_be_turned_off(env, caplog):
+    r = env
+    tasks = {"report": {**HOURLY["report"], "catch_up": False}}
+    await _cron(r, tasks, _utc(22, 9))
+    assert await _cron(r, tasks, _utc(22, 13, 20)) == 0
+    assert "Not catching up" in caplog.text and await r.hget(worker.CRON_MISSED_KEY, "report") == "4"
+    with patch.object(settings, "CRON_CATCH_UP", False):
+        await _cron(r, HOURLY, _utc(22, 16, 30))
+    assert await r.hget(worker.CRON_MISSED_KEY, "report") == "7"
+
+
+async def test_6_a_new_cron_task_doesnt_count_the_past_as_missed(env):
+    r = env
+    assert await _cron(r, HOURLY, _utc(22, 9, 40)) == 0
+    assert not await r.hgetall(worker.CRON_MISSED_KEY)
+    assert await _cron(r, HOURLY, _utc(22, 10)) == 1
+
+
+def test_6_catch_up_is_only_for_cron_tasks():
+    q = PyTaskQ()
+    with pytest.raises(ValueError, match="catch_up"):
+        @q.task(catch_up=True)
+        def not_cron():
+            pass
+
+    @q.task(cron="0 9 * * *", catch_up=False)
+    def daily():
+        pass
+    assert q.TASKS["daily"]["catch_up"] is False
+
+
+async def test_6_missed_runs_show_in_settings_performance(env, client):
+    r = env
+    await _cron(r, HOURLY, _utc(22, 9))
+    await _cron(r, HOURLY, _utc(22, 13, 20))
+    with patch.object(time, "time", lambda: _utc(22, 13, 30)):
+        perf = (await client.get("/system/performance")).json()["suggestions"]
+    assert any(s["title"] == "Scheduled task report missed 4 run(s)" for s in perf)

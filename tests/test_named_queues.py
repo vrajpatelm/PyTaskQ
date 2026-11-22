@@ -425,6 +425,9 @@ def _at(year, month, day, hour, minute, second=30):
 
 
 async def cron_runs(r, tasks, now):
+    """These tests jump the clock around to check time-zone math; forget which ticks were handled
+    (since 0.5 PyTaskQ remembers that, to notice missed runs; catch-up is tested in test_v050.py)."""
+    await r.delete(worker.CRON_STATE_KEY)
     with patch.object(worker, "TASKS", tasks):
         return await worker.run_due_cron_jobs(now=now)
 

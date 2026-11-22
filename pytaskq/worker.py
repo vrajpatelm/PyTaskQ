@@ -553,30 +553,78 @@ async def cron_scheduler():
 
 
 CRON_LOCK_TTL = 3 * 3600
+CRON_STATE_KEY = rkey("pytaskq:cron")          # HASH task → the latest tick handled (Unix time)
+CRON_MISSED_KEY = rkey("pytaskq:cron:missed")  # HASH task → missed ticks; "task:at" → when last noticed
+MISSED_COUNT_LIMIT = 10_000
+
+
+def _missed_ticks(cron_expr: str, zone, after: float, until: datetime) -> int:
+    """How many ticks fell after `after` (exclusive) and up to `until` (inclusive)."""
+    it = croniter.croniter(cron_expr, datetime.fromtimestamp(after, zone))
+    count = 0
+    while count < MISSED_COUNT_LIMIT:
+        tick = it.get_next(datetime)
+        if tick > until:
+            break
+        count += 1
+    return count
 
 
 async def run_due_cron_jobs(now: float = None) -> int:
-    """Queue every cron task whose latest tick was in the last minute (once per tick, fleet-wide).
+    """Queue every cron task whose latest tick is due (once per tick, fleet-wide).
 
     Schedules are read in the task's `tz` (else CRON_TIMEZONE, UTC by default),
     so "0 9 * * *" means 09:00 in that zone on every machine, whatever the
     machine's own clock is set to, and every worker computes the same tick.
     The tick lock, the job record and the push are one atomic step: a fast
     worker can't finish the job before its record exists.
+
+    A tick is normally queued within a minute of its time. If no worker was
+    leading then (an outage, a long deploy), the ticks are missed: that's
+    logged and counted (Settings → Performance), and with catch_up (the
+    default) the latest missed tick runs once now. Before 0.5, missed ticks
+    were skipped without a word.
     """
+    r = redis_client.r
     now = clock.now() if now is None else now
     queued = 0
-    for task_name, task_info in list(TASKS.items()):
-        cron_expr = task_info.get("cron")
-        if not cron_expr:
-            continue
+    cron_tasks = [(n, i) for n, i in list(TASKS.items()) if i.get("cron")]
+    if not cron_tasks:
+        return 0
+    handled = await r.hmget(CRON_STATE_KEY, [n for n, _ in cron_tasks])
+    for (task_name, task_info), last in zip(cron_tasks, handled):
+        cron_expr = task_info["cron"]
         try:
             zone_name = task_info.get("tz") or settings.CRON_TIMEZONE
             zone = cron_zone(zone_name)
             local_now = datetime.fromtimestamp(now, zone)
             prev_tick = croniter.croniter(cron_expr, local_now).get_prev(datetime)
-            if now - prev_tick.timestamp() >= 60:
-                continue
+            tick_at = prev_tick.timestamp()
+            last_at = float(last) if last else None
+            if last_at is not None and tick_at <= last_at:
+                continue                                    # this tick was handled already
+            late = now - tick_at
+            note = ""
+            if late >= 60:
+                if last_at is None:
+                    # First time this task is seen: no record of what ran before, so nothing to call missed.
+                    await r.hset(CRON_STATE_KEY, task_name, tick_at)
+                    continue
+                missed = _missed_ticks(cron_expr, zone, last_at, prev_tick)
+                catch_up = task_info.get("catch_up")
+                catch_up = settings.CRON_CATCH_UP if catch_up is None else catch_up
+                await r.hincrby(CRON_MISSED_KEY, task_name, missed)
+                await r.hset(CRON_MISSED_KEY, f"{task_name}:at", now)
+                logger.warning(
+                    f"[Cron] {task_name} missed {missed} run(s) between "
+                    f"{datetime.fromtimestamp(last_at, zone).isoformat()} and {prev_tick.isoformat()}: no worker "
+                    f"was running the schedule then. "
+                    + ("Running the latest one now (catch_up)." if catch_up else "Not catching up (catch_up=False).")
+                )
+                if not catch_up:
+                    await r.hset(CRON_STATE_KEY, task_name, tick_at)
+                    continue
+                note = f"Late run for the {prev_tick.isoformat()} tick, which was missed (catch_up)."
             # One run per LOCAL clock time: when clocks go back, 01:30 happens twice,
             # and the second one finds the first one's lock (standard cron runs once too).
             lock = rkey(f"cron_lock:{task_name}:{zone_name}:{prev_tick.strftime('%Y-%m-%dT%H:%M')}")
@@ -585,9 +633,10 @@ async def run_due_cron_jobs(now: float = None) -> int:
             # The lock only has to outlive the tick (and clocks going back an hour): 3 hours, not 30 days
             # (an every-minute task used to leave 43,200 lock keys behind).
             if await queueing.enqueue(redis_client.r, payload, lock=lock, lock_ttl=CRON_LOCK_TTL,
-                                      max_bytes=0) is not None:
+                                      max_bytes=0, note=note or None) is not None:
                 queued += 1
-                logger.info(f"[Cron] Queued {task_name} for {prev_tick.isoformat()}")
+                logger.info(f"[Cron] Queued {task_name} for {prev_tick.isoformat()}" + (" (late)" if note else ""))
+            await r.hset(CRON_STATE_KEY, task_name, tick_at)
         except Exception as e:
             logger.error(f"[Cron] Could not schedule {task_name}: {e}")
     return queued

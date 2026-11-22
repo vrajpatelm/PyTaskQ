@@ -33,6 +33,7 @@ class Settings(BaseSettings):
     MAX_PAYLOAD_BYTES: int = 1_000_000 # larger jobs (arguments) are refused: API 413, SDK ValueError; 0 = no limit
     DLQ_LIMIT: int = 10_000            # dead letters kept; the oldest are dropped beyond this (0 = no limit)
     CRON_TIMEZONE: str = "UTC"         # time zone for cron schedules (a task's own tz= wins)
+    CRON_CATCH_UP: bool = True         # run the latest missed cron tick once after an outage (a task's catch_up= wins)
 
     # ── Workers ──────────────────────────────────────────────────────────────
     WORKER_QUEUES: str = ""            # queues a worker serves, comma-separated (empty = its tasks' queues)

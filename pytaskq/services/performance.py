@@ -172,6 +172,7 @@ async def build_report(workers: list[dict]) -> dict:
     found = await _redis_suggestions(r, mem, turned_away) + found
     from pytaskq.core import fleet
     found += [_suggest(p["level"], p["title"], p["detail"]) for p in fleet.compare(live)]
+    found += await _missed_cron(r)
     try:
         kept = await redis_health.retention(r)
     except Exception:
@@ -204,6 +205,33 @@ async def build_report(workers: list[dict]) -> dict:
         },
         "suggestions": found,
     }
+
+
+async def _missed_cron(r) -> list[dict]:
+    """Cron runs missed in the last week because no worker was running the schedule."""
+    from pytaskq.core.keys import k as rkey
+    try:
+        missed = await r.hgetall(rkey("pytaskq:cron:missed"))
+    except Exception:
+        return []
+    out = []
+    for name, count in missed.items():
+        if name.endswith(":at"):
+            continue
+        try:
+            at = float(missed.get(f"{name}:at") or 0)
+        except ValueError:
+            at = 0
+        if not at or time.time() - at > 7 * 86400:
+            continue
+        out.append(_suggest(
+            "warning", f"Scheduled task {name} missed {int(count):,} run(s)",
+            f"Last noticed {time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime(at))}. No worker was running the "
+            f"schedule when they were due (all workers stopped, or Redis was down). The latest missed run was "
+            f"run late unless the task has catch_up=False. Keep at least one worker running, or run two so one "
+            f"can take over.",
+        ))
+    return out
 
 
 async def _redis_suggestions(r, mem: dict, turned_away: dict) -> list[dict]:

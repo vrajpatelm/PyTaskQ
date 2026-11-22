@@ -186,6 +186,7 @@ class PyTaskQ:
         priority: Optional[str] = None,
         queue: Optional[str] = None,
         tz: Optional[str] = None,
+        catch_up: Optional[bool] = None,
         max_retries: Optional[int] = None,
         timeout: Optional[float] = None,
     ):
@@ -198,6 +199,9 @@ class PyTaskQ:
         cron        Standard 5-field cron expression; the fleet enqueues it on schedule.
         tz          Time zone the cron expression is read in, e.g. "Europe/London"
                     (default: the CRON_TIMEZONE setting, which is UTC).
+        catch_up    For cron tasks: after an outage (no worker running when a tick was
+                    due), run the latest missed tick once when workers are back
+                    (default: the CRON_CATCH_UP setting, True). Missed runs are always logged.
         priority    "high", "default" or "low" within its queue.
         queue       Named queue (default "default", or the app's default_queue). Only
                     workers serving this queue run the task: use it to give a kind of
@@ -229,6 +233,8 @@ class PyTaskQ:
                 if cron is None:
                     raise ValueError(f"{fn.__name__}: tz= only applies to cron tasks")
                 _check_time_zone(tz)
+            if catch_up is not None and cron is None:
+                raise ValueError(f"{fn.__name__}: catch_up= only applies to cron tasks")
             task_queue = queueing.check_queue_name(self.default_queue if queue is None else queue)
             if max_retries is not None and max_retries < 0:
                 raise ValueError("max_retries must be >= 0")
@@ -244,6 +250,7 @@ class PyTaskQ:
                 "type": task_type,
                 "cron": cron,
                 "tz": tz,
+                "catch_up": catch_up,
                 "priority": prio,
                 "queue": task_queue,
                 "max_retries": retries,

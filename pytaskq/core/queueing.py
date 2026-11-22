@@ -388,7 +388,8 @@ _NO_KEY = rkey("pytaskq:unused")     # placeholder for KEYS a call doesn't use
 async def enqueue(r, payload: dict, delay_seconds: float = 0, created_by: Optional[str] = None,
                   idempotency_key: Optional[str] = None, *, capacity: int = 0,
                   lock: Optional[str] = None, lock_ttl: int = 2592000,
-                  max_bytes: Optional[int] = None, oom_ok: bool = False) -> Optional[dict]:
+                  max_bytes: Optional[int] = None, oom_ok: bool = False,
+                  note: Optional[str] = None) -> Optional[dict]:
     """Push a task payload onto its priority queue (or the delayed set), atomically.
 
     With an idempotency key, the first call queues the job and remembers the key
@@ -424,6 +425,8 @@ async def enqueue(r, payload: dict, delay_seconds: float = 0, created_by: Option
         meta = _meta(payload, raw, status, now, delay_seconds)
         if created_by:
             meta["created_by"] = created_by
+        if note:
+            meta["note"] = note
         result = {"task_id": task_id, "status": status.lower()}
         if delay_seconds > 0:
             result["execute_in_seconds"] = delay_seconds
