@@ -18,8 +18,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import math
 import re
+import time
 import uuid
 from typing import Any, Iterable, Optional
 
@@ -27,6 +29,8 @@ from pytaskq import tracing
 from pytaskq.core import clock
 from pytaskq.core.config import settings
 from pytaskq.core.keys import k as rkey, fill_scripts
+
+logger = logging.getLogger("pytaskq")
 
 PRIORITIES = ("high", "default", "low")
 
@@ -432,7 +436,7 @@ async def enqueue(r, payload: dict, delay_seconds: float = 0, created_by: Option
             result["execute_in_seconds"] = delay_seconds
         record = json.dumps({"fingerprint": fingerprint, "response": result}) if idem else ""
         fields = [str(x) for kv in meta.items() for x in kv]
-        reply = await r.eval(
+        args = (
             ENQUEUE_SCRIPT, 12,
             rkey("delayed_tasks") if delay_seconds > 0 else queue_key(priority, queue),
             task_key(task_id), RECENT_KEY, QUEUES_KEY, idem or _NO_KEY, lock or _NO_KEY,
@@ -442,8 +446,21 @@ async def enqueue(r, payload: dict, delay_seconds: float = 0, created_by: Option
             str(int(lock_ttl)) if lock else "", task_id, "1" if oom_ok else "0", max(0, settings.MAX_QUEUES),
             *fields,
         )
+        replicas = max(0, int(settings.REDIS_WAIT_REPLICAS or 0))
+        if replicas:
+            # WAIT counts the writes of the connection it runs on, so it goes in the same pipeline.
+            async with r.pipeline(transaction=False) as pipe:
+                pipe.eval(*args)
+                pipe.execute_command("WAIT", replicas, max(1, int(settings.REDIS_WAIT_TIMEOUT_MS)))
+                reply, acked = await pipe.execute()
+        else:
+            reply = await r.eval(*args)
         code = int(reply[0])
         if code == 1:
+            if replicas:
+                result["replicas"] = int(acked)
+                if int(acked) < replicas:
+                    _warn_unreplicated(task_id, int(acked), replicas)
             return result
         if code == 2:
             return _duplicate(reply[1], fingerprint)
@@ -454,6 +471,19 @@ async def enqueue(r, payload: dict, delay_seconds: float = 0, created_by: Option
         if code == 5:
             raise TooManyQueues(queue, int(reply[1]))
         raise QueueFull(queue, int(reply[1]) if len(reply) > 1 else 0)
+
+
+_last_replica_warning = 0.0
+
+
+def _warn_unreplicated(task_id: str, acked: int, wanted: int) -> None:
+    global _last_replica_warning
+    if time.monotonic() - _last_replica_warning < 10:
+        return
+    _last_replica_warning = time.monotonic()
+    logger.warning(f"Job {task_id} is queued, but only {acked} of {wanted} Redis replica(s) confirmed it within "
+                   f"REDIS_WAIT_TIMEOUT_MS ({settings.REDIS_WAIT_TIMEOUT_MS} ms). If the primary failed right now, "
+                   f"it could be lost. Check the replicas (INFO replication).")
 
 
 # Atomically pull a waiting task out of its queue or the delayed set.

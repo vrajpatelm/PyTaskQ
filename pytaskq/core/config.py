@@ -18,6 +18,12 @@ class Settings(BaseSettings):
     REDIS_PASSWORD: str = ""
     REDIS_MAX_CONNECTIONS: int = 200   # per process; requests wait for a free one instead of failing
     REDIS_POOL_TIMEOUT: float = 5      # seconds a request waits for a free connection before a 503
+    # High availability (docs/REDIS.md): Redis Sentinel finds the current primary and follows failovers.
+    REDIS_SENTINELS: str = ""          # "host1:26379,host2:26379,host3:26379"; wins over REDIS_URL's host
+    REDIS_SENTINEL_MASTER: str = "mymaster"   # the name the Sentinels monitor
+    REDIS_SENTINEL_PASSWORD: str = ""  # if the Sentinels themselves need a password
+    REDIS_WAIT_REPLICAS: int = 0       # after queueing a job, wait until this many replicas have it (0 = don't)
+    REDIS_WAIT_TIMEOUT_MS: int = 500   # …but no longer than this; a warning is logged when fewer confirmed
 
     # ── Queue behaviour ──────────────────────────────────────────────────────
     QUEUE_CAPACITY: int = 500          # jobs that can wait in EACH queue before the API answers 429 (0 = no limit)

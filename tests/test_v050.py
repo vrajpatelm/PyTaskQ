@@ -1125,3 +1125,70 @@ async def test_7e_pausing_takes_effect_at_once_even_before_workers_notice(env):
     await queueing.resume_queue(r, "mail")
     raw = await r.eval(worker.PRIORITY_POP_SCRIPT, *worker.pop_call(["mail", "default"], 0))
     assert json.loads(raw)["task_id"] == "m1"
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 8. High availability
+# ═════════════════════════════════════════════════════════════════════════════
+
+def test_8_sentinel_failover_with_real_redis():
+    """A primary, a replica and three Sentinels: kill the primary while jobs are being queued."""
+    import os
+    import shutil
+    import subprocess
+    import sys
+    if not shutil.which("redis-server") or not shutil.which("redis-cli"):
+        pytest.skip("needs redis-server and redis-cli")
+    env = {**os.environ, "HA_BASE_PORT": "6421", "REDIS_KEY_PREFIX": "", "REDIS_URL": ""}
+    script = os.path.join(os.path.dirname(__file__), "ha_scenario.py")
+    run = subprocess.run([sys.executable, script], env=env, capture_output=True, text=True, timeout=120)
+    assert run.returncode == 0, run.stderr[-2000:]
+    out = json.loads(run.stdout.strip().splitlines()[-1])
+    assert out["first_replicas"] == 1, "WAIT confirmed the job reached the replica"
+    assert out["new_primary_port"] == 6422, "Sentinel promoted the replica"
+    assert out["missing"] == [] and out["queued_now"] == len(out["confirmed"]) == 20
+    assert out["seconds_unavailable"] < 15
+    assert out["replicas_without_replica"] == 0, "no replica left: still queued, and the reply says so"
+    assert out["heartbeat_client_ping"] is True
+    assert "only 0 of 1 Redis replica(s) confirmed" in run.stderr + run.stdout
+
+
+def test_8_sentinel_settings_are_checked():
+    from pytaskq.core import redis_client
+    assert redis_client.sentinel_hosts("a:26379, b:26380 ,") == [("a", 26379), ("b", 26380)]
+    assert redis_client.sentinel_hosts("[::1]:26379") == [("::1", 26379)]
+    for bad in ("a", "a:b", ":26379"):
+        with pytest.raises(SystemExit, match="host:port"):
+            redis_client.sentinel_hosts(bad)
+
+
+async def test_8_wait_runs_on_the_same_connection_as_the_write(r, caplog):
+    calls = []
+    real_pipeline = r.pipeline
+
+    def spy(*a, **k):
+        pipe = real_pipeline(*a, **k)
+        real_execute_command = pipe.execute_command
+
+        def record(*args, **kw):
+            calls.append(args[0])
+            if args[0] == "WAIT":
+                return real_execute_command("ECHO", "0", **kw)     # fakeredis has no replicas
+            return real_execute_command(*args, **kw)
+        pipe.execute_command = record
+        return pipe
+
+    with patch.object(settings, "REDIS_WAIT_REPLICAS", 2), patch.object(r, "pipeline", spy):
+        res = await queueing.enqueue(r, queueing.new_payload("ok", [1]))
+    assert calls[-2:] == ["EVAL", "WAIT"], "one pipeline: the WAIT counts the enqueue's write"
+    assert res["replicas"] == 0 and "only 0 of 2 Redis replica(s) confirmed" in caplog.text
+    with patch.object(settings, "REDIS_WAIT_REPLICAS", 0):
+        assert "replicas" not in await queueing.enqueue(r, queueing.new_payload("ok", [2]))
+
+
+async def test_8_performance_page_warns_when_replicas_are_missing(client, r):
+    async def info(section=None, *a, **k):
+        return {"connected_slaves": 0} if section == "replication" else {}
+    with patch.object(settings, "REDIS_WAIT_REPLICAS", 1), patch.object(r, "info", info):
+        found = (await client.get("/system/performance")).json()["suggestions"]
+    assert any(s["title"] == "REDIS_WAIT_REPLICAS is 1, but Redis has 0 replica(s) connected" for s in found)

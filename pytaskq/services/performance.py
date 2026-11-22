@@ -250,6 +250,20 @@ async def _redis_suggestions(r, mem: dict, turned_away: dict) -> list[dict]:
             "Redis reached `maxmemory`. Workers keep taking and finishing waiting jobs, which frees memory; raise "
             "`maxmemory` or add workers if it happens again.",
         ))
+    wanted = max(0, int(settings.REDIS_WAIT_REPLICAS or 0))
+    if wanted:
+        try:
+            info = await r.info("replication")
+            have = int(info.get("connected_slaves") or 0)
+        except Exception:
+            have = None
+        if have is not None and have < wanted:
+            out.append(_suggest(
+                "warning", f"REDIS_WAIT_REPLICAS is {wanted}, but Redis has {have} replica(s) connected",
+                f"Every new job waits up to REDIS_WAIT_TIMEOUT_MS ({settings.REDIS_WAIT_TIMEOUT_MS} ms) for replicas "
+                f"that aren't there, and isn't protected against losing the primary. Bring the replicas back "
+                f"(INFO replication on the primary), or lower REDIS_WAIT_REPLICAS.",
+            ))
     try:
         lost = await r.hget(redis_health.INSTALL_KEY, "data_lost_at")
         lost_at = float(lost) if lost else 0
