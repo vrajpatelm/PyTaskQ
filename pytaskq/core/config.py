@@ -20,14 +20,21 @@ class Settings(BaseSettings):
     REDIS_POOL_TIMEOUT: float = 5      # seconds a request waits for a free connection before a 503
 
     # ── Queue behaviour ──────────────────────────────────────────────────────
-    QUEUE_CAPACITY: int = 500          # jobs that can wait in EACH queue before new ones get 429
+    QUEUE_CAPACITY: int = 500          # jobs that can wait in EACH queue before the API answers 429 (0 = no limit)
     TASK_TIMEOUT: float = 300          # default per-task timeout (seconds, 0 = none)
     MAX_RETRIES: int = 3               # default retries before a task is dead-lettered
-    RESULT_TTL: int = 86400            # how long task status/results are kept (seconds)
+    RESULT_TTL: int = 86400            # how long a FINISHED job's status/result is kept (seconds)
     HISTORY_LIMIT: int = 500           # how many recent tasks the dashboard can list
     MAX_RESULT_BYTES: int = 1_000_000  # larger results aren't stored (the job still succeeds); 0 = no limit
+    MAX_PAYLOAD_BYTES: int = 1_000_000 # larger jobs (arguments) are refused: API 413, SDK ValueError; 0 = no limit
+    DLQ_LIMIT: int = 10_000            # dead letters kept; the oldest are dropped beyond this (0 = no limit)
     CRON_TIMEZONE: str = "UTC"         # time zone for cron schedules (a task's own tz= wins)
+
+    # ── Workers ──────────────────────────────────────────────────────────────
     WORKER_QUEUES: str = ""            # queues a worker serves, comma-separated (empty = its tasks' queues)
+    WORKER_NAME: str = ""              # stable, unique worker name ("{hostname}" allowed); empty = random each start
+    WORKER_HEARTBEAT_TTL: int = 30     # seconds without a heartbeat before a worker counts as dead
+    WORKER_SHUTDOWN_GRACE: float = 30  # seconds running jobs get to finish on Ctrl+C / docker stop
 
     # ── Authentication (self-hosting) ────────────────────────────────────────
     PYTASKQ_AUTH: str = "on"           # "off" disables login (local development only)

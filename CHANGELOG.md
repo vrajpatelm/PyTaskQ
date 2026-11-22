@@ -2,6 +2,45 @@
 
 All notable changes to PyTaskQ. Versions follow [semantic versioning](https://semver.org/).
 
+## 0.4.1 — 2026-11-21
+
+Reliability fixes from a break test of 0.4.0: crashed and hung tasks, Redis outages mid-job, frozen event loops, invalid jobs and request floods, on a real Redis with real worker processes. Every fix has a regression test, and the experiments were re-run. New guide: `docs/WORKERS.md` (how tasks run, timeouts per task type, what happens when things go wrong).
+
+### Upgrading from 0.4.0
+- **The API now checks a job's arguments** against the parameters the workers advertise, and answers `422` for a missing required argument, an unknown keyword or too many positional ones (before, the job failed on every retry in the worker).
+- **Jobs over 1 MB are refused** (`MAX_PAYLOAD_BYTES`, `0` = no limit): `413` from the API, `ValueError` from `.delay()`.
+- **Task names starting with `_` can't be queued through the API** (`403`). They're PyTaskQ's internal tasks.
+- A job's record no longer expires while it waits or runs; `RESULT_TTL` now counts from when it finishes.
+- A job recovered from a crashed worker keeps its priority (it used to be moved to `high`) and goes to the front of its queue.
+- Stopping a worker gives running jobs `WORKER_SHUTDOWN_GRACE` (30 s), then puts any still running back on their queue. Before, it waited forever. The compose files set `stop_grace_period: 40s` and `WORKER_NAME={hostname}` for workers.
+- `QUEUE_CAPACITY=0` now means "no limit" (it used to refuse every API job).
+
+### Fixed
+- **A crashed CPU task process froze the whole worker** (the out-of-memory killer, a C extension crash, `os._exit`): it stopped heartbeating and ignored SIGTERM. Now only that job fails (`ProcessCrashed`, retried normally) and a fresh process takes its place. If processes can't be started at all, the worker exits with code 1 so it gets restarted.
+- **A timed-out task kept its slot, so every later job timed out without running.** CPU tasks now run one per process, and a timed-out one's process is stopped and replaced. A timed-out IO thread (which Python can't stop) keeps its slot until it returns, so later jobs wait for a thread instead of timing out behind it; when every IO thread is stuck, the worker leaves IO jobs for other workers.
+- **The timeout included time spent waiting for a free process or thread**, so bursts of CPU jobs were dead-lettered while waiting. The timeout, `started_at` and the *Processing* status now start when the function does.
+- **Shutdown hung forever on a stuck CPU task.**
+- **A Redis outage as a job finished left it "Processing" forever**, and a job running at a clean stop was orphaned. Saving an outcome and removing the job from the worker's list are now one atomic step, retried until Redis is back; a stopping worker puts unfinished jobs back; the leader also recovers jobs listed by workers that have no heartbeat.
+- **A worker whose event loop was blocked looked dead, so its job ran twice at once.** The heartbeat now runs in its own thread with its own Redis connection, and a watchdog logs which async task is blocking the loop (also shown on the Workers tab and in *Settings → Performance*).
+- **The sweeper could queue a job that had just finished again**, overwriting Success. Recovery is now one Lua script that does nothing if the job is no longer listed or already finished.
+- **A fast cron job could end up "Queued" forever** (its record was written after the push). The tick lock, the record and the push are now one script.
+- **`QUEUE_CAPACITY` could be overshot** (limit 10, 29 accepted under load). The check and the push are now one script: exact under any load. Scheduled jobs through the API respect it too, and due scheduled jobs and retries move onto a queue only while it has room (in batches of 500, with one log line per pass instead of one per job: 10,000 jobs in 0.2 s instead of 50,000 in 28 s).
+- **Each job's arguments were stored three times.** Now once (`args`/`kwargs` are read from the stored job). Dead letters are capped at `DLQ_LIMIT` (10,000).
+- **Invalid jobs vanished silently**, and all of them overwrote one `task:Unknown` record. They now become "(invalid job)" dead letters with the text that was sent. A non-object entry in the delayed set no longer logs an error every second forever. Stored jobs are validated (priority, non-negative retry count and so on).
+- **A job waiting longer than `RESULT_TTL` lost its record** (it couldn't be cancelled but still ran).
+- **Recovery on worker start never ran.** With `WORKER_NAME` (or `pytaskq worker --name`; `{hostname}` allowed), a restarted worker puts back its unfinished jobs at once instead of after about 40 seconds. Two live workers can't share a name.
+- A 2 MB task name was echoed back in the error; names are limited to 200 characters and long rejected values are shortened in `422` replies.
+- The leader lock is taken and renewed in one step, so a leader can't renew another worker's lock.
+- Heartbeats, retry times and schedules use Redis's clock, so a machine with a wrong clock no longer looks dead.
+- An async task that overruns its timeout because it blocked the event loop is logged as such.
+- A promoted retry or scheduled job shows *Queued* while it waits (it showed *RetryScheduled*).
+
+### Added
+- `docs/WORKERS.md`.
+- Settings: `MAX_PAYLOAD_BYTES` (1 MB), `DLQ_LIMIT` (10,000), `WORKER_SHUTDOWN_GRACE` (30 s), `WORKER_HEARTBEAT_TTL` (30 s), `WORKER_NAME`; `pytaskq worker --name`.
+- `/system/workers` reports `stuck_io`, `cpu_restarts` and `loop_blocked_seconds`; the Workers tab and *Settings → Performance* explain them.
+- The dashboard's dead letters show what an invalid job contained, and offer only Delete for it.
+
 ## 0.4.0 — 2026-11-20
 
 Named queues, cron time zones, and everything from the unreleased 0.3.2: faster under load, safer to retry, traceable end to end, and a set of bugs fixed after a close review. On a 2-core server with 500 simulated users, the "Redis unavailable" errors went from 14% of requests to none, and the typical response from 320 ms to 16 ms. Details in `docs/PERFORMANCE.md`.

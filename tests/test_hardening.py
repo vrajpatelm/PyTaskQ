@@ -160,11 +160,13 @@ async def test_unreadable_dead_letter_does_not_break_the_page(client, r):
     assert (await client.post("/dlq/replay/good")).status_code == 200
 
 
-async def test_replayed_job_record_still_expires(client, r):
+async def test_replayed_job_record_waits_without_expiring(client, r):
+    """0.4.1: a waiting job's record never expires (B13); it gets RESULT_TTL when the job finishes."""
     await r.lpush("dlq", _dead_letter("old"))            # its task:old record expired long ago
+    await r.hset("task:old", "status", "DeadLetter")
+    await r.expire("task:old", 100)
     assert (await client.post("/dlq/replay/old")).status_code == 200
-    ttl = await r.ttl("task:old")
-    assert 0 < ttl <= settings.RESULT_TTL
+    assert await r.ttl("task:old") == -1
 
 
 async def test_workers_with_different_apps_dont_hide_each_others_tasks(client, r):
@@ -182,7 +184,7 @@ async def test_workers_with_different_apps_dont_hide_each_others_tasks(client, r
         await emails.publish()
         await images.publish()      # the second worker's heartbeat used to replace the first one's tasks
     for name in ("send_email", "resize"):
-        res = await client.post("/task/enqueue", json={"task_name": name})
+        res = await client.post("/task/enqueue", json={"task_name": name, "args": ["x"]})
         assert res.status_code == 200, res.text
     names = [t["name"] for t in (await client.get("/tasks/registered")).json()["tasks"]]
     assert {"send_email", "resize"} <= set(names)
@@ -197,7 +199,7 @@ async def test_tasks_nobody_advertises_any_more_disappear(client, r):
 
     with patch("pytaskq.core.redis_client.r", r):
         await app.publish()
-        with patch("pytaskq.core.queueing.time.time", return_value=time.time() + queueing.REGISTRY_TTL + 1):
+        with patch("pytaskq.core.clock.time.time", return_value=time.time() + queueing.REGISTRY_TTL + 1):
             names = [t["name"] for t in await queueing.registered_tasks(r)]
     assert "old_name" not in names
 

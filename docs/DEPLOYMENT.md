@@ -38,7 +38,7 @@ PYTASKQ_DOMAIN=jobs.example.com
 REDIS_PASSWORD=<paste the output of: python3 -c "import secrets; print(secrets.token_urlsafe(32))">
 ```
 
-Pin the version too (`PYTASKQ_VERSION=0.4.0`), so upgrades only happen when you choose.
+Pin the version too (`PYTASKQ_VERSION=0.4.1`), so upgrades only happen when you choose.
 
 ## 3. Start
 
@@ -85,7 +85,7 @@ PYTASKQ_WORKER_APP=tasks:queue
 
 and run `docker compose -f docker-compose.prod.yml up -d` again. The dashboard shows your tasks as soon as the worker starts.
 
-To run more workers, use `docker compose -f docker-compose.prod.yml up -d --scale worker=3`.
+To run more workers, use `docker compose -f docker-compose.prod.yml up -d --scale worker=3`. Each worker container is named after its host name (`WORKER_NAME={hostname}`), so a restarted container puts back the jobs it was running at once, and `docker compose stop` gives running jobs 30 seconds to finish (`stop_grace_period: 40s`). [WORKERS.md](WORKERS.md) explains both.
 
 To give heavy tasks their own workers, put them on a queue (`@queue.task(queue="images")`) and add a second worker service in a `docker-compose.override.yml` next to the prod file:
 

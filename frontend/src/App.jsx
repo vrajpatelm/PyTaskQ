@@ -627,6 +627,9 @@ function WorkersView({ workers }) {
                     {w.status === 'healthy' ? 'Healthy' : w.status === 'degraded' ? 'Slow heartbeat' : 'Unresponsive'}
                   </span>
                   <div className="muted small">{w.last_heartbeat_seconds_ago}s ago</div>
+                  {w.loop_blocked_seconds > 0 && <div className="small warn-text" title="An async task is running blocking code; see Settings → Performance">Blocked by an async task for {w.loop_blocked_seconds}s</div>}
+                  {w.stuck_io > 0 && <div className="small warn-text" title="IO tasks that timed out but whose code is still running">{w.stuck_io} IO thread{w.stuck_io === 1 ? '' : 's'} stuck</div>}
+                  {w.cpu_restarts > 0 && <div className="muted small" title="CPU processes replaced after a timeout or a crash">{w.cpu_restarts} CPU process{w.cpu_restarts === 1 ? '' : 'es'} replaced</div>}
                 </td>
               </tr>
             ))}
@@ -652,7 +655,7 @@ function DeadLettersView({ items, notify, onOpen, canOperate }) {
   return (
     <div className="panel">
       <div className="toolbar">
-        <p className="muted small">These jobs failed every retry. Fix the cause, then replay them.</p>
+        <p className="muted small">These jobs failed every retry. Fix the cause, then replay them. Entries marked “(invalid job)” weren't valid jobs at all; they're kept so you can see what was sent.</p>
         {canOperate && <div className="toolbar-right">
           <button className="btn btn-secondary btn-sm" onClick={() => act('/dlq/retry_all', r => `Replaying ${r.retried} job${r.retried === 1 ? '' : 's'}.`)}>
             <RotateCcw size={14} /> Replay all
@@ -677,14 +680,17 @@ function DeadLettersView({ items, notify, onOpen, canOperate }) {
               <tr key={t.task_id}>
                 <td>
                   <button className="link" onClick={() => onOpen(t.task_id)}>{t.task_name}</button>
-                  <div className="task-id">{t.task_id.slice(0, 8)}</div>
+                  <div className="task-id">{t.invalid ? t.task_id : t.task_id.slice(0, 8)}</div>
                 </td>
-                <td className="error-cell">{t.error || <span className="muted">not recorded</span>}</td>
+                <td className="error-cell">
+                  {t.error || <span className="muted">not recorded</span>}
+                  {t.invalid && <div className="muted small raw-preview" title={t.raw}>Sent: <code>{String(t.raw ?? '').slice(0, 120)}{String(t.raw ?? '').length > 120 ? '…' : ''}</code></div>}
+                </td>
                 <td>{timeAgo(t.failed_at)}</td>
                 <td className="num">{(t.retry_count || 0) + 1}</td>
                 <td>
                   {canOperate && <div className="row-actions">
-                    <button className="btn btn-secondary btn-sm" onClick={() => act(`/dlq/replay/${t.task_id}`, () => `${t.task_name} replayed.`)}><RotateCcw size={14} /> Replay</button>
+                    {!t.invalid && <button className="btn btn-secondary btn-sm" onClick={() => act(`/dlq/replay/${t.task_id}`, () => `${t.task_name} replayed.`)}><RotateCcw size={14} /> Replay</button>}
                     <button className="btn btn-ghost btn-sm" onClick={() => act(`/dlq/purge/${t.task_id}`, () => 'Dead letter deleted.')} aria-label={`Delete ${t.task_name}`}><Trash2 size={14} /></button>
                   </div>}
                 </td>

@@ -61,7 +61,9 @@ Both connect to the same Redis. In Docker Compose, run two worker services with 
 
 ### Capacity is per queue
 
-`QUEUE_CAPACITY` (default 500) applies to **each** queue. When `images` is full, new image jobs get `429` ("queue 'images' is full"), while emails keep being accepted.
+`QUEUE_CAPACITY` (default 500) applies to **each** queue. When `images` is full, new image jobs sent through the API get `429` ("queue 'images' is full"), while emails keep being accepted.
+
+The limit protects the queue from outside traffic. Jobs your app queues with `.delay()`, cron runs, retries and dead-letter replays are never refused. Due scheduled jobs and retries wait in the schedule until their queue is below the limit, so a large backlog that becomes due at once drains steadily instead of filling the queue in one go.
 
 ### What the dashboard shows
 

@@ -13,13 +13,16 @@ _operator = [Depends(require("operator"))]
 
 DLQ_KEY = "dlq"
 _DLQ_ONLY_FIELDS = ("error", "failed_at")
+_NOT_REPLAYABLE = ("This entry isn't a valid job: it was found in a queue and kept here so you can see what was "
+                   "sent (its text is in 'raw'). It can't run; delete it.")
 
 
 # Take one entry out of the dead-letter list and queue it again, atomically.
 # If someone else already took it (a second click, another admin, "Replay all"
 # at the same moment), LREM removes nothing and the job is NOT queued twice.
 # KEYS: dlq, target queue list, task hash
-# ARGV: dead-letter entry, new payload, task_id, task_name, priority, note, result TTL, queue name
+# ARGV: dead-letter entry, new payload, task_id, task_name, priority, note, (unused), queue name
+# The record has no expiry while the job waits again (it gets RESULT_TTL when it finishes).
 REPLAY_SCRIPT = """
 if redis.call('LREM', KEYS[1], 1, ARGV[1]) == 0 then
     return 0
@@ -31,7 +34,7 @@ if ARGV[3] ~= '' then
     redis.call('HSET', KEYS[3], 'task_id', ARGV[3], 'task_name', ARGV[4], 'status', 'Queued',
                'priority', ARGV[5], 'queue', ARGV[8], 'retry_count', 0, 'payload', ARGV[2], 'error', '',
                'note', ARGV[6])
-    redis.call('EXPIRE', KEYS[3], ARGV[7])
+    redis.call('PERSIST', KEYS[3])
 end
 return 1
 """
@@ -94,6 +97,8 @@ async def _replay(raw: str, task: dict) -> bool:
 @router.post("/replay/{task_id}", dependencies=_operator)
 async def replay_task(task_id: str):
     raw, item = await _find(task_id)
+    if item.get("invalid"):
+        raise HTTPException(status_code=409, detail=_NOT_REPLAYABLE)
     task = await _fresh_payload(item)
     if not await _replay(raw, task):
         raise HTTPException(status_code=409, detail="This job was already replayed or deleted by someone else.")
@@ -127,7 +132,7 @@ async def retry_all_dlq():
     retried = 0
     for raw in raws:
         item = _parse(raw)
-        if item is None:
+        if item is None or item.get("invalid"):
             continue
         if await _replay(raw, await _fresh_payload(item)):
             retried += 1

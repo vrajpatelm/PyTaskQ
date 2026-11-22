@@ -66,9 +66,14 @@ services:
     image: ${WORKER_IMAGE:-ghcr.io/vrajpatelm/pytaskq:${PYTASKQ_VERSION:-latest}}
     command: ["pytaskq", "worker", "--app", "${PYTASKQ_WORKER_APP:-example_app:queue}"]
     restart: unless-stopped
+    # Running jobs get WORKER_SHUTDOWN_GRACE (30 s) to finish on `docker compose stop`/upgrades;
+    # Docker would kill the worker after 10 s otherwise.
+    stop_grace_period: 40s
     env_file: .env
     environment:
       <<: *redis-env
+      # A stable name per container: a restarted worker puts back its unfinished jobs at once.
+      WORKER_NAME: "{hostname}"
     healthcheck:
       test: ["CMD", "pytaskq", "ping"]
       interval: 30s

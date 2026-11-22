@@ -52,4 +52,6 @@ async def reset_worker_globals():
     worker.active_tasks.clear()
     yield
     worker.shutdown_event.clear()
+    worker._hard_stop.clear()
     worker.active_tasks.clear()
+    worker.EXIT_CODE = worker.THREADS_LEFT_RUNNING = 0

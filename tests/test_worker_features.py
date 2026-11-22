@@ -194,17 +194,21 @@ async def test_unknown_task_error_lists_registered_tasks(env):
     assert "known" in meta["error"]
 
 
-async def test_invalid_payload_keeps_task_id(env):
+async def test_invalid_payload_becomes_a_dead_letter(env):
+    """0.4.1 (B11): kept in the DLQ with its text, under its own id; never written over a real job's record."""
     r = env
     raw = json.dumps({"task_id": "bad-1"})  # missing task_name / args
     await r.lpush(f"processing_queue:{worker.WORKER_ID}", raw)
     sem = asyncio.Semaphore(1)
     await sem.acquire()
     await worker.handle_task(raw, sem, asyncio.get_running_loop(), None, None)
-    meta = await r.hgetall("task:bad-1")
-    assert meta["status"] == "Failed"
-    assert "Invalid task payload" in meta["error"]
+    assert not await r.exists("task:bad-1")
+    entry = json.loads((await r.lrange("dlq", 0, -1))[0])
+    assert entry["invalid"] and entry["raw"] == raw and entry["task_id"].startswith("invalid-")
+    meta = await r.hgetall(f"task:{entry['task_id']}")
+    assert meta["status"] == "DeadLetter" and "task_name" in meta["error"]
     assert int(await r.get("stats:failed")) == 1
+    assert await r.llen(f"processing_queue:{worker.WORKER_ID}") == 0
 
 
 async def test_webhook_followup_is_counted_as_waiting(env):
@@ -258,10 +262,10 @@ async def test_sweeper_recovers_and_updates_status(env):
 
     assert await worker._sweep_dead_workers() == 1
     meta = await r.hgetall(f"task:{payload['task_id']}")
-    assert meta["status"] == "Queued" and meta["priority"] == "high"
+    assert meta["status"] == "Queued" and meta["priority"] == "default"   # keeps its priority
     assert "dead-1" in meta["note"]
     assert json.loads(meta["payload"])["fence_token"] == 1
-    assert await r.lindex("queue:high", 0) == meta["payload"]
+    assert await r.lindex("queue:default", -1) == meta["payload"]             # first in line
     assert not await r.exists("worker:dead-1")
     assert raw  # sanity
 

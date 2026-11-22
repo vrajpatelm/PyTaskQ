@@ -20,11 +20,11 @@ import hashlib
 import json
 import math
 import re
-import time
 import uuid
 from typing import Any, Iterable, Optional
 
 from pytaskq import tracing
+from pytaskq.core import clock
 from pytaskq.core.config import settings
 
 PRIORITIES = ("high", "default", "low")
@@ -145,15 +145,43 @@ def new_payload(
     return payload
 
 
-def dumps_payload(payload: dict) -> str:
-    """JSON for Redis. NaN/Infinity are refused: they aren't valid JSON and would break every reader."""
+class PayloadTooLarge(ValueError):
+    """The job's JSON is over MAX_PAYLOAD_BYTES."""
+
+
+class QueueFull(Exception):
+    """The queue already holds QUEUE_CAPACITY jobs (only callers that ask for a capacity check get this)."""
+
+    def __init__(self, queue: str, waiting: int = 0):
+        super().__init__(f"Queue '{queue}' is full ({waiting} jobs waiting)")
+        self.queue = queue
+        self.waiting = waiting
+
+
+def dumps_payload(payload: dict, max_bytes: Optional[int] = None) -> str:
+    """JSON for Redis. NaN/Infinity are refused: they aren't valid JSON and would break every reader.
+
+    Jobs over `max_bytes` (default MAX_PAYLOAD_BYTES, 0 = no limit) are refused:
+    every waiting job sits in Redis memory, twice (its queue entry and its record).
+    """
     try:
-        return json.dumps(payload, allow_nan=False)
+        raw = json.dumps(payload, allow_nan=False)
     except ValueError:
         raise ValueError("Job arguments can't contain NaN or Infinity.") from None
+    limit = settings.MAX_PAYLOAD_BYTES if max_bytes is None else max_bytes
+    if limit and limit > 0:
+        size = len(raw.encode("utf-8"))
+        if size > limit:
+            raise PayloadTooLarge(
+                f"The job is {size:,} bytes, over MAX_PAYLOAD_BYTES ({limit:,}). Put large data in a file or "
+                f"object storage and pass its location instead."
+            )
+    return raw
 
 
 def _meta(payload: dict, raw: str, status: str, now: float, delay_seconds: float = 0) -> dict:
+    # The arguments live only inside `payload` (they used to be stored three
+    # times); public_view() reads them from there.
     return _clean({
         "task_id": payload["task_id"],
         "task_name": payload["task_name"],
@@ -162,20 +190,18 @@ def _meta(payload: dict, raw: str, status: str, now: float, delay_seconds: float
         "queue": payload_queue(payload),
         "created_at": now,
         "scheduled_for": now + delay_seconds if delay_seconds > 0 else None,
-        "args": json.dumps(payload.get("args", []), default=str),
-        "kwargs": json.dumps(payload.get("kwargs", {}), default=str),
         "retry_count": payload.get("retry_count", 0),
         "payload": raw,
     })
 
 
 async def record(r, payload: dict, status: str = QUEUED) -> None:
-    """Create the status hash + history entry for a payload pushed elsewhere (e.g. cron Lua)."""
-    raw = dumps_payload(payload)
+    """Create the status hash + history entry for a payload pushed elsewhere."""
+    raw = dumps_payload(payload, max_bytes=0)
     task_id = payload["task_id"]
     async with r.pipeline(transaction=True) as pipe:
-        pipe.hset(task_key(task_id), mapping=_meta(payload, raw, status, time.time()))
-        pipe.expire(task_key(task_id), int(settings.RESULT_TTL))
+        pipe.hset(task_key(task_id), mapping=_meta(payload, raw, status, clock.now()))
+        pipe.persist(task_key(task_id))
         pipe.lpush(RECENT_KEY, task_id)
         pipe.ltrim(RECENT_KEY, 0, max(1, settings.HISTORY_LIMIT) - 1)
         pipe.publish(EVENTS_CHANNEL, "update")
@@ -223,15 +249,63 @@ async def find_duplicate(r, key: Optional[str], payload: dict, delay_seconds: fl
     return _duplicate(record, _fingerprint(payload, float(delay_seconds or 0))) if record else None
 
 
+# Queue one job in a single atomic step.
+#   KEYS: 1 target (queue list or delayed zset), 2 task hash, 3 history list, 4 queue-name set,
+#         5 idempotency key, 6 cron tick lock, 7-9 the queue's three lists (capacity)
+#   ARGV: 1 payload, 2 "list" | "delayed", 3 due time, 4 queue name, 5 history limit, 6 capacity (0 = none),
+#         7 idempotency record ("" = none), 8 idempotency TTL, 9 lock TTL ("" = no lock), 10 task id,
+#         11.. task hash fields (name, value, …)
+# Returns {1} queued, {2, record} idempotency key already used, {3} lock already taken, {0, waiting} full.
+# The task hash has no expiry while the job waits: it gets RESULT_TTL when the job finishes.
+ENQUEUE_SCRIPT = """
+local unpack = unpack or table.unpack
+if ARGV[7] ~= '' then
+    local existing = redis.call('GET', KEYS[5])
+    if existing then return {2, existing} end
+end
+if ARGV[9] ~= '' then
+    if not redis.call('SET', KEYS[6], '1', 'NX', 'EX', tonumber(ARGV[9])) then return {3} end
+end
+local cap = tonumber(ARGV[6])
+if cap > 0 then
+    local waiting = redis.call('LLEN', KEYS[7]) + redis.call('LLEN', KEYS[8]) + redis.call('LLEN', KEYS[9])
+    if waiting >= cap then return {0, waiting} end
+end
+if ARGV[7] ~= '' then redis.call('SET', KEYS[5], ARGV[7], 'EX', tonumber(ARGV[8])) end
+if ARGV[2] == 'delayed' then
+    redis.call('ZADD', KEYS[1], ARGV[3], ARGV[1])
+else
+    redis.call('LPUSH', KEYS[1], ARGV[1])
+end
+redis.call('SADD', KEYS[4], ARGV[4])
+redis.call('HSET', KEYS[2], unpack(ARGV, 11))
+redis.call('PERSIST', KEYS[2])
+redis.call('LPUSH', KEYS[3], ARGV[10])
+redis.call('LTRIM', KEYS[3], 0, tonumber(ARGV[5]) - 1)
+redis.call('PUBLISH', 'events:global', 'update')
+return {1}
+"""
+
+_NO_KEY = "pytaskq:unused"     # placeholder for KEYS a call doesn't use
+
+
 async def enqueue(r, payload: dict, delay_seconds: float = 0, created_by: Optional[str] = None,
-                  idempotency_key: Optional[str] = None) -> dict:
-    """Push a task payload onto its priority queue (or the delayed set).
+                  idempotency_key: Optional[str] = None, *, capacity: int = 0,
+                  lock: Optional[str] = None, lock_ttl: int = 2592000,
+                  max_bytes: Optional[int] = None) -> Optional[dict]:
+    """Push a task payload onto its priority queue (or the delayed set), atomically.
 
     With an idempotency key, the first call queues the job and remembers the key
     for IDEMPOTENCY_TTL seconds; repeating the call with the same key and the
     same job returns the original response (plus "duplicate": true) and queues
-    nothing. The check and the enqueue are one atomic step, so two retries
-    racing each other still produce one job.
+    nothing. Racing retries still produce one job.
+
+    capacity  refuse with QueueFull when the job's queue already holds this
+              many jobs (the API uses QUEUE_CAPACITY; 0 = no check). The check
+              and the push are one step, so the limit is exact under load.
+    lock      queue only if this key isn't set yet (cron: one run per tick);
+              returns None when it is.
+    max_bytes size limit for the job (default MAX_PAYLOAD_BYTES; 0 = none).
     """
     delay_seconds = float(delay_seconds or 0)
     if not math.isfinite(delay_seconds) or not 0 <= delay_seconds <= MAX_DELAY_SECONDS:
@@ -243,8 +317,8 @@ async def enqueue(r, payload: dict, delay_seconds: float = 0, created_by: Option
         task_id = payload["task_id"]
         priority = payload.get("priority", "default")
         queue = payload_queue(payload)
-        raw = dumps_payload(payload)
-        now = time.time()
+        raw = dumps_payload(payload, max_bytes)
+        now = await clock.sync(r) if delay_seconds > 0 else clock.now()
         status = SCHEDULED if delay_seconds > 0 else QUEUED
         meta = _meta(payload, raw, status, now, delay_seconds)
         if created_by:
@@ -252,42 +326,25 @@ async def enqueue(r, payload: dict, delay_seconds: float = 0, created_by: Option
         result = {"task_id": task_id, "status": status.lower()}
         if delay_seconds > 0:
             result["execute_in_seconds"] = delay_seconds
-
-        def queue_commands(pipe):
-            if delay_seconds > 0:
-                pipe.zadd("delayed_tasks", {raw: now + delay_seconds})
-            else:
-                pipe.lpush(queue_key(priority, queue), raw)
-            pipe.sadd(QUEUES_KEY, queue)
-            pipe.hset(task_key(task_id), mapping=meta)
-            pipe.expire(task_key(task_id), int(settings.RESULT_TTL + delay_seconds))
-            pipe.lpush(RECENT_KEY, task_id)
-            pipe.ltrim(RECENT_KEY, 0, max(1, settings.HISTORY_LIMIT) - 1)
-            pipe.publish(EVENTS_CHANNEL, "update")
-
-        if not idem:
-            async with r.pipeline(transaction=True) as pipe:
-                queue_commands(pipe)
-                await pipe.execute()
+        record = json.dumps({"fingerprint": fingerprint, "response": result}) if idem else ""
+        fields = [str(x) for kv in meta.items() for x in kv]
+        reply = await r.eval(
+            ENQUEUE_SCRIPT, 9,
+            "delayed_tasks" if delay_seconds > 0 else queue_key(priority, queue),
+            task_key(task_id), RECENT_KEY, QUEUES_KEY, idem or _NO_KEY, lock or _NO_KEY,
+            *queue_keys(queue),
+            raw, "delayed" if delay_seconds > 0 else "list", repr(now + delay_seconds), queue,
+            max(1, settings.HISTORY_LIMIT), int(capacity or 0), record, max(1, settings.IDEMPOTENCY_TTL),
+            str(int(lock_ttl)) if lock else "", task_id, *fields,
+        )
+        code = int(reply[0])
+        if code == 1:
             return result
-
-        from redis.exceptions import WatchError
-        record = json.dumps({"fingerprint": fingerprint, "response": result})
-        async with r.pipeline(transaction=True) as pipe:
-            while True:
-                try:
-                    await pipe.watch(idem)
-                    existing = await pipe.get(idem)
-                    if existing:
-                        await pipe.reset()
-                        return _duplicate(existing, fingerprint)
-                    pipe.multi()
-                    pipe.set(idem, record, ex=max(1, settings.IDEMPOTENCY_TTL))
-                    queue_commands(pipe)
-                    await pipe.execute()
-                    return result
-                except WatchError:
-                    continue    # someone used the key a moment ago: read what they stored
+        if code == 2:
+            return _duplicate(reply[1], fingerprint)
+        if code == 3:
+            return None
+        raise QueueFull(queue, int(reply[1]) if len(reply) > 1 else 0)
 
 
 # Atomically pull a waiting task out of its queue or the delayed set.
@@ -295,7 +352,7 @@ async def enqueue(r, payload: dict, delay_seconds: float = 0, created_by: Option
 # priority can differ from the list it waits in (crash recovery puts jobs on
 # "high"; a later retry goes back to the original priority).
 # KEYS: the queue's 3 lists, delayed zset, task hash
-# ARGV: exact payload JSON, cancelled timestamp
+# ARGV: exact payload JSON, cancelled timestamp, result TTL
 CANCEL_SCRIPT = """
 local removed = 0
 for i = 1, 3 do
@@ -307,6 +364,7 @@ if removed == 0 then
 end
 if removed > 0 then
     redis.call('HSET', KEYS[5], 'status', 'Cancelled', 'finished_at', ARGV[2])
+    redis.call('EXPIRE', KEYS[5], tonumber(ARGV[3]))
     return 1
 end
 return 0
@@ -328,7 +386,7 @@ async def cancel(r, task_id: str, by: Optional[str] = None) -> tuple[bool, str]:
     ok = await r.eval(
         CANCEL_SCRIPT, 5,
         *queue_keys(payload_queue(meta)), "delayed_tasks", task_key(task_id),
-        payload, str(time.time()),
+        payload, str(clock.now()), int(settings.RESULT_TTL),
     )
     if ok:
         if by:
@@ -346,7 +404,18 @@ def _reject_constant(name):
 def public_view(meta: dict) -> dict:
     """Task hash minus internal fields, with JSON fields decoded for clients."""
     out = {k: v for k, v in meta.items() if k != "payload"}
+    if "args" not in out and meta.get("payload"):
+        # Since 0.4.1 the arguments are stored once, inside the payload.
+        try:
+            stored = json.loads(meta["payload"], parse_constant=_reject_constant)
+        except (TypeError, ValueError):
+            stored = None
+        if isinstance(stored, dict):
+            out["args"] = stored.get("args", [])
+            out["kwargs"] = stored.get("kwargs", {})
     for field in ("args", "kwargs"):
+        if not isinstance(out.get(field, ""), str):
+            continue
         if field in out:
             try:
                 out[field] = json.loads(out[field], parse_constant=_reject_constant)
@@ -417,7 +486,7 @@ async def registered_tasks(r) -> list[dict]:
     are all listed. A task nobody advertises any more (renamed, removed, its
     workers stopped) drops out after REGISTRY_TTL and is cleaned up.
     """
-    cutoff = time.time() - REGISTRY_TTL
+    cutoff = clock.now() - REGISTRY_TTL
     async with r.pipeline(transaction=False) as pipe:
         pipe.hgetall(REGISTRY_KEY)
         pipe.zrangebyscore(REGISTRY_SEEN_KEY, cutoff, "+inf")
@@ -448,7 +517,7 @@ def queue_registry_lookup(pipe, task_name: str) -> float:
     Feed the three results to `parse_registry_lookup`. Lets callers fold the
     lookup into a pipeline they already send (one round trip for enqueue).
     """
-    cutoff = time.time() - REGISTRY_TTL
+    cutoff = clock.now() - REGISTRY_TTL
     pipe.hget(REGISTRY_KEY, task_name)
     pipe.zscore(REGISTRY_SEEN_KEY, task_name)
     pipe.zcount(REGISTRY_SEEN_KEY, cutoff, "+inf")
@@ -477,7 +546,7 @@ async def publish_registry(r, specs: dict[str, dict]) -> None:
     """Advertise `specs` (name → JSON-able spec), alongside tasks other workers advertise."""
     if not specs:
         return
-    now = time.time()
+    now = clock.now()
     async with r.pipeline(transaction=True) as pipe:
         pipe.hset(REGISTRY_KEY, mapping={k: json.dumps(v, default=str) for k, v in specs.items()})
         pipe.zadd(REGISTRY_SEEN_KEY, {k: now for k in specs})
@@ -494,14 +563,16 @@ async def queue_overview(r) -> dict:
     could even go negative. Counting the lists themselves is always right.
     Each queue also reports how many live workers serve it.
     """
-    now = time.time()
     async with r.pipeline(transaction=False) as pipe:
         pipe.smembers(QUEUES_KEY)
-        pipe.zrangebyscore("active_workers", now, "+inf")
+        pipe.time()
+        pipe.zrange("active_workers", 0, -1, withscores=True)
         pipe.zcard("delayed_tasks")
         pipe.llen("dlq")
-        names, live_workers, delayed, dlq = await pipe.execute()
-    live_workers = list(live_workers)
+        names, redis_time, workers, delayed, dlq = await pipe.execute()
+    clock.update(redis_time)
+    now = clock.now()      # Redis's clock: the one heartbeats are written with
+    live_workers = [w for w, expires in workers if expires >= now]
     async with r.pipeline(transaction=False) as pipe:
         for worker in live_workers:
             pipe.llen(f"processing_queue:{worker}")

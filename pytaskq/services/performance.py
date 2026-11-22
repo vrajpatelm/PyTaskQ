@@ -37,7 +37,7 @@ def suggestions(*, turned_away: dict, workers: list[dict], queues: list[dict], c
     live = [w for w in workers if w.get("status") != "dead"]
     slots = sum((w.get("cpu_workers") or 0) + (w.get("io_workers") or 0) for w in live)
     running = sum(w.get("active") or 0 for w in live)
-    capacity = max(1, settings.QUEUE_CAPACITY)
+    capacity = max(0, settings.QUEUE_CAPACITY)       # 0 = no limit
     queue_full = turned_away.get("queue_full", 0)
     redis_busy = turned_away.get("redis_busy", 0)
     redis_down = turned_away.get("redis_down", 0)
@@ -94,7 +94,7 @@ def suggestions(*, turned_away: dict, workers: list[dict], queues: list[dict], c
                 "absorbs bursts like this; workers catch up afterwards.",
                 f"QUEUE_CAPACITY={capacity * 2}",
             ))
-    else:
+    elif capacity:
         for q in queues:
             if q.get("total", 0) >= 0.7 * capacity:
                 out.append(_suggest(
@@ -111,6 +111,32 @@ def suggestions(*, turned_away: dict, workers: list[dict], queues: list[dict], c
             "put it back. Those jobs still run, just later. Give each app its own queue: "
             "`PyTaskQ(default_queue=\"emails\")` or `@queue.task(queue=\"emails\")`.",
         ))
+
+    for w in live:
+        name = w.get("worker_id") or "a worker"
+        if w.get("loop_blocked_seconds"):
+            out.append(_suggest(
+                "critical", f"Worker {name}: an async task has blocked it for {w['loop_blocked_seconds']}s",
+                "An `async def` task is calling blocking code (time.sleep, requests, a sync database driver), so "
+                "nothing else on that worker runs and timeouts can't fire. The worker's log names the task. Use "
+                "`await asyncio.sleep()` or an async client, or make it a plain function with type=\"io\".",
+            ))
+        if w.get("stuck_io"):
+            out.append(_suggest(
+                "warning", f"Worker {name}: {w['stuck_io']} IO thread(s) are stuck in timed-out tasks",
+                "Python can't stop a thread, so a timed-out IO task keeps its thread until its code returns, and "
+                "that thread runs nothing else meanwhile. Give network calls in IO tasks their own timeouts "
+                "(e.g. `requests.get(url, timeout=10)`). When every thread is stuck, the worker leaves IO jobs "
+                "for other workers.",
+            ))
+        if w.get("cpu_restarts"):
+            out.append(_suggest(
+                "warning", f"Worker {name}: {w['cpu_restarts']} CPU process(es) were replaced",
+                "A CPU task ran past its timeout (its process was stopped) or its process died: often the "
+                "out-of-memory killer, or a crash in a C extension. Each affected job failed with the reason and "
+                "was retried. Look for 'process' errors in the dead letters, and give the worker more memory if "
+                "tasks run out of it.",
+            ))
 
     if cores >= 4 and processes < min(cores, 4):
         out.append(_suggest(
