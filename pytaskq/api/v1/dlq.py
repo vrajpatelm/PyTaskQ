@@ -23,11 +23,12 @@ _NOT_REPLAYABLE = ("This entry isn't a valid job: it was found in a queue and ke
 # KEYS: dlq, target queue list, task hash
 # ARGV: dead-letter entry, new payload, task_id, task_name, priority, note, (unused), queue name
 # The record has no expiry while the job waits again (it gets RESULT_TTL when it finishes).
-REPLAY_SCRIPT = """
+REPLAY_SCRIPT = queueing.WAKE_LUA + """
 if redis.call('LREM', KEYS[1], 1, ARGV[1]) == 0 then
     return 0
 end
 redis.call('RPUSH', KEYS[2], ARGV[2])
+pytaskq_wake(KEYS[5], 100)
 if ARGV[3] ~= '' then
     redis.call('HDEL', KEYS[3], 'started_at', 'finished_at', 'duration_ms', 'next_retry_at', 'result',
                'result_dropped')
@@ -87,8 +88,9 @@ async def _replay(raw: str, task: dict) -> bool:
     note = f"Replayed from dead letters at {time.strftime('%Y-%m-%d %H:%M:%S')}"
     queue = queueing.payload_queue(task)
     done = await redis_client.r.eval(
-        REPLAY_SCRIPT, 4,
+        REPLAY_SCRIPT, 5,
         DLQ_KEY, queueing.queue_key(priority, queue), queueing.task_key(task_id), queueing.FINISHED_KEY,
+        queueing.wake_key(queue),
         raw, json.dumps(task), task_id, task.get("task_name", ""), priority, note, int(settings.RESULT_TTL),
         queue,
     )

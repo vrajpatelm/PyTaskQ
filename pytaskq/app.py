@@ -319,15 +319,22 @@ class PyTaskQ:
         return queueing.public_view(meta) if meta else None
 
     async def wait(self, task_id: str, timeout: float = 30, poll_interval: float = 0.25) -> dict:
-        """Wait until the task reaches a final state; raises TimeoutError otherwise."""
+        """Wait until the task reaches a final state; raises TimeoutError otherwise.
+
+        Checks often at first (every 20 ms) and less often as time passes (up to
+        `poll_interval`), so a quick job's result comes back quickly without a
+        long wait hammering Redis.
+        """
         deadline = time.monotonic() + timeout
+        delay = min(0.02, poll_interval)
         while True:
             info = await self.status(task_id)
             if info and info.get("status") in queueing.FINAL_STATES:
                 return info
             if time.monotonic() >= deadline:
                 raise TimeoutError(f"Task {task_id} did not finish within {timeout}s")
-            await asyncio.sleep(poll_interval)
+            await asyncio.sleep(min(delay, max(0.0, deadline - time.monotonic())))
+            delay = min(delay * 1.5, poll_interval)
 
     async def cancel(self, task_id: str) -> bool:
         """Cancel a task that has not started yet."""

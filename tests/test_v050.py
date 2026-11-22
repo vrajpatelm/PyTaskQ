@@ -163,3 +163,69 @@ async def test_1_performance_page_shows_the_forecast(client, r):
 def test_1_cron_locks_live_hours_not_a_month():
     assert worker.CRON_LOCK_TTL <= 4 * 3600
     assert worker.CRON_LOCK_TTL > 3600, "must outlive clocks going back an hour"
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 2. Instant pickup
+# ═════════════════════════════════════════════════════════════════════════════
+
+async def test_2_every_way_onto_a_queue_wakes_a_worker(env, client):
+    r = env
+    wake = queueing.wake_key("default")
+    await queueing.enqueue(r, queueing.new_payload("ok", task_id="a"))
+    assert await r.llen(wake) == 1
+    await queueing.enqueue(r, queueing.new_payload("ok", task_id="b"), delay_seconds=1)
+    assert await r.llen(wake) == 1, "a scheduled job wakes nobody yet"
+    await worker._promote_due_tasks(now=time.time() + 5)
+    assert await r.llen(wake) == 2, "…until it's due"
+    await pop(r)
+    await worker._recover_worker("test-worker", "test")
+    assert await r.llen(wake) == 3, "crash recovery"
+    await queueing.enqueue(r, queueing.new_payload("bad", task_id="c"))
+    await r.delete("queue:default")
+    await r.lpush("queue:default", json.dumps(queueing.new_payload("bad", task_id="c")))
+    await run_one(r, OK)
+    assert (await client.post("/dlq/replay/c")).status_code == 200
+    assert await r.llen(wake) == 5, "dead-letter replay"
+
+
+async def test_2_wake_tokens_are_capped(r):
+    for i in range(150):
+        await queueing.enqueue(r, queueing.new_payload("ok"))
+    assert await r.llen(queueing.wake_key("default")) == queueing.WAKE_CAP
+
+
+async def test_2_idle_worker_wakes_as_soon_as_a_job_arrives(env):
+    r = env
+    started = time.monotonic()
+    waiting = asyncio.create_task(worker._wait_for_work(["default", "images"]))
+    await asyncio.sleep(0.05)
+    assert not waiting.done()
+    await queueing.enqueue(r, queueing.new_payload("ok", queue="images"))
+    await asyncio.wait_for(waiting, 1)
+    assert time.monotonic() - started < 0.5
+
+
+async def test_2_idle_wait_ends_on_shutdown_and_on_its_own(env):
+    started = time.monotonic()
+    with patch.object(worker, "IDLE_WAIT", 1):
+        await worker._wait_for_work(["default"])
+    assert 0.9 < time.monotonic() - started < 2.5, "returns after IDLE_WAIT even with no job"
+    waiting = asyncio.create_task(worker._wait_for_work(["default"]))
+    await asyncio.sleep(0.05)
+    worker.shutdown_event.set()
+    await asyncio.wait_for(waiting, 0.5)
+
+
+async def test_2_queue_wait_returns_quickly(r):
+    q = PyTaskQ()
+    with patch("pytaskq.core.redis_client.r", r):
+        await r.hset("task:w", mapping={"status": "Queued"})
+
+        async def finish():
+            await asyncio.sleep(0.03)
+            await r.hset("task:w", "status", "Success")
+        asyncio.create_task(finish())
+        started = time.monotonic()
+        await q.wait("w", timeout=5)
+    assert time.monotonic() - started < 0.15

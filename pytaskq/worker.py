@@ -293,11 +293,11 @@ return 1 + trimmed
 # Put a job from a processing list back on its queue (crashed or stopped worker,
 # or a job this worker can't run right now). Only if it's still in that list,
 # so a job that just finished is never queued again.
-# KEYS: processing list, fence, target list, task hash, queue-name set
+# KEYS: processing list, fence, target list, task hash, queue-name set, the queue's wake list
 # ARGV: payload as listed, new payload, fence value read before ("" = none), new fence, note, "front" | "back",
 #       queue name
 # Returns 1 put back, 2 was already finished (entry dropped), 0 not in the list, -2 fence changed (read again).
-PUT_BACK_SCRIPT = """
+PUT_BACK_SCRIPT = queueing.WAKE_LUA + """
 local current = redis.call('GET', KEYS[2])
 if (current or '') ~= ARGV[3] then return -2 end
 if redis.call('LREM', KEYS[1], 1, ARGV[1]) == 0 then return 0 end
@@ -312,6 +312,7 @@ else
     redis.call('LPUSH', KEYS[3], ARGV[2])
 end
 redis.call('SADD', KEYS[5], ARGV[7])
+pytaskq_wake(KEYS[6], 100)
 if status then
     redis.call('HSET', KEYS[4], 'status', 'Queued', 'payload', ARGV[2], 'note', ARGV[5])
     redis.call('HDEL', KEYS[4], 'started_at', 'worker_id')
@@ -333,16 +334,17 @@ return 1
 
 # Move a batch of due jobs from the delayed set onto their queues, only while a
 # queue has room (QUEUE_CAPACITY), so a big backlog can't flood one queue.
-# KEYS: delayed set, queue-name set, each queue's 3 lists, then per job: target list, task hash
+# KEYS: delayed set, queue-name set, each queue's 3 lists, each queue's wake list, then per job: target list,
+#       task hash
 # ARGV: capacity (0 = none), number of queues, the queue names, then per job: payload, queue index (1-based)
 # Returns {moved, skipped because the queue was full}
-PROMOTE_SCRIPT = """
+PROMOTE_SCRIPT = queueing.WAKE_LUA + """
 local cap = tonumber(ARGV[1])
 local nq = tonumber(ARGV[2])
 local counts = {}
 local used = {}
 local moved, full = 0, 0
-local base = 2 + nq * 3
+local base = 2 + nq * 4
 local first = 2 + nq
 local n = (#ARGV - first) / 2
 for i = 1, n do
@@ -371,7 +373,10 @@ for i = 1, n do
         moved = moved + 1
     end
 end
-for qi, _ in pairs(used) do redis.call('SADD', KEYS[2], ARGV[2 + qi]) end
+for qi, _ in pairs(used) do
+    redis.call('SADD', KEYS[2], ARGV[2 + qi])
+    pytaskq_wake(KEYS[2 + nq * 3 + qi], 100)
+end
 if moved > 0 then redis.call('PUBLISH', 'events:global', 'update') end
 return {moved, full}
 """
@@ -594,7 +599,8 @@ async def _promote_due_tasks(now: float = None) -> int:
             items.append((raw, queues.index(queue) + 1,
                           queueing.queue_key(_priority(data), queue), queueing.task_key(data["task_id"])))
         if items:
-            keys = ["delayed_tasks", queueing.QUEUES_KEY] + [k for q in queues for k in queueing.queue_keys(q)]
+            keys = (["delayed_tasks", queueing.QUEUES_KEY] + [k for q in queues for k in queueing.queue_keys(q)]
+                    + [queueing.wake_key(q) for q in queues])
             argv: list = [max(0, settings.QUEUE_CAPACITY), len(queues), *queues]
             for raw, qi, target, hash_key in items:
                 keys += [target, hash_key]
@@ -684,9 +690,10 @@ async def _put_back(r, worker_id: str, raw: str, note: str, side: str = "front")
         new_raw = json.dumps({**data, "fence_token": token})
         queue = queueing.payload_queue(data)
         result = await r.eval(
-            PUT_BACK_SCRIPT, 5,
+            PUT_BACK_SCRIPT, 6,
             _processing_key(worker_id), f"fence:{task_id}",
             queueing.queue_key(_priority(data), queue), queueing.task_key(task_id), queueing.QUEUES_KEY,
+            queueing.wake_key(queue),
             raw, new_raw, current or "", str(token), note, side, queue,
         )
         if result != -2:
@@ -1470,8 +1477,6 @@ async def consumer_task():
 
     logger.info(f"Worker {WORKER_ID} started and ready to process tasks.")
 
-    idle_delay = 0.05
-    max_idle_delay = 1.0
     turn = 0
 
     while not shutdown_event.is_set():
@@ -1496,14 +1501,8 @@ async def consumer_task():
 
             if not task_json:
                 sem.release()
-                try:
-                    await asyncio.wait_for(shutdown_event.wait(), timeout=idle_delay)
-                except asyncio.TimeoutError:
-                    pass
-                idle_delay = min(idle_delay * 1.5, max_idle_delay)
+                await _wait_for_work(QUEUES)
                 continue
-
-            idle_delay = 0.05
         except Exception as e:
             sem.release()
             why = ("Redis is out of memory" if redis_health.is_oom(e)
@@ -1518,6 +1517,31 @@ async def consumer_task():
         task.add_done_callback(active_tasks.discard)
 
     await _shutdown(background, heart, cpu_pool, io_pool)
+
+
+# Seconds an idle worker blocks before checking its queues anyway. New jobs wake it at once (wake-up
+# tokens); this only catches jobs queued by PyTaskQ versions before 0.5, which don't send tokens.
+IDLE_WAIT = 5
+
+
+async def _wait_for_work(queues: list[str]) -> None:
+    """
+    Idle: block until a wake-up token arrives on one of our queues (a job was
+    queued), IDLE_WAIT passes, or the worker is stopping. Replaces polling with
+    a growing delay, which took up to a second to notice a new job.
+    """
+    keys = [queueing.wake_key(q) for q in queues]
+    waiting = asyncio.ensure_future(redis_client.r.blpop(keys, timeout=IDLE_WAIT))
+    stopping = asyncio.ensure_future(shutdown_event.wait())
+    try:
+        await asyncio.wait({waiting, stopping}, return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        stopping.cancel()
+        if not waiting.done():
+            waiting.cancel()                   # stopping: redis-py drops that connection
+            await asyncio.gather(waiting, return_exceptions=True)
+    if waiting.done() and not waiting.cancelled():
+        waiting.result()                       # a Redis error: the main loop backs off
 
 
 async def _shutdown(background, heart, cpu_pool, io_pool):
