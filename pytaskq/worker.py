@@ -29,7 +29,6 @@ How a job is kept safe (0.4.1):
 """
 
 import asyncio
-import inspect
 import json
 import logging
 import os

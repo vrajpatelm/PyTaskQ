@@ -1,5 +1,4 @@
 import asyncio
-import json
 
 from pytaskq.core import queueing, redis_client
 from pytaskq.core.config import settings

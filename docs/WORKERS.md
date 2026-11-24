@@ -80,6 +80,21 @@ It's retried like any other failure, and a fresh process takes the empty slot at
 
 If the worker can't start new processes at all, it stops with exit code 1, so Docker or systemd restarts it, and puts its jobs back on their queues first.
 
+## What task code can't do
+
+A task can't stop or wedge the worker, whatever its code does:
+
+| The task… | What happens |
+|---|---|
+| calls `sys.exit()` / `exit()`, raises `KeyboardInterrupt` (any task type) | The job fails with `TaskExited` (and is retried or dead-lettered as usual); the worker carries on. Only the worker's own Ctrl+C / SIGTERM stops it. |
+| is an `async def` behind a plain decorator, or returns a coroutine | It runs as an async task; the coroutine is awaited. |
+| returns a generator | Its items are collected into a list (its code only runs when it's read). |
+| returns text with invalid UTF-8 (a file name from `os.listdir()`) or raises with it | Stored with `\udcff`-style escapes. |
+| raises with a huge message | The error is cut to `MAX_ERROR_BYTES` (4 KB, start and end kept) before it's stored or logged. |
+| returns `NaN`, a set, bytes, an object | Stored as `null` / its text, with a warning in the log. |
+
+And whatever else goes wrong while saving a job's outcome (other than Redis being away), the job becomes a dead letter that says why, instead of staying in *Processing* and running again on every restart. *(Before 0.6, a task calling `sys.exit()` stopped the worker, and then every worker the job was handed to next.)*
+
 ## When Redis goes away for a moment
 
 A job that finishes while Redis is unreachable keeps its result in memory, and the worker retries saving it until Redis is back. The log says so once:
@@ -123,7 +138,7 @@ Each worker sends a heartbeat every `WORKER_HEARTBEAT_TTL / 3` seconds (10 by de
 WORKER_NAME=images-1 pytaskq worker --app tasks:queue
 ```
 
-In Docker, `WORKER_NAME={hostname}` uses the container's name, which survives restarts. The compose files in this repo do this. Two live workers can't share a name: the second one waits for the first one's heartbeat to stop, and refuses to start if it doesn't.
+In Docker, `WORKER_NAME={hostname}` uses the container's name, which survives restarts. The compose files in this repo do this. Two live workers can't share a name: the second one waits for the first one's heartbeat to stop, and refuses to start if it doesn't. A restart is recognised by a boot id the worker leaves in its temp folder (`/tmp/pytaskq-worker-<name>.boot`), not by hostname and process id: two containers with the same `hostname:` (or `network_mode: host`) both run as process 1, and before 0.6 the second one took over the first one's running job.
 
 Heartbeat times come from Redis's clock, not each machine's, so a server whose clock is off doesn't make its workers look dead.
 
@@ -141,7 +156,7 @@ The job is recorded as `Cancelled`, isn't retried, and its record says who cance
 
 ## Jobs that wait for their turn
 
-A task with `max_concurrency` or `rate_limit` ([TASKS.md](TASKS.md#limiting-how-many-run-and-how-fast)) can be taken by a worker before it may start. The worker doesn't hold on to it: it puts the job back in the schedule until its turn, with the reason shown in the dashboard, and takes other work meanwhile. Waiting never uses up a retry. Jobs on a paused queue simply aren't taken.
+A task with `max_concurrency` or `rate_limit` ([TASKS.md](TASKS.md#limiting-how-many-run-and-how-fast)) can be taken by a worker before it may start. The worker doesn't hold on to it: it puts the job back in the schedule until its turn (for `max_concurrency`, in line: a finishing job starts the one that waited longest), with the reason shown in the dashboard, and takes other work meanwhile. Waiting never uses up a retry. Jobs on a paused queue simply aren't taken. A job that was cancelled while it waited never starts: the cancel request is checked right before every start.
 
 ## Progress
 
@@ -187,3 +202,4 @@ A job's record (status, arguments, result) never expires while the job is waitin
 | `WORKER_HEARTBEAT_TTL` | 30 | Seconds without a heartbeat before a worker counts as dead |
 | `WORKER_NAME` | random | Stable name (`{hostname}` allowed). Same as `pytaskq worker --name` |
 | `TASK_TIMEOUT` | 300 | Default `timeout` for tasks that don't set one (`0` = none) |
+| `MAX_ERROR_BYTES` | 4096 | A failed job's error text is cut to this |

@@ -68,7 +68,7 @@ Pause a queue to stop workers from starting new jobs from it, for example while 
 - `POST /queues/emails/pause` and `POST /queues/emails/resume`;
 - `await app.pause_queue("emails")` and `await app.resume_queue("emails")`.
 
-It takes effect at once. Jobs already running finish normally. New jobs can still be queued and wait; scheduled jobs, retries and cron runs keep arriving. Resume it, and idle workers start on it within a couple of seconds. The pause is stored in Redis, so it survives restarts and applies to every worker, until someone resumes the queue.
+It takes effect at once. Jobs already running finish normally. New jobs can still be queued and wait; scheduled jobs and retries keep arriving. Cron runs of tasks on a paused queue are **skipped** (logged, and counted in `pytaskq:cron:skipped`), so a day-long pause doesn't release 1,440 runs of an every-minute task at once when you resume. Resume it, and idle workers start on it within a couple of seconds. The pause is stored in Redis, so it survives restarts and applies to every worker, until someone resumes the queue.
 
 ### Example: a dedicated image worker
 

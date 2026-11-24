@@ -18,6 +18,10 @@ But a job **can run more than once**:
 
 What PyTaskQ does guarantee is that **only one attempt's outcome counts**. Each job carries a fence token; a stale attempt's result or failure is ignored, so a job never ends up both succeeded and dead-lettered, or retried twice.
 
+A **lost reply** doesn't make duplicates either. If the connection drops after Redis has done something but before the answer arrives (a network blip, a failover), the client sends the command again; PyTaskQ recognises the repeat: a job is queued once (the caller gets "queued", not an error), a failure is one dead letter, a success counts once.
+
+**Task code can't stop the worker.** `sys.exit()`, `KeyboardInterrupt`, a coroutine or generator returned by a decorator, text that isn't valid UTF-8, a 20 MB error message: each becomes a normal outcome for that one job (failed, or stored cleanly). Before 0.6 some of these could stop the worker or leave a job stuck in *Processing*.
+
 **What to do:** make tasks safe to repeat. Send an idempotency key to the services you call (most payment and email APIs accept one), use `INSERT … ON CONFLICT DO NOTHING`, or check whether the work is already done before doing it.
 
 ## Order
@@ -74,13 +78,29 @@ All times that machines compare (heartbeats, when a scheduled job is due, cron t
 
 ## Limits across the fleet
 
-`max_concurrency` and `rate_limit` hold across every worker, because they're kept in Redis. A `max_concurrency` place is a lease that a running job's worker renews; if a worker is cut off from Redis for more than about a minute, its leases run out and another job may start, so for a short time one more job than the limit can be running.
+`max_concurrency` and `rate_limit` hold across every worker, because they're kept in Redis.
+
+- A `max_concurrency` place is a lease per attempt that the worker renews while the job runs, and an IO job that timed out keeps it until its thread really returns. If a worker is cut off from Redis for more than about a minute, its leases run out and another job may start, so for a short time one more job than the limit can be running.
+- `rate_limit` starts are never closer than the limit allows: a turn that passed while the job couldn't start (a pause, a busy worker, a replay) is replaced by a new one.
 
 ## Cancelling and pausing
 
 - Cancelling a **waiting** job is immediate and certain: it won't run.
 - Cancelling a **running** job stops it within about a second. An IO task's code keeps running until it returns (Python can't stop a thread), but its result is ignored and it isn't retried. A job that was just finishing as you pressed cancel may still succeed.
-- **Pausing a queue** takes effect at once for new jobs; running jobs finish.
+- A job that was cancelled while a worker had it (or whose worker died) **never starts again**: the request is checked right before every start, and kept (up to a week) until the job is cancelled.
+- **Pausing a queue** takes effect at once for new jobs; running jobs finish. Cron runs of its tasks are skipped while it's paused.
+
+## Workflows
+
+The next stage of a workflow starts exactly once, even when the last steps of a stage finish at the same moment or a worker dies in between. A step that runs twice is counted once. [WORKFLOWS.md](WORKFLOWS.md#what-it-guarantees)
+
+## Connections
+
+Every connection to Redis has a read timeout (`REDIS_SOCKET_TIMEOUT`, 15 s) and TCP keepalive, so a connection that a NAT, firewall or load balancer dropped without a word fails and is reopened instead of hanging. If a worker's own connections still stop answering while Redis is reachable, it reopens them after a minute and, if that doesn't help, stops (exit code 1) so its jobs go to other workers.
+
+## Worker names
+
+With a fixed `WORKER_NAME`, a worker that starts while another one with the same name is alive refuses to start, also when both are containers with the same hostname and process id 1. A restart of the same container or machine is recognised (it left a boot id in its temp folder) and puts its own jobs back at once.
 
 ## Running different versions or settings
 
@@ -92,6 +112,7 @@ During an upgrade, old and new workers run side by side for a few minutes. That'
 |---|---|---|
 | `MAX_PAYLOAD_BYTES` | 1 MB | A job's arguments; larger jobs are refused (`413`, `ValueError`) |
 | `MAX_RESULT_BYTES` | 1 MB | A stored result; larger ones aren't stored, the job still succeeds |
+| `MAX_ERROR_BYTES` | 4 KB | A failed job's error text (the start and the end are kept) |
 | `QUEUE_CAPACITY` | 500 per queue | Jobs waiting before the **API** answers `429`; your app's `.delay()` is never refused |
 | `MAX_QUEUES` | 100 | Queue names |
 

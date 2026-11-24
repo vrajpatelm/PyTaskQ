@@ -28,6 +28,7 @@ Async-first, self-hosted, built on FastAPI and Redis.
 - **See everything.** A live dashboard shows every job's arguments, timing, result and error, and lets you run, cancel and replay jobs.
 - **Built for failure.** Retries with backoff, a dead-letter queue, crash recovery, fencing tokens, safe retries with idempotency keys and graceful shutdown come built in. [What PyTaskQ guarantees](https://github.com/vrajpatelm/PyTaskQ/blob/main/docs/GUARANTEES.md), stated plainly.
 - **In control.** Report progress from a task, stop a running job, pause a queue, limit how many of a task run at once or how fast, and search every finished job.
+- **Workflows.** Run jobs one after another or side by side and pass results on (`chain`, `group`), see the whole flow in the dashboard, and resume it after fixing a failed step. No result backend needed.
 - **Fast on small servers.** On a 2-core server, 500 simultaneous users get a typical response in 16 ms, and the dashboard tells you which setting to change when it can't keep up.
 - **Self-hosted.** Accounts, roles, invite links, HTTPS and backups are included. Redis is the only thing you need to run.
 
@@ -108,6 +109,8 @@ Live updates, light and dark themes, and a layout that works on phones.
 **Workers.** Host, load, jobs done and failed, pool sizes, uptime, heartbeat health and PyTaskQ version.
 
 **History.** Search every kept finished job (50,000 by default) by text, outcome, task, queue and time.
+
+**Workflows.** Every workflow's stages and steps at a glance, why it stopped, and buttons to retry its failed steps or cancel it.
 
 **Queues.** How many jobs wait in each queue and how many workers serve it, with a button to pause and resume each one.
 
@@ -213,6 +216,7 @@ Interactive docs are served at `/docs`, and the full reference is in [docs/API.m
 | `GET` | `/tasks/history` | Search finished jobs (text, status, task, queue, time) |
 | `GET` / `POST` | `/queues`, `/queues/{name}/pause`, `/queues/{name}/resume` | Queues, and pausing them |
 | `GET` | `/metrics/prometheus` | Prometheus metrics |
+| `GET` / `POST` | `/workflows`, `/workflows/{id}`, `/workflows/{id}/cancel`, `/workflows/{id}/retry` | Workflows |
 | `GET` | `/metrics`, `/system/workers`, `/dlq` | Queue, worker and dead-letter state |
 | `GET` | `/system/performance` | Refused requests and tuning suggestions |
 | `POST` | `/dlq/replay/{id}`, `/dlq/retry_all` | Replay dead letters |
@@ -233,7 +237,7 @@ docker compose -f docker-compose.prod.yml up -d
 For your own tasks, build a worker image on top of the official one:
 
 ```dockerfile
-FROM ghcr.io/vrajpatelm/pytaskq:0.5
+FROM ghcr.io/vrajpatelm/pytaskq:0.6
 COPY tasks.py .
 CMD ["pytaskq", "worker", "--app", "tasks:queue"]
 ```
@@ -251,7 +255,7 @@ npm run dev                  # dashboard with hot reload; talks to `pytaskq dash
 npm run build                # writes the bundle into pytaskq/static/
 ```
 
-See [TASKS](https://github.com/vrajpatelm/PyTaskQ/blob/main/docs/TASKS.md), [GUARANTEES](https://github.com/vrajpatelm/PyTaskQ/blob/main/docs/GUARANTEES.md), [QUEUES](https://github.com/vrajpatelm/PyTaskQ/blob/main/docs/QUEUES.md), [WORKERS](https://github.com/vrajpatelm/PyTaskQ/blob/main/docs/WORKERS.md), [REDIS](https://github.com/vrajpatelm/PyTaskQ/blob/main/docs/REDIS.md), [UPGRADING](https://github.com/vrajpatelm/PyTaskQ/blob/main/docs/UPGRADING.md), [CONTRIBUTING](https://github.com/vrajpatelm/PyTaskQ/blob/main/docs/CONTRIBUTING.md), [ARCHITECTURE](https://github.com/vrajpatelm/PyTaskQ/blob/main/docs/ARCHITECTURE.md) and the [CHANGELOG](https://github.com/vrajpatelm/PyTaskQ/blob/main/CHANGELOG.md).
+See [TASKS](https://github.com/vrajpatelm/PyTaskQ/blob/main/docs/TASKS.md), [WORKFLOWS](https://github.com/vrajpatelm/PyTaskQ/blob/main/docs/WORKFLOWS.md), [GUARANTEES](https://github.com/vrajpatelm/PyTaskQ/blob/main/docs/GUARANTEES.md), [QUEUES](https://github.com/vrajpatelm/PyTaskQ/blob/main/docs/QUEUES.md), [WORKERS](https://github.com/vrajpatelm/PyTaskQ/blob/main/docs/WORKERS.md), [REDIS](https://github.com/vrajpatelm/PyTaskQ/blob/main/docs/REDIS.md), [UPGRADING](https://github.com/vrajpatelm/PyTaskQ/blob/main/docs/UPGRADING.md), [CONTRIBUTING](https://github.com/vrajpatelm/PyTaskQ/blob/main/docs/CONTRIBUTING.md), [ARCHITECTURE](https://github.com/vrajpatelm/PyTaskQ/blob/main/docs/ARCHITECTURE.md) and the [CHANGELOG](https://github.com/vrajpatelm/PyTaskQ/blob/main/CHANGELOG.md).
 
 ## License
 
