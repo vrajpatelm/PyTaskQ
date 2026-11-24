@@ -424,6 +424,14 @@ async def find_duplicate(r, key: Optional[str], payload: dict, delay_seconds: fl
 ENQUEUE_SCRIPT = WAKE_LUA + """
 local unpack = unpack or table.unpack
 if ARGV[11] == '1' then redis.call('DEL', '__PYTASKQ__pytaskq:oom-probe') end
+-- This very call already queued the job: the client re-sent the script after losing the reply
+-- (a dropped connection, a failover). Answer "queued" again; never queue it twice (break test E4).
+for i = 13, #ARGV - 1, 2 do
+    if ARGV[i] == 'enqueue_nonce' then
+        if redis.call('HGET', KEYS[2], 'enqueue_nonce') == ARGV[i + 1] then return {1} end
+        break
+    end
+end
 if ARGV[7] ~= '' then
     local existing = redis.call('GET', KEYS[5])
     if existing then return {2, existing} end
@@ -508,6 +516,7 @@ async def enqueue(r, payload: dict, delay_seconds: float = 0, created_by: Option
         now = await clock.sync(r) if delay_seconds > 0 else clock.now()
         status = SCHEDULED if delay_seconds > 0 else QUEUED
         meta = _meta(payload, raw, status, now, delay_seconds)
+        meta["enqueue_nonce"] = uuid.uuid4().hex       # recognises this call if it's re-sent
         if created_by:
             meta["created_by"] = created_by
         if note:
@@ -652,7 +661,7 @@ def _reject_constant(name):
 
 def public_view(meta: dict) -> dict:
     """Task hash minus internal fields, with JSON fields decoded for clients."""
-    out = {k: v for k, v in meta.items() if k != "payload"}
+    out = {k: v for k, v in meta.items() if k not in ("payload", "enqueue_nonce")}
     if "args" not in out and meta.get("payload"):
         # Since 0.4.1 the arguments are stored once, inside the payload.
         try:

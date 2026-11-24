@@ -211,7 +211,8 @@ async def test_retry_all_keeps_priority_and_fence(client, r):
     assert res.json()["retried"] == 2
     high = json.loads(await r.lindex("queue:high", 0))
     low = json.loads(await r.lindex("queue:low", 0))
-    assert high["task_id"] == "d1" and high["fence_token"] == 2, "fence must match or the result is discarded"
+    assert high["task_id"] == "d1" and high["fence_token"] == int(await r.get("fence:d1")) == 3, \
+        "a new fence (0.6), and the job carries it, or its result would be discarded"
     assert low["task_id"] == "d2"
     for t in (high, low):
         assert t["retry_count"] == 0 and "error" not in t and "failed_at" not in t

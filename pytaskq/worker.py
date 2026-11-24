@@ -92,6 +92,7 @@ logging.basicConfig(
 logger = logging.getLogger("worker")
 
 HOSTNAME = socket.gethostname()
+BOOT_ID = uuid.uuid4().hex          # this run of this worker process (break test E6)
 WORKER_ID = f"{HOSTNAME}-{os.getpid()}-{uuid.uuid4().hex[:6]}"
 TASK_TIMEOUT = float(os.getenv("TASK_TIMEOUT", str(settings.TASK_TIMEOUT)))
 HEARTBEAT_TTL = max(3, int(settings.WORKER_HEARTBEAT_TTL))
@@ -302,7 +303,8 @@ return 0
 # Returns 1 saved, 0 stale attempt (a newer one owns the job), -1 nothing to do (already done).
 COMPLETE_SCRIPT = queueing.KEEP_LUA + """
 local removed = redis.call('LREM', KEYS[1], 1, ARGV[1])
-if removed == 0 and ARGV[3] == '1' then return -1 end
+-- Already done by this very call: the client re-sent it after losing the reply (break test E4).
+if removed == 0 and (ARGV[3] == '1' or redis.call('HGET', KEYS[3], 'status') == 'Success') then return -1 end
 local current = redis.call('GET', KEYS[2])
 if current and current ~= ARGV[2] then
     redis.call('PUBLISH', '__PYTASKQ__events:global', 'update')
@@ -332,7 +334,12 @@ return 1
 FAIL_SCRIPT = queueing.KEEP_LUA + """
 local unpack = unpack or table.unpack
 local removed = redis.call('LREM', KEYS[1], 1, ARGV[1])
-if removed == 0 and ARGV[3] == '1' then return -1 end
+if removed == 0 then
+    -- Already recorded by this very call (a re-sent script after a lost reply, break test E4):
+    -- never a second dead letter or a second retry.
+    local st = redis.call('HGET', KEYS[3], 'status')
+    if ARGV[3] == '1' or st == 'RetryScheduled' or st == 'DeadLetter' then return -1 end
+end
 local current = redis.call('GET', KEYS[2])
 if current and current ~= ARGV[2] then
     redis.call('PUBLISH', '__PYTASKQ__events:global', 'update')
@@ -410,7 +417,7 @@ return 1
 # prefix, note, duration (ms)
 CANCELLED_RUN_SCRIPT = queueing.KEEP_LUA + """
 local removed = redis.call('LREM', KEYS[1], 1, ARGV[1])
-if removed == 0 and ARGV[3] == '1' then return -1 end
+if removed == 0 and (ARGV[3] == '1' or redis.call('HGET', KEYS[3], 'status') == 'Cancelled') then return -1 end
 local current = redis.call('GET', KEYS[2])
 if current and current ~= ARGV[2] then return 0 end
 local by = redis.call('GET', KEYS[5])
@@ -907,6 +914,7 @@ def _worker_info() -> dict:
         "worker_id": WORKER_ID,
         "hostname": HOSTNAME,
         "pid": os.getpid(),
+        "boot_id": BOOT_ID,
         "app": APP_NAME,
         "cpu_workers": CPU_WORKERS,
         "io_workers": IO_WORKERS,
@@ -1184,6 +1192,11 @@ async def _record_failure(r, tasks, task_json, task_id, error, max_retries) -> s
         ))
 
     outcome = await _with_retries(save, "record a failure", task_id)
+    if outcome == -1:
+        # The first try went through, only its reply was lost: report what it recorded.
+        status = await r.hget(queueing.task_key(task_id), "status")
+        if status in (queueing.DEAD_LETTER, "RetryScheduled"):
+            outcome = 1
     if outcome <= 0:
         if outcome == 0:
             logger.warning(f"Task {task_id} attempt failed after the job was handed to another worker; "
@@ -1758,6 +1771,28 @@ def _pid_alive(pid: int) -> Optional[bool]:
     return True
 
 
+def _boot_file() -> str:
+    import tempfile
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", WORKER_ID)[:100]
+    return os.path.join(tempfile.gettempdir(), f"pytaskq-worker-{safe}.boot")
+
+
+def _swap_boot_file() -> str:
+    """Read the boot id this machine's previous run of this named worker wrote, and write ours."""
+    path, previous = _boot_file(), ""
+    try:
+        with open(path) as f:
+            previous = f.read().strip()
+    except OSError:
+        pass
+    try:
+        with open(path, "w") as f:
+            f.write(BOOT_ID)
+    except OSError:
+        pass
+    return previous
+
+
 async def _claim_name(r) -> None:
     """
     With a fixed WORKER_NAME, make sure no other live worker uses the same name.
@@ -1766,13 +1801,22 @@ async def _claim_name(r) -> None:
     at once and puts back the jobs it was running. Otherwise it waits for the
     old heartbeat to run out, and refuses to start if that worker is still alive.
     """
+    previous_boot = _swap_boot_file()
     score = await r.zscore(rkey("active_workers"), WORKER_ID)
     if score is None or score < clock.now():
         return
     info = await r.hgetall(rkey(f"worker:{WORKER_ID}"))
     pid = _as_int(info.get("pid"))
-    if info.get("hostname") == HOSTNAME and (pid == os.getpid() or _pid_alive(pid) is False):
-        return
+    if info.get("hostname") == HOSTNAME:
+        # Proof that the live-looking record is this worker's own previous run: the boot id this
+        # machine wrote last time matches it. Same hostname and pid alone aren't proof: in containers
+        # every worker is pid 1, and `network_mode: host` or a fixed `hostname:` gives two containers
+        # the same name, so a second container took the first one's running job (break test E6).
+        mine_before = bool(previous_boot) and info.get("boot_id") == previous_boot
+        if pid != os.getpid() and _pid_alive(pid) is False:
+            return                              # same machine, that process is gone
+        if mine_before and (pid == os.getpid() or _pid_alive(pid) is not True):
+            return                              # this container/machine restarted
     logger.warning(f"A worker named {WORKER_ID!r} (host {info.get('hostname')}, pid {pid}) was alive moments ago. "
                    f"Waiting up to {HEARTBEAT_TTL}s for its heartbeat to run out…")
     deadline = time.monotonic() + HEARTBEAT_TTL + 5

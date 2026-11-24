@@ -1,5 +1,6 @@
 import json
 import time
+from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 
@@ -21,13 +22,25 @@ _NOT_REPLAYABLE = ("This entry isn't a valid job: it was found in a queue and ke
 # Take one entry out of the dead-letter list and queue it again, atomically.
 # If someone else already took it (a second click, another admin, "Replay all"
 # at the same moment), LREM removes nothing and the job is NOT queued twice.
-# KEYS: dlq, target queue list, task hash
-# ARGV: dead-letter entry, new payload, task_id, task_name, priority, note, (unused), queue name
+# KEYS: dlq, target queue list, task hash, finished set, wake list, fence
+# ARGV: dead-letter entry, new payload, task_id, task_name, priority, note, (unused), queue name,
+#       fence read before ("" = none), new fence
+# Returns 1 replayed, 0 already taken by someone else, -1 the id is in use, -2 the fence moved (retry).
 # The record has no expiry while the job waits again (it gets RESULT_TTL when it finishes).
 REPLAY_SCRIPT = queueing.WAKE_LUA + """
+-- A job with this id is waiting or running now (the id was reused): replaying would run a second
+-- copy at the same time (break test E7).
+local status = redis.call('HGET', KEYS[3], 'status')
+if status and status ~= 'Success' and status ~= 'DeadLetter' and status ~= 'Cancelled' and status ~= 'Failed' then
+    return -1
+end
+-- The fence moved since the payload was built: build it again.
+if (redis.call('GET', KEYS[6]) or '') ~= ARGV[9] then return -2 end
 if redis.call('LREM', KEYS[1], 1, ARGV[1]) == 0 then
     return 0
 end
+-- A new fence: any attempt of an earlier run that still finishes late is ignored.
+redis.call('SET', KEYS[6], ARGV[10], 'EX', 86400)
 redis.call('RPUSH', KEYS[2], ARGV[2])
 pytaskq_wake(KEYS[5], 100)
 if ARGV[3] ~= '' then
@@ -69,33 +82,58 @@ async def _find(task_id: str):
     raise HTTPException(status_code=404, detail="That job is not in the dead letters (it may have been replayed or deleted).")
 
 
-async def _fresh_payload(item: dict) -> dict:
-    """Reset a dead-lettered task so it can run again with a valid fence token."""
+async def _fresh_payload(item: dict) -> tuple[dict, str]:
+    """
+    Reset a dead-lettered task so it runs again as a new attempt: retries, waits and its
+    rate-limit turn start over (a turn reserved long ago let replays burst, break test D4),
+    and it gets a new fence token. Returns (payload, the fence it was built from).
+    """
     task = {k: v for k, v in item.items() if k not in _DLQ_ONLY_FIELDS}
     task["retry_count"] = 0
     task["prev_delay"] = 1.0
     task["bounces"] = 0
+    task["waits"] = 0
+    task["rate_slot"] = None
     task.pop("handed_back_since", None)
-    current_fence = await redis_client.r.get(rkey(f"fence:{task.get('task_id')}"))
-    if current_fence is not None:
-        task["fence_token"] = int(current_fence)
-    return task
+    current = await redis_client.r.get(rkey(f"fence:{task.get('task_id')}"))
+    seen = current or ""
+    try:
+        base = max(int(current or 0), int(task.get("fence_token") or 0))
+    except (TypeError, ValueError):
+        base = int(current or 0)
+    task["fence_token"] = base + 1
+    return task, seen
 
 
-async def _replay(raw: str, task: dict) -> bool:
-    """Queue a dead letter again. False if someone else already took it."""
-    task_id = task.get("task_id") or ""
-    priority = task.get("priority", "default")
-    note = f"Replayed from dead letters at {time.strftime('%Y-%m-%d %H:%M:%S')}"
-    queue = queueing.payload_queue(task)
-    done = await redis_client.r.eval(
-        REPLAY_SCRIPT, 5,
-        DLQ_KEY, queueing.queue_key(priority, queue), queueing.task_key(task_id), queueing.FINISHED_KEY,
-        queueing.wake_key(queue),
-        raw, json.dumps(task), task_id, task.get("task_name", ""), priority, note, int(settings.RESULT_TTL),
-        queue,
-    )
-    return bool(done)
+class _InUse(Exception):
+    pass
+
+
+async def _replay(raw: str, item: dict) -> Optional[dict]:
+    """Queue a dead letter again. None if someone else already took it; _InUse if its id is busy."""
+    for _ in range(5):
+        task, seen = await _fresh_payload(item)
+        task_id = task.get("task_id") or ""
+        priority = task.get("priority", "default")
+        note = f"Replayed from dead letters at {time.strftime('%Y-%m-%d %H:%M:%S')}"
+        queue = queueing.payload_queue(task)
+        done = int(await redis_client.r.eval(
+            REPLAY_SCRIPT, 6,
+            DLQ_KEY, queueing.queue_key(priority, queue), queueing.task_key(task_id), queueing.FINISHED_KEY,
+            queueing.wake_key(queue), rkey(f"fence:{task_id}"),
+            raw, json.dumps(task), task_id, task.get("task_name", ""), priority, note, int(settings.RESULT_TTL),
+            queue, seen, str(task["fence_token"]),
+        ))
+        if done == 1:
+            return task
+        if done == 0:
+            return None
+        if done == -1:
+            raise _InUse(task_id)
+    return None
+
+_IN_USE = ("A job with this id is waiting or running right now (the id was used again after this one failed). "
+           "Replaying it would run a second copy at the same time. Wait for it to finish, then replay.")
 
 
 @router.post("/replay/{task_id}", dependencies=_operator)
@@ -103,8 +141,11 @@ async def replay_task(task_id: str):
     raw, item = await _find(task_id)
     if item.get("invalid"):
         raise HTTPException(status_code=409, detail=_NOT_REPLAYABLE)
-    task = await _fresh_payload(item)
-    if not await _replay(raw, task):
+    try:
+        task = await _replay(raw, item)
+    except _InUse:
+        raise HTTPException(status_code=409, detail=_IN_USE) from None
+    if task is None:
         raise HTTPException(status_code=409, detail="This job was already replayed or deleted by someone else.")
     await _notify_tenant("global", "dlq_updated")
     return {"message": "Task replayed successfully", "task": task}
@@ -133,13 +174,28 @@ async def retry_all_dlq():
     if not raws:
         return {"message": "DLQ is empty", "retried": 0}
 
-    retried = 0
+    retried = duplicates = busy = 0
+    seen: set = set()
     for raw in raws:
         item = _parse(raw)
         if item is None or item.get("invalid"):
             continue
-        if await _replay(raw, await _fresh_payload(item)):
-            retried += 1
+        task_id = item.get("task_id")
+        if task_id in seen:
+            # The same job dead-lettered twice: queue it once, drop the extra entry.
+            duplicates += int(await redis_client.r.lrem(DLQ_KEY, 1, raw))
+            continue
+        try:
+            if await _replay(raw, item):
+                retried += 1
+                seen.add(task_id)
+        except _InUse:
+            busy += 1
 
     await _notify_tenant("global", "dlq_updated")
-    return {"message": f"Successfully requeued {retried} tasks", "retried": retried}
+    message = f"Successfully requeued {retried} tasks"
+    if duplicates:
+        message += f"; removed {duplicates} duplicate entr{'y' if duplicates == 1 else 'ies'}"
+    if busy:
+        message += f"; left {busy} whose id is in use by a waiting or running job"
+    return {"message": message, "retried": retried, "duplicates_removed": duplicates, "skipped_in_use": busy}

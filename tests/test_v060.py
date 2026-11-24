@@ -418,3 +418,209 @@ async def test_e11_results_json_cant_hold_are_stored_as_valid_json(env, caplog):
     for text in stored:
         json.loads(text)                                  # all valid JSON now
     assert "NaN or Infinity" in caplog.text and "values JSON can't hold" in caplog.text
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Lost replies and ids: E4, E6, E7
+# ═════════════════════════════════════════════════════════════════════════════
+
+class DropReplyProxy:
+    """
+    A TCP proxy in front of Redis that, for the first `times` commands containing
+    `marker`, forwards the command, lets Redis run it, then cuts the client's
+    connection instead of passing the reply on (a network drop or failover right
+    after the write). The client's automatic retry then re-sends the command.
+    """
+
+    def __init__(self, upstream_port: int, marker: bytes, times: int = 1):
+        self.upstream_port, self.marker, self.left = upstream_port, marker, times
+        self.dropped = 0
+
+    async def start(self):
+        self.server = await asyncio.start_server(self._client, "127.0.0.1", 0)
+        self.port = self.server.sockets[0].getsockname()[1]
+        return self
+
+    async def _client(self, reader, writer):
+        up_r, up_w = await asyncio.open_connection("127.0.0.1", self.upstream_port)
+
+        async def down():
+            try:
+                while data := await up_r.read(65536):
+                    writer.write(data)
+                    await writer.drain()
+            except Exception:
+                pass
+        pump = asyncio.create_task(down())
+        try:
+            while data := await reader.read(65536):
+                if self.left and self.marker in data:
+                    self.left -= 1
+                    self.dropped += 1
+                    pump.cancel()
+                    up_w.write(data)
+                    await up_w.drain()
+                    await up_r.read(65536)            # Redis ran it and answered...
+                    writer.transport.abort()          # ...but the client never hears it
+                    up_w.close()
+                    return
+                up_w.write(data)
+                await up_w.drain()
+        except Exception:
+            pass
+        finally:
+            pump.cancel()
+
+    async def close(self):
+        self.server.close()
+
+
+@needs_redis
+async def test_e4_a_lost_enqueue_reply_neither_fails_nor_queues_twice(redis_url):
+    port = int(redis_url.rsplit(":", 1)[1].split("/")[0])
+    proxy = await DropReplyProxy(port, b"enqueue_nonce").start()
+    try:
+        with patch.object(settings, "REDIS_URL", f"redis://127.0.0.1:{proxy.port}/4"):
+            r = redis_client.make_client()
+        await r.flushdb()
+        res = await queueing.enqueue(r, queueing.new_payload("echo", [1], task_id="lost-1"))
+        assert proxy.dropped == 1, "the reply really was lost and the call re-sent"
+        assert res["status"] == "queued", "not TaskIdInUse for a job that was queued"
+        assert await r.llen(queueing.queue_key("default")) == 1, "queued once"
+        await r.aclose()
+    finally:
+        await proxy.close()
+
+
+async def test_e4_a_resent_enqueue_after_the_job_finished_doesnt_run_it_again(r):
+    with patch.object(queueing.uuid, "uuid4", lambda: type("U", (), {"hex": "same-call"})()):
+        payload = queueing.new_payload("echo", [1], task_id="done-1")
+        await queueing.enqueue(r, payload)
+        await r.delete(queueing.queue_key("default"))
+        await r.hset("task:done-1", "status", "Success")           # a worker finished it meanwhile
+        res = await queueing.enqueue(r, payload)                    # the re-sent call
+    assert res["status"] == "queued" and await r.llen(queueing.queue_key("default")) == 0
+    assert await r.hget("task:done-1", "status") == "Success", "the finished record stays"
+
+
+@needs_redis
+async def test_e4_a_lost_failure_reply_records_one_dead_letter(redis_url, tmp_path):
+    port = int(redis_url.rsplit(":", 1)[1].split("/")[0])
+    proxy = await DropReplyProxy(port, b"stats:failed").start()
+    try:
+        with patch.object(settings, "REDIS_URL", f"redis://127.0.0.1:{proxy.port}/5"):
+            r = redis_client.make_client()
+        await r.flushdb()
+        bak = worker.WORKER_ID
+        worker.WORKER_ID = "e4"
+        with patch.object(worker.redis_client, "r", r), patch("pytaskq.core.redis_client.r", r):
+            await queueing.enqueue(r, queueing.new_payload("bad", [], task_id="f1"))
+            await run_one(r, {"bad": {"handler": lambda: 1 / 0, "type": "io", "max_retries": 0}})
+        worker.WORKER_ID = bak
+        assert proxy.dropped == 1
+        assert await r.llen("dlq") == 1 and await r.get("stats:failed") == "1"
+        assert await r.hget("task:f1", "status") == "DeadLetter"
+        await r.aclose()
+    finally:
+        await proxy.close()
+
+
+@needs_redis
+async def test_e4_a_lost_success_reply_counts_once(redis_url):
+    port = int(redis_url.rsplit(":", 1)[1].split("/")[0])
+    proxy = await DropReplyProxy(port, b"stats:completed").start()
+    try:
+        with patch.object(settings, "REDIS_URL", f"redis://127.0.0.1:{proxy.port}/6"):
+            r = redis_client.make_client()
+        await r.flushdb()
+        bak = worker.WORKER_ID
+        worker.WORKER_ID = "e4"
+        with patch.object(worker.redis_client, "r", r), patch("pytaskq.core.redis_client.r", r):
+            await queueing.enqueue(r, queueing.new_payload("ok", [], task_id="s1"))
+            await run_one(r, {"ok": {"handler": lambda: "fine", "type": "io", "max_retries": 0}})
+        worker.WORKER_ID = bak
+        assert proxy.dropped == 1
+        assert await r.get("stats:completed") == "1" and await r.hget("task:s1", "status") == "Success"
+        await r.aclose()
+    finally:
+        await proxy.close()
+
+
+async def test_e6_a_second_container_with_the_same_name_doesnt_take_the_first_ones_job(env, tmp_path):
+    """Same WORKER_NAME, same hostname, both pid 1 (two containers): the second must not 'recover' the job."""
+    r = env
+    from pytaskq.core import clock
+    await queueing.enqueue(r, queueing.new_payload("echo", [1], task_id="busy"))
+    await pop(r)                                          # the first container is running it
+    await r.zadd("active_workers", {"test-worker": clock.now() + 25})
+    await r.hset("worker:test-worker", mapping={"hostname": worker.HOSTNAME, "pid": os.getpid(),
+                                                "boot_id": "first-container"})
+
+    async def first_keeps_beating():
+        while True:
+            await asyncio.sleep(0.5)
+            await r.zadd("active_workers", {"test-worker": clock.now() + 31})
+    beating = asyncio.create_task(first_keeps_beating())
+    try:
+        with patch.object(worker, "_boot_file", lambda: str(tmp_path / "boot")):   # its own filesystem: no file
+            with pytest.raises(SystemExit, match="Another worker named 'test-worker'"):
+                await worker._claim_name(r)
+    finally:
+        beating.cancel()
+    assert await r.llen(worker._processing_key()) == 1, "the first one's job wasn't touched"
+
+
+async def test_e6_the_same_container_restarting_continues_at_once(env, tmp_path):
+    r = env
+    from pytaskq.core import clock
+    boot = tmp_path / "boot"
+    boot.write_text("previous-run")                      # written by this container's previous run
+    await r.zadd("active_workers", {"test-worker": clock.now() + 25})
+    await r.hset("worker:test-worker", mapping={"hostname": worker.HOSTNAME, "pid": os.getpid(),
+                                                "boot_id": "previous-run"})
+    with patch.object(worker, "_boot_file", lambda: str(boot)):
+        began = time.monotonic()
+        await worker._claim_name(r)
+    assert time.monotonic() - began < 1
+    assert boot.read_text() == worker.BOOT_ID, "the next restart will recognise this run"
+
+
+async def _dead_letter(r, task_id, **fields):
+    p = queueing.new_payload("report", [], task_id=task_id)
+    p.update(error="RuntimeError: upstream down", failed_at=time.time(), **fields)
+    await r.lpush("dlq", json.dumps(p))
+    await r.hset(f"task:{task_id}", mapping={"task_id": task_id, "status": "DeadLetter"})
+    return p
+
+
+async def test_e7_replay_is_refused_while_the_same_id_is_running(client, r):
+    await _dead_letter(r, "report-2026-11-23")
+    await r.hset("task:report-2026-11-23", "status", "Processing")   # the id was reused and runs now
+    res = await client.post("/dlq/replay/report-2026-11-23")
+    assert res.status_code == 409 and "second copy" in res.json()["detail"]
+    assert await r.llen("dlq") == 1 and await r.llen("queue:default") == 0
+    res = (await client.post("/dlq/retry_all")).json()
+    assert res["retried"] == 0 and res["skipped_in_use"] == 1
+
+
+async def test_e7_replay_gets_a_new_fence_so_a_late_old_attempt_is_ignored(client, r):
+    await _dead_letter(r, "r1", fence_token=4)
+    await r.set("fence:r1", 4)
+    assert (await client.post("/dlq/replay/r1")).status_code == 200
+    queued = json.loads(await r.lindex("queue:default", 0))
+    assert queued["fence_token"] == 5 and await r.get("fence:r1") == "5"
+
+
+async def test_e7_retry_all_queues_a_job_dead_lettered_twice_once(client, r):
+    await _dead_letter(r, "twice")
+    await _dead_letter(r, "twice")
+    res = (await client.post("/dlq/retry_all")).json()
+    assert res["retried"] == 1 and res["duplicates_removed"] == 1
+    assert await r.llen("queue:default") == 1 and await r.llen("dlq") == 0
+
+
+async def test_d4_replay_starts_rate_limit_waits_over(client, r):
+    await _dead_letter(r, "rl", rate_slot=time.time() - 3600, waits=7)
+    assert (await client.post("/dlq/replay/rl")).status_code == 200
+    queued = json.loads(await r.lindex("queue:default", 0))
+    assert queued["rate_slot"] is None and queued["waits"] == 0
