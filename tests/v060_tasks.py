@@ -136,3 +136,8 @@ def wf_resize(data, size=64):
 def wf_publish(images, channel="web"):
     log("wf_publish", channel, len(images))
     return {"published": images, "channel": channel}
+
+
+@queue.task(type="io", max_retries=1)
+def big_error(mb=20):
+    raise RuntimeError("E" * (mb * 1_000_000))

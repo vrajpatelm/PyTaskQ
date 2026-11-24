@@ -458,14 +458,14 @@ class DropReplyProxy:
                     self.left -= 1
                     self.dropped += 1
                     pump.cancel()
+                    try:
+                        await pump                    # stop reading Redis's replies before reading one ourselves
+                    except asyncio.CancelledError:
+                        pass
                     up_w.write(data)
                     await up_w.drain()
                     await up_r.read(65536)            # Redis ran it and answered...
-                    writer.close()                    # ...but the client never hears it: the connection closes
-                    try:
-                        await writer.wait_closed()
-                    except Exception:
-                        pass
+                    writer.transport.abort()          # ...but the client never hears it: the connection drops
                     up_w.close()
                     return
                 up_w.write(data)
@@ -480,9 +480,6 @@ class DropReplyProxy:
 
 
 @needs_redis
-@pytest.mark.skipif(__import__("sys").version_info < (3, 11), reason=(
-    "on Python 3.10, redis-py reports a connection closed during a read as a timeout and doesn't re-send, "
-    "so there's no repeat to recognise (the caller gets the timeout)"))
 async def test_e4_a_lost_enqueue_reply_neither_fails_nor_queues_twice(redis_url):
     port = int(redis_url.rsplit(":", 1)[1].split("/")[0])
     proxy = await DropReplyProxy(port, b"enqueue_nonce").start()
