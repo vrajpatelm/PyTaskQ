@@ -350,6 +350,7 @@ def _meta(payload: dict, raw: str, status: str, now: float, delay_seconds: float
         "created_at": now,
         "scheduled_for": now + delay_seconds if delay_seconds > 0 else None,
         "retry_count": payload.get("retry_count", 0),
+        "workflow_id": (payload.get("workflow") or {}).get("id") if isinstance(payload.get("workflow"), dict) else None,
         "payload": raw,
     })
 
@@ -646,6 +647,13 @@ async def cancel(r, task_id: str, by: Optional[str] = None) -> tuple[bool, str]:
         if by:
             await r.hset(task_key(task_id), "cancelled_by", by)
         await r.publish(EVENTS_CHANNEL, "update")
+        try:
+            info = json.loads(payload).get("workflow")
+        except (ValueError, AttributeError):
+            info = None
+        if isinstance(info, dict):
+            from pytaskq import workflows      # a cancelled step stops its workflow
+            await workflows.step_finished(r, info, "cancelled", error="cancelled")
         return True, CANCELLED
     # Not on its queue any more: a worker took it just now. Ask that worker to stop it.
     return await _request_stop(r, task_id, by)
@@ -746,7 +754,7 @@ LIST_ERROR_MAX = 1_000          # job lists show this much of an error (the job'
 
 # The small fields a job list needs. Lists used to read whole records, so a few jobs with
 # megabyte-sized arguments, results or errors made every list request megabytes (break tests D7, E8).
-SUMMARY_FIELDS = ("task_id", "task_name", "status", "queue", "priority", "created_at", "scheduled_for",
+SUMMARY_FIELDS = ("task_id", "task_name", "status", "queue", "priority", "created_at", "scheduled_for", "workflow_id",
                   "started_at", "finished_at", "duration_ms", "retry_count", "error", "note", "worker_id",
                   "cancelled_by", "cancel_requested_at", "cancel_requested_by", "progress", "progress_message",
                   "waiting_for", "result_dropped", "next_retry_at", "created_by", "args", "kwargs")

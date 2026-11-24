@@ -464,3 +464,33 @@ tr:hover .name-cell .icon-btn, .name-cell .icon-btn:focus-visible { opacity: 1; 
 .history-time input { width: 12.5rem; max-width: 100%; }
 .history-time { display: flex; flex-direction: column; gap: 0.15rem; font-size: 0.75rem; color: var(--text-secondary); }
 .history-foot { display: flex; align-items: center; justify-content: space-between; gap: 0.75rem; margin-top: 0.75rem; flex-wrap: wrap; }
+
+/* Workflows */
+.wf-empty pre { text-align: left; display: inline-block; margin: 0.75rem auto 0; padding: 0.75rem 1rem;
+  background: var(--task-bg); border: 1px solid var(--border-color); border-radius: 8px; font-size: 0.8rem; }
+.wf-steps { min-width: 11rem; }
+.wf-detail { margin-top: 1rem; border-top: 1px solid var(--border-color); padding-top: 1rem; }
+.wf-head { display: flex; justify-content: space-between; gap: 1rem; flex-wrap: wrap; align-items: flex-start; }
+.wf-head h3 { margin: 0; display: flex; gap: 0.5rem; align-items: center; flex-wrap: wrap; font-size: 1.05rem; }
+.wf-head p { margin: 0.25rem 0 0; }
+.wf-reason { color: var(--status-failed-text); font-size: 0.85rem; max-width: 60ch; overflow-wrap: anywhere; }
+.wf-actions { display: flex; gap: 0.5rem; flex-wrap: wrap; }
+/* Stages read left to right, joined by a line; a group's steps stack inside their stage. */
+.wf-stages { list-style: none; display: flex; gap: 2rem; padding: 1rem 0 0.25rem; margin: 0; overflow-x: auto; }
+.wf-stage { position: relative; display: flex; flex-direction: column; gap: 0.4rem; min-width: 10rem; }
+.wf-stage + .wf-stage::before { content: ""; position: absolute; left: -2rem; width: 2rem; top: 2.1rem;
+  border-top: 2px solid var(--border-color); }
+.wf-stage.current .wf-stage-label { color: var(--status-processing-text); font-weight: 600; }
+.wf-stage-label { font-size: 0.72rem; color: var(--text-secondary); }
+.wf-step { display: flex; justify-content: space-between; align-items: center; gap: 0.5rem; text-align: left;
+  padding: 0.45rem 0.6rem; border-radius: 8px; border: 1px solid var(--border-color); background: var(--surface-color);
+  color: var(--text-primary); cursor: pointer; font: inherit; font-size: 0.85rem; }
+.wf-step:hover:not(:disabled) { border-color: var(--accent-color); }
+.wf-step:focus-visible { outline: 2px solid var(--accent-color); outline-offset: 2px; }
+.wf-step:disabled { cursor: default; opacity: 0.7; }
+.wf-step-name { font-family: var(--font-mono, ui-monospace, monospace); overflow: hidden; text-overflow: ellipsis; }
+@media (max-width: 640px) {
+  .wf-stages { flex-direction: column; gap: 1rem; }
+  .wf-stage + .wf-stage::before { left: 1rem; top: -1rem; width: 0; height: 1rem; border-top: 0;
+    border-left: 2px solid var(--border-color); }
+}

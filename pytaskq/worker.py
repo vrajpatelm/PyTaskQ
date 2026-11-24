@@ -892,6 +892,8 @@ async def zombie_sweeper():
             continue
         try:
             await _sweep_dead_workers()
+            from pytaskq import workflows
+            await workflows.sweep(redis_client.r)  # stages whose steps were never queued
             if rounds % 30 == 0:                   # every ~5 minutes
                 dropped = await queueing.prune_queues(redis_client.r)
                 if dropped:
@@ -1288,6 +1290,8 @@ async def _record_failure(r, tasks, task_json, task_id, error, max_retries) -> s
                            f"ignoring it ({error}).")
         return "Discarded"
     if dead:
+        if tasks.workflow:
+            await _workflow_step(r, tasks, "failed", error=error)
         if outcome == 2:
             logger.warning(f"[DLQ] More than DLQ_LIMIT ({settings.DLQ_LIMIT}) dead letters; the oldest was dropped.")
         logger.error(f"[DLQ] Task {task_id} failed after {tasks.retry_count} retries. Moving to DLQ. ({error})")
@@ -1547,6 +1551,19 @@ async def _record_cancelled(r, tasks, task_json, started_at) -> None:
         ))
     if await _with_retries(save, "record a cancelled job", task_id) != 0:
         logger.info(f"Task {task_id} ({tasks.task_name}) cancelled{' while running' if started_at else ''}.")
+        if tasks.workflow:
+            await _workflow_step(r, tasks, "cancelled", error="cancelled")
+
+
+async def _workflow_step(r, tasks, outcome: str, value=None, error: str = "") -> None:
+    """Tell the job's workflow that this step is done (and start the next stage when it's the last one)."""
+    from pytaskq import workflows
+    try:
+        await _with_retries(lambda _: workflows.step_finished(r, tasks.workflow, outcome, value, error),
+                            "advance a workflow", tasks.task_id)
+    except Exception as e:
+        # The leader's workflow sweep queues a stage's missing steps later.
+        logger.error(f"[Workflow] Couldn't record step {tasks.task_id} ({queueing.error_text(e)}).")
 
 
 async def _check_cancel_requests() -> int:
@@ -1856,6 +1873,8 @@ async def _run(r, tasks, task_json, process_pool, thread_pool) -> None:
 
         span.set_attribute("task.status", "Success")
         logger.info(f"Task {task_id} completed successfully.")
+        if tasks.workflow:
+            await _workflow_step(r, tasks, "ok", result)
         if dropped:
             logger.warning(f"Task {task_id} succeeded but its result wasn't stored: {dropped}")
         # ── Webhook delivery ──────────────────────────────────────────────

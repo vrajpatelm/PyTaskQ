@@ -336,6 +336,17 @@ class PyTaskQ:
                     idempotency_key=opts.get("idempotency_key"),
                 ))
 
+            def s(*args, **kwargs):
+                """A workflow step that receives the previous stage's result as its first argument."""
+                from pytaskq.workflows import Step
+                return Step(task_name, args, kwargs)
+
+            def si(*args, **kwargs):
+                """A workflow step that doesn't receive the previous stage's result."""
+                from pytaskq.workflows import Step
+                return Step(task_name, args, kwargs, immutable=True)
+
+            fn.s, fn.si = s, si
             fn.delay = delay
             fn.schedule = schedule
             fn.apply_async = apply_async
@@ -394,6 +405,55 @@ class PyTaskQ:
         """
         ok, _ = await queueing.cancel(_redis(), task_id)
         return ok
+
+    # ── workflows ────────────────────────────────────────────────────────────
+    async def workflow(self, flow, *, name: Optional[str] = None, on_failure: str = "stop",
+                       workflow_id: Optional[str] = None) -> dict:
+        """
+        Start a workflow: `chain(a.s(), group(b.s(1), b.s(2)), c.s())`. Stages run one
+        after another; a group's steps run at the same time. Each step gets the
+        previous stage's result first (`.si()` to opt out). See pytaskq.workflows.
+        on_failure: "stop" (the workflow is Failed when a step fails for good) or
+        "continue" (that step's result is None and the workflow goes on).
+        """
+        from pytaskq import workflows
+        plan = workflows.plan_of(flow)
+        workflows.remember_queues(self.TASKS)
+        return await workflows.start(_redis(), plan, name=name, on_failure=on_failure, registry=self.TASKS,
+                                     workflow_id=workflow_id)
+
+    async def workflow_status(self, workflow_id: str) -> Optional[dict]:
+        """The workflow and each step's state (None if unknown)."""
+        from pytaskq import workflows
+        return await workflows.status(_redis(), workflow_id)
+
+    async def wait_workflow(self, workflow_id: str, timeout: float = 60, poll_interval: float = 0.5) -> dict:
+        """Wait until the workflow finishes (Succeeded, PartlySucceeded, Failed or Cancelled)."""
+        from pytaskq import workflows
+        deadline = time.monotonic() + timeout
+        delay = 0.05
+        while True:
+            info = await workflows.status(_redis(), workflow_id)
+            if info is None:
+                raise LookupError(f"No workflow with id {workflow_id!r}")
+            if info["status"] in workflows.FINAL:
+                return info
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f"Workflow {workflow_id} did not finish within {timeout}s")
+            await asyncio.sleep(min(delay, max(0.0, deadline - time.monotonic())))
+            delay = min(delay * 1.5, poll_interval)
+
+    async def cancel_workflow(self, workflow_id: str) -> bool:
+        """Cancel a running workflow (its waiting and running steps too). False if it already finished."""
+        from pytaskq import workflows
+        before = await workflows.cancel(_redis(), workflow_id)
+        return before == workflows.RUNNING
+
+    async def retry_workflow(self, workflow_id: str) -> int:
+        """Run a failed workflow's failed steps again; it carries on when they succeed. Returns how many."""
+        from pytaskq import workflows
+        workflows.remember_queues(self.TASKS)
+        return await workflows.retry_failed(_redis(), workflow_id)
 
     async def pause_queue(self, queue: str) -> bool:
         """

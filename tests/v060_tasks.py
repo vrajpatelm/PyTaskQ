@@ -117,3 +117,22 @@ def mc_short(n=0):
 def rl_task(n=0):
     log("rl_start", n)
     return n
+
+
+@queue.task(type="io", max_retries=0)
+def wf_fetch(url=""):
+    log("wf_fetch", url)
+    return {"rows": 3, "url": url}
+
+
+@queue.task(type="io", max_retries=0)
+def wf_resize(data, size=64):
+    log("wf_resize", size)
+    time.sleep(0.2)
+    return f"{size}px of {data['rows']} rows"
+
+
+@queue.task(type="io", max_retries=0)
+def wf_publish(images, channel="web"):
+    log("wf_publish", channel, len(images))
+    return {"published": images, "channel": channel}
