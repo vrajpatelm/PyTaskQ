@@ -45,13 +45,17 @@ import hmac
 import inspect
 import json
 import os
+import logging
 import re
 import time
 from typing import Any, Callable, Optional
 
+from pytaskq import context
 from pytaskq.core import queueing
 from pytaskq.core.config import settings
 from pytaskq.net import SAFE_OPENER, assert_safe_url
+
+logger = logging.getLogger("pytaskq")
 
 TASK_TYPES = ("cpu", "io", "async")
 
@@ -225,12 +229,17 @@ class PyTaskQ:
             type, func = func, None
 
         def decorator(fn: Callable) -> Callable:
-            is_async = inspect.iscoroutinefunction(fn)
+            is_async = context.is_async_callable(fn)       # also behind decorators (break test E3)
             task_type = type or ("async" if is_async else "cpu")
             if task_type not in TASK_TYPES:
                 raise ValueError(f"type must be one of {TASK_TYPES}, got {task_type!r}")
             if is_async and task_type != "async":
-                raise ValueError(f"{fn.__name__} is `async def`; use type='async' (or leave type unset)")
+                fn_name = getattr(fn, "__name__", repr(fn))
+                if inspect.iscoroutinefunction(fn):
+                    raise ValueError(f"{fn_name} is `async def`; use type='async' (or leave type unset)")
+                logger.warning(f"Task {fn_name}: an `async def` behind a decorator, registered with type={task_type!r}. "
+                               f"It runs as an async task (on the event loop), which is what its code needs.")
+                task_type = "async"
             if task_type == "async" and not is_async:
                 raise ValueError(f"{fn.__name__} has type='async' but is not an `async def` function")
             prio = priority or self.default_priority

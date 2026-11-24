@@ -1205,7 +1205,12 @@ def _storable_result(result) -> tuple[str, str]:
     in Redis for RESULT_TTL. The job still counts as a success (its work is done;
     running it again would repeat that work), and the reason is recorded.
     """
-    encoded = queueing.encode_result(result)
+    encoded, notes = queueing.encode_result_noted(result)
+    if notes:
+        what = {"nan": "NaN or Infinity, which JSON can't hold: stored as null",
+                "text": "values JSON can't hold (a set, bytes, an object…): stored as their text"}
+        logger.warning(f"A result contained {'; and '.join(what[n] for n in notes)}. "
+                       f"Return plain JSON types (dict, list, str, int, float, bool, None) to keep it exact.")
     limit = settings.MAX_RESULT_BYTES
     if limit and limit > 0:
         size = len(encoded.encode("utf-8", "replace"))
@@ -1498,7 +1503,7 @@ async def _run_async(func, args, kwargs, timeout, task_id, task_name, started, c
     began = time.monotonic()
     token = context._current.set(ctx)       # the task (and anything it starts) sees its own job
     try:
-        job = asyncio.ensure_future(func(*args, **kwargs))
+        job = asyncio.ensure_future(context.acall_task(ctx, func, args, kwargs))
     finally:
         context._current.reset(token)
     try:
@@ -1526,6 +1531,7 @@ async def _run_async(func, args, kwargs, timeout, task_id, task_name, started, c
 async def handle_task(task_json, sem, loop, process_pool, thread_pool):
     """Run one popped job and record its outcome. `sem` (the worker's job limit) is released at the end."""
     r = redis_client.r
+    tasks = None
     try:
         try:
             tasks = Taskloader.model_validate_json(task_json)
@@ -1547,11 +1553,23 @@ async def handle_task(task_json, sem, loop, process_pool, thread_pool):
         # The shutdown grace period ran out. The job stays in this worker's
         # processing list, and the shutdown puts it back on its queue.
         raise
-    except Exception as e:
-        # Only reachable if Redis stayed down until the very end of a shutdown, or a bug.
-        # The job stays in the processing list; it's put back when this worker stops.
-        logger.exception(f"Could not finish handling a job ({type(e).__name__}: {e}). It stays listed under "
-                         f"this worker and is put back on its queue when the worker stops.")
+    except (Exception, SystemExit, KeyboardInterrupt) as e:
+        if tasks is not None and not isinstance(e, redis_errors.RedisError):
+            # Not Redis being away: something about this job made its outcome impossible to save.
+            # Putting it back would run it again on every restart, forever (break test E2), so it
+            # becomes a dead letter that says why.
+            reason = (f"PyTaskQ couldn't save this job's outcome ({queueing.error_text(e)}). "
+                      f"It was moved to dead letters instead of being run again.")
+            try:
+                await _record_failure(r, tasks, task_json, tasks.task_id, queueing.cut_text(reason, 4096), 0)
+                logger.error(f"Task {tasks.task_id}: {reason}")
+                return
+            except Exception:
+                pass
+        # Redis stayed down until the very end of a shutdown, or a bug. The job stays in the
+        # processing list; it's put back when this worker stops.
+        logger.error(f"Could not finish handling a job ({queueing.error_text(e)}). It stays listed under "
+                     f"this worker and is put back on its queue when the worker stops.")
     finally:
         sem.release()
 
@@ -1609,7 +1627,7 @@ async def _run(r, tasks, task_json, process_pool, thread_pool) -> None:
             args, kwargs = tasks.args, tasks.kwargs
             ctx = _jobs.get(task_id) or context.Job(task_id, _progress.put)
 
-            if inspect.iscoroutinefunction(func):
+            if context.is_async_callable(func) or task_type == "async":
                 execute = _run_async(func, args, kwargs, timeout, task_id, tasks.task_name, started, ctx)
             else:
                 pool = _pool_for(task_type, process_pool, thread_pool)
@@ -1645,8 +1663,8 @@ async def _run(r, tasks, task_json, process_pool, thread_pool) -> None:
                     "record a timeout", task_id))
                 if new_token >= 0:
                     tasks.fence_token = new_token
-            error = f"{type(e).__name__}: {e}"
-            span.set_status(trace.StatusCode.ERROR, str(e))
+            error = queueing.error_text(e)
+            span.set_status(trace.StatusCode.ERROR, error[:1000])
             span.record_exception(e)
             outcome = await _record_failure(r, tasks, task_json, task_id, error, max_retries)
             span.set_attribute("task.status", outcome)
@@ -1877,7 +1895,7 @@ async def consumer_task():
     named = NAME_OVERRIDE or settings.WORKER_NAME
     if named:
         WORKER_ID = worker_name(named)
-    needs_processes = any(e.get("type", "cpu") == "cpu" and not inspect.iscoroutinefunction(e.get("handler"))
+    needs_processes = any(e.get("type", "cpu") == "cpu" and not context.is_async_callable(e.get("handler"))
                           for n, e in TASKS.items() if not n.startswith("_"))
     logger.info(
         f"Worker {WORKER_ID}: {_TOTAL_CORES} CPU cores detected. "

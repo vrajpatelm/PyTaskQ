@@ -21,6 +21,7 @@ class Settings(BaseSettings):
     # How long one Redis command may take before the connection counts as dead (then it's reopened).
     # Must stay above the workers' idle wait (5 s). Keepalive probes find connections dropped silently
     # by a NAT, firewall or load balancer.
+    MAX_ERROR_BYTES: int = 4096        # a failed job's error text is cut to this (start and end kept)
     REDIS_SOCKET_TIMEOUT: float = 15
     REDIS_CONNECT_TIMEOUT: float = 5
     # High availability (docs/REDIS.md): Redis Sentinel finds the current primary and follows failovers.

@@ -197,3 +197,224 @@ def test_e5_sentinel_gives_the_primary_its_own_timeouts():
     sentinel = r.connection_pool.sentinel_manager.sentinels[0].connection_pool.connection_kwargs
     assert sentinel["socket_timeout"] == 2, "only the Sentinels get the short timeout"
     assert sync.connection_pool.connection_kwargs["socket_timeout"] == 5
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Task code can't hurt the worker: E1, E2, E3, E8, E11
+# ═════════════════════════════════════════════════════════════════════════════
+
+from tests import v060_tasks  # noqa: E402
+
+
+@pytest.fixture
+async def cpu_pool():
+    import multiprocessing
+    from pytaskq.pools import CpuPool
+    pools = []
+
+    async def make(size=1):
+        ctx = "fork" if "fork" in multiprocessing.get_all_start_methods() else None
+        pool = CpuPool(size, modules=("tests.v060_tasks",), mp_context=multiprocessing.get_context(ctx))
+        await pool.start()
+        pools.append(pool)
+        return pool
+    yield make
+    for pool in pools:
+        await pool.close(grace=0)
+
+
+@pytest.mark.parametrize("name", ["io_exit", "io_kbint", "async_exit", "async_kbint"])
+async def test_e1_sys_exit_or_keyboardinterrupt_in_a_task_fails_the_job_not_the_worker(env, name):
+    from pytaskq.pools import IoPool
+    r = env
+    tasks = dict(v060_tasks.queue.TASKS)
+    await queueing.enqueue(r, queueing.new_payload(name, [], task_id="bad"))
+    await queueing.enqueue(r, queueing.new_payload("echo", [7], task_id="good"))
+    io = IoPool(2)
+    try:
+        await run_one(r, tasks, io_pool=io)           # would raise SystemExit/KeyboardInterrupt before
+        await run_one(r, tasks, io_pool=io)
+    finally:
+        io.close()
+    bad = await r.hgetall("task:bad")
+    assert bad["status"] == "DeadLetter"
+    assert "TaskExited" in bad["error"] and ("sys.exit(3)" in bad["error"] or "KeyboardInterrupt" in bad["error"])
+    assert await r.hget("task:good", "status") == "Success", "the worker carried on"
+    assert await r.llen(worker._processing_key()) == 0
+
+
+async def test_e1_cpu_task_calling_sys_exit_fails_and_the_process_is_kept(env, cpu_pool):
+    r = env
+    pool = await cpu_pool(1)
+    tasks = {"x": {"handler": v060_tasks.cpu_exit_fn, "type": "cpu", "max_retries": 0},
+             "d": {"handler": v060_tasks.cpu_double, "type": "cpu", "max_retries": 0}}
+    await queueing.enqueue(r, queueing.new_payload("x", [], task_id="bad"))
+    await queueing.enqueue(r, queueing.new_payload("d", [21], task_id="good"))
+    await run_one(r, tasks, cpu_pool=pool)
+    await run_one(r, tasks, cpu_pool=pool)
+    assert "sys.exit(4)" in await r.hget("task:bad", "error")
+    assert await r.hget("task:good", "result") == "42" and pool.restarts == 0
+
+
+@needs_redis
+def test_e1_real_worker_survives_a_task_that_exits(redis_url, tmp_path):
+    """A real `pytaskq worker` process: before the fix it died with the job stuck in Processing."""
+    import sys as _sys
+    runlog = tmp_path / "runs.log"
+    env_vars = {**os.environ, "REDIS_URL": redis_url.replace("/0", "/3"), "PYTASKQ_AUTH": "off",
+                "PYTHONPATH": os.getcwd(), "RUNLOG": str(runlog), "WORKER_IO_WORKERS": "2",
+                "WORKER_CPU_WORKERS": "1", "PYTHONUNBUFFERED": "1"}
+    import redis as redis_sync
+    rs = redis_sync.Redis.from_url(env_vars["REDIS_URL"], decode_responses=True)
+    rs.flushdb()
+    proc = subprocess.Popen([_sys.executable, "-m", "pytaskq", "worker", "--app", "tests.v060_tasks:queue",
+                             "--name", "e1"], env=env_vars, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            text=True)
+    try:
+        enqueue = ("import asyncio,sys; sys.path.insert(0,'.'); from tests import v060_tasks as t;"
+                   "ids=[t.io_exit.delay_sync()['task_id'], t.async_kbint.delay_sync()['task_id'],"
+                   " t.cpu_exit.delay_sync()['task_id'], t.echo.delay_sync(5, tag='after')['task_id']];"
+                   "print(' '.join(ids))")
+        ids = subprocess.run([_sys.executable, "-c", enqueue], env=env_vars, capture_output=True, text=True,
+                             check=True).stdout.split()
+        end = time.time() + 30
+        while time.time() < end:
+            states = [rs.hget(f"task:{i}", "status") for i in ids]
+            if states == ["DeadLetter", "DeadLetter", "DeadLetter", "Success"]:
+                break
+            time.sleep(0.2)
+        assert states == ["DeadLetter", "DeadLetter", "DeadLetter", "Success"], states
+        assert proc.poll() is None, "the worker is still running"
+    finally:
+        proc.terminate()
+        out = proc.communicate(timeout=40)[0]
+    assert proc.returncode == 0, out[-2000:]
+
+
+@needs_redis
+@pytest.mark.parametrize("kind", ["result", "error"])
+async def test_e2_text_redis_cant_store_is_cleaned_not_stuck(real, kind):
+    r = real
+
+    def surrogate_result():
+        return "bad-\udcff-name"
+
+    def surrogate_error():
+        raise RuntimeError("cannot open file \udcff.txt")
+    tasks = {"t": {"handler": surrogate_result if kind == "result" else surrogate_error,
+                   "type": "io", "max_retries": 1}}
+    await queueing.enqueue(r, queueing.new_payload("t", [], task_id="s1", max_retries=1))
+    await run_one(r, tasks)
+    info = await r.hgetall("task:s1")
+    if kind == "result":
+        assert info["status"] == "Success" and info["result"] == "bad-\\udcff-name"
+    else:
+        assert info["status"] == "RetryScheduled", "its retry is scheduled, as max_retries says"
+        assert "\\udcff.txt" in info["error"]
+    assert await r.llen(worker._processing_key()) == 0, "nothing left to run again on every restart"
+
+
+async def test_e2_any_outcome_that_cant_be_saved_becomes_a_dead_letter(env):
+    """The safety net: a non-Redis error while saving an outcome must not leave the job in the processing list."""
+    r = env
+    tasks = {"t": {"handler": lambda: "fine", "type": "io", "max_retries": 3}}
+    await queueing.enqueue(r, queueing.new_payload("t", [], task_id="n1"))
+    with patch.object(worker, "_storable_result", side_effect=RuntimeError("cannot encode this")):
+        await run_one(r, tasks)
+    info = await r.hgetall("task:n1")
+    assert info["status"] == "DeadLetter" and "couldn't save this job's outcome" in info["error"]
+    assert await r.llen(worker._processing_key()) == 0
+
+
+@pytest.mark.parametrize("name", ["wrapped_async", "wrapped_async_default"])
+async def test_e3_async_functions_behind_decorators_really_run(env, tmp_path, name):
+    r = env
+    runlog = tmp_path / "runs.log"
+    with patch.object(v060_tasks, "RUNLOG", str(runlog)):
+        tasks = dict(v060_tasks.queue.TASKS)
+        assert tasks[name]["type"] == "async"
+        await queueing.enqueue(r, queueing.new_payload(name, [], {"tag": "x"}, task_id="w1"))
+        await run_one(r, tasks)
+    info = await r.hgetall("task:w1")
+    assert info["status"] == "Success" and info["result"].startswith("did work")
+    assert f"{name}_ran x" in runlog.read_text()
+
+
+async def test_e3_coroutines_and_generators_returned_by_sync_code(env, cpu_pool):
+    r = env
+    pool = await cpu_pool(1)
+
+    async def inner():
+        return 5
+
+    class Callable:
+        async def __call__(self, n):
+            return n + 1
+    tasks = {"io_coro": {"handler": lambda: inner(), "type": "io", "max_retries": 0},
+             "io_gen": {"handler": lambda: (i for i in range(3)), "type": "io", "max_retries": 0},
+             "obj": {"handler": Callable(), "type": "io", "max_retries": 0},
+             "cpu_coro": {"handler": v060_tasks.cpu_wrapped_coroutine, "type": "cpu", "max_retries": 0},
+             "cpu_gen": {"handler": v060_tasks.cpu_generator, "type": "cpu", "max_retries": 0}}
+    for name, args in (("io_coro", []), ("io_gen", []), ("obj", [1]), ("cpu_coro", []), ("cpu_gen", [4])):
+        await queueing.enqueue(r, queueing.new_payload(name, args, task_id=name))
+        await run_one(r, tasks, cpu_pool=pool)
+    results = {n: (await r.hget(f"task:{n}", "status"), await r.hget(f"task:{n}", "result"))
+               for n in ("io_coro", "io_gen", "obj", "cpu_coro", "cpu_gen")}
+    assert results == {"io_coro": ("Success", "5"), "io_gen": ("Success", "[0, 1, 2]"),
+                       "obj": ("Success", "2"), "cpu_coro": ("Success", "awaited in the process"),
+                       "cpu_gen": ("Success", "[0, 1, 4, 9]")}
+
+
+def test_e3_a_wrapped_async_def_is_registered_as_async():
+    from pytaskq import PyTaskQ
+    q = PyTaskQ()
+
+    @q.task(type="io")
+    @v060_tasks.logged
+    async def wrapped():
+        pass
+
+    @q.task()
+    @v060_tasks.logged
+    async def wrapped_default():
+        pass
+    assert q.TASKS["wrapped"]["type"] == q.TASKS["wrapped_default"]["type"] == "async"
+    with pytest.raises(ValueError, match="async def"):
+        @q.task(type="io")
+        async def plain():
+            pass
+
+
+async def test_e8_huge_error_messages_are_cut(env, caplog):
+    r = env
+    tasks = {"big": {"handler": lambda: (_ for _ in ()).throw(RuntimeError("E" * 20_000_000)),
+                     "type": "io", "max_retries": 0}}
+    await queueing.enqueue(r, queueing.new_payload("big", [], task_id="b1"))
+    await run_one(r, tasks)
+    error = await r.hget("task:b1", "error")
+    assert len(error.encode()) < 4300 and "bytes cut; MAX_ERROR_BYTES=4096" in error
+    assert "RuntimeError: EEE" in error and error.endswith("EEE")
+    dead = json.loads((await r.lrange("dlq", 0, 0))[0])
+    assert len(json.dumps(dead)) < 6000
+    assert len(caplog.text) < 100_000, "the log isn't flooded either"
+
+
+def test_e8_error_text_never_fails():
+    class Nasty(Exception):
+        def __str__(self):
+            raise ValueError("no text for you")
+    assert queueing.error_text(Nasty()).startswith("Nasty: (its message couldn't be read")
+    assert queueing.error_text(ValueError("ok")) == "ValueError: ok"
+
+
+async def test_e11_results_json_cant_hold_are_stored_as_valid_json(env, caplog):
+    r = env
+    for i, value in enumerate([float("nan"), {"v": [1, float("-inf")]}, {1, 2}, b"\xff"]):
+        tasks = {"t": {"handler": lambda value=value: value, "type": "io", "max_retries": 0}}
+        await queueing.enqueue(r, queueing.new_payload("t", [], task_id=f"n{i}"))
+        await run_one(r, tasks)
+    stored = [await r.hget(f"task:n{i}", "result") for i in range(4)]
+    assert stored[0] == "null" and json.loads(stored[1]) == {"v": [1, None]}
+    for text in stored:
+        json.loads(text)                                  # all valid JSON now
+    assert "NaN or Infinity" in caplog.text and "values JSON can't hold" in caplog.text

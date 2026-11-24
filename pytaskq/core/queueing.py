@@ -99,14 +99,95 @@ def queue_keys(queue: str = DEFAULT_QUEUE) -> list[str]:
     return [queue_key(p, queue) for p in PRIORITIES]
 
 
+def clean_text(text: Any) -> str:
+    """
+    Text that Redis (UTF-8) can store. Lone surrogates, which Python uses for bytes
+    that aren't UTF-8 (file names from os.listdir, output decoded with
+    surrogateescape), become \\udcff escapes instead of failing the save (break test E2).
+    """
+    if not isinstance(text, str):
+        text = str(text)
+    try:
+        text.encode("utf-8")
+        return text
+    except UnicodeEncodeError:
+        return text.encode("utf-8", "backslashreplace").decode("utf-8")
+
+
+def cut_text(text: str, limit: int) -> str:
+    """At most `limit` bytes of UTF-8: the start and the end, with how much was left out between them."""
+    data = text.encode("utf-8")
+    if limit <= 0 or len(data) <= limit:
+        return text
+    head = data[: limit * 3 // 4].decode("utf-8", "ignore")
+    tail = data[-(limit // 4):].decode("utf-8", "ignore")
+    return f"{head} … [{len(data) - limit:,} bytes cut; MAX_ERROR_BYTES={limit}] … {tail}"
+
+
+def error_text(exc: BaseException) -> str:
+    """
+    "Type: message" for a failed job, safe to store and log: clean text, at most
+    MAX_ERROR_BYTES (an exception carrying a whole HTTP body or SQL dump used to be
+    stored and sent everywhere in full, break test E8), and never failing itself.
+    """
+    try:
+        message = str(exc)
+    except Exception:
+        message = f"(its message couldn't be read: {object.__repr__(exc)})"
+    limit = int(settings.MAX_ERROR_BYTES or 0)
+    if limit and len(message) > limit * 4:       # don't even copy a huge message around
+        message = message[: limit * 2] + message[-limit:]
+    return cut_text(clean_text(f"{type(exc).__name__}: {message}"), limit)
+
+
+class _ResultNotes(list):
+    pass
+
+
+def _jsonable(value, notes: _ResultNotes, depth: int = 0):
+    """NaN/Infinity → None (JSON has no such numbers), noting what was changed."""
+    if isinstance(value, float) and (value != value or value in (float("inf"), float("-inf"))):
+        if "nan" not in notes:
+            notes.append("nan")
+        return None
+    if depth > 50:
+        return value
+    if isinstance(value, dict):
+        return {k: _jsonable(v, notes, depth + 1) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_jsonable(v, notes, depth + 1) for v in value]
+    return value
+
+
+def encode_result_noted(result: Any) -> tuple[str, list[str]]:
+    """
+    The result as stored, and what had to be changed to store it:
+    "nan" (NaN/Infinity became null, break test E11), "text" (values JSON can't
+    hold, such as sets, bytes or objects, became their text). Strings are stored
+    as they are (cleaned of invalid characters).
+    """
+    if isinstance(result, str):
+        return clean_text(result), []
+    notes = _ResultNotes()
+
+    def as_text(value):
+        if "text" not in notes:
+            notes.append("text")
+        return str(value)
+    try:
+        return clean_text(json.dumps(result, default=as_text, allow_nan=False)), list(notes)
+    except ValueError:
+        try:
+            return clean_text(json.dumps(_jsonable(result, notes), default=as_text, allow_nan=False)), list(notes)
+        except (TypeError, ValueError):
+            return clean_text(str(result)), ["text"]
+    except TypeError:
+        return clean_text(str(result)), ["text"]
+
+
 def encode_result(result: Any) -> str:
     """Store strings as-is, everything else as JSON (falls back to str())."""
-    if isinstance(result, str):
-        return result
-    try:
-        return json.dumps(result, default=str)
-    except (TypeError, ValueError):
-        return str(result)
+    return encode_result_noted(result)[0]
 
 
 def _clean(mapping: dict) -> dict:

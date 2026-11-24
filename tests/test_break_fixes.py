@@ -145,7 +145,8 @@ async def test_b1_task_errors_come_back_with_their_type(cpu_pool):
     assert type(info.value).__name__ == "Unpicklable" and "1/2" in str(info.value)
     with pytest.raises(Exception, match="couldn't be sent back"):
         await pool.execute(brk_tasks.returns_unpicklable, (), {}, 5, nothing)
-    with pytest.raises(SystemExit):
+    from pytaskq.context import TaskExited
+    with pytest.raises(TaskExited, match=r"sys.exit"):     # never SystemExit in the worker (break test E1)
         await pool.execute(brk_tasks.calls_exit, (), {}, 5, nothing)
     assert await pool.execute(brk_tasks.double, (1,), {}, 5, nothing) == 2
     assert pool.restarts == 0, "a task raising doesn't cost its process"
