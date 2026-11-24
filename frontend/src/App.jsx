@@ -2,10 +2,10 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   Play, ListChecks, Server, Skull, Search, X,
   RotateCcw, Trash2, Ban, Clock, Cpu, Zap, Waves, Terminal, ChevronRight,
-  Settings as SettingsIcon, UserRound, Pause, ArrowUp, AlertTriangle, Layers, History as HistoryIcon,
+  Settings as SettingsIcon, UserRound, Pause, ArrowUp, AlertTriangle, Layers, History as HistoryIcon, Workflow,
 } from 'lucide-react'
 import {
-  api, WS_URL, STATUS, FINAL, CANCELLABLE, timeAgo, formatDuration, formatClock,
+  api, WS_URL, STATUS, WF_STATUS, FINAL, CANCELLABLE, timeAgo, formatDuration, formatClock,
   formatArgs, parseValue, prettyResult, storage, can, ROLE_LABEL, UNAUTHORIZED_EVENT,
 } from './api'
 import { Brand, CopyButton, ThemeButton } from './ui'
@@ -17,6 +17,7 @@ const TABS = [
   { id: 'run', label: 'Run a task', icon: Play },
   { id: 'workers', label: 'Workers', icon: Server },
   { id: 'dead', label: 'Dead letters', icon: Skull },
+  { id: 'workflows', label: 'Workflows', icon: Workflow },
   { id: 'history', label: 'History', icon: HistoryIcon },
   { id: 'settings', label: 'Settings', icon: SettingsIcon },
 ];
@@ -492,6 +493,148 @@ function TaskDrawer({ taskId, onClose, notify, refreshKey, canOperate }) {
         )}
       </aside>
     </div>
+  );
+}
+
+// ── Workflows: chains and groups of jobs ─────────────────────────────────────
+
+function WfBadge({ status }) {
+  const s = WF_STATUS[status] || STATUS[status] || { label: status || 'Unknown', tone: 'muted' };
+  return <span className={`badge tone-${s.tone}`}>{s.label}</span>;
+}
+
+function WorkflowsView({ onOpen, notify, canOperate, refreshKey }) {
+  const [items, setItems] = useState(null);
+  const [openWf, setOpenWf] = useState(null);
+  useEffect(() => {
+    let live = true;
+    api('/workflows?limit=100').then(d => { if (live) setItems(d.workflows || []); }).catch(() => live && setItems([]));
+    return () => { live = false; };
+  }, [refreshKey]);
+
+  if (items === null) return <div className="panel"><div className="empty">Loading workflows…</div></div>;
+  if (!items.length) {
+    return (
+      <div className="panel">
+        <div className="empty wf-empty">
+          <p>No workflows yet. A workflow runs jobs one after another, or several at once, and passes results on:</p>
+          <pre>{`from pytaskq import chain, group
+
+await app.workflow(chain(
+    download.s(url),
+    group(resize.s(size=64), resize.s(size=512)),
+    publish.s(),
+), name="Thumbnails")`}</pre>
+        </div>
+      </div>
+    );
+  }
+  return (
+    <div className="panel">
+      <div className="table-wrap">
+        <table className="jobs">
+          <thead><tr><th>Status</th><th>Workflow</th><th>Steps</th><th>Started</th><th className="num">Took</th></tr></thead>
+          <tbody>
+            {items.map(w => {
+              const pct = w.total_steps ? Math.round(100 * (w.done_steps || 0) / w.total_steps) : 0;
+              const took = w.finished_at && w.created_at ? (w.finished_at - w.created_at) * 1000 : null;
+              return (
+                <tr key={w.workflow_id} onClick={() => setOpenWf(w.workflow_id)} tabIndex={0}
+                  onKeyDown={e => { if (e.key === 'Enter') setOpenWf(w.workflow_id); }}>
+                  <td><WfBadge status={w.status} /></td>
+                  <td>
+                    <div className="task-name">{w.name}</div>
+                    <div className="task-id">{w.workflow_id}</div>
+                  </td>
+                  <td>
+                    <div className="job-progress wide wf-steps">
+                      <div className="capacity" role="progressbar" aria-valuenow={pct} aria-valuemin={0} aria-valuemax={100}>
+                        <div style={{ width: `${pct}%` }} />
+                      </div>
+                      <span className="small muted">
+                        {w.done_steps || 0} of {w.total_steps} done
+                        {w.failed_steps ? ` · ${w.failed_steps} failed` : ''}
+                        {w.status === 'Running' ? ` · stage ${(w.stage || 0) + 1} of ${w.stages}` : ''}
+                      </span>
+                    </div>
+                  </td>
+                  <td title={formatClock(w.created_at)}>{formatClock(w.created_at)}</td>
+                  <td className="num">{took === null ? '' : formatDuration(took)}</td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+      {openWf && (
+        <WorkflowDetail id={openWf} onClose={() => setOpenWf(null)} onOpenJob={onOpen} notify={notify}
+          canOperate={canOperate} refreshKey={refreshKey} />
+      )}
+    </div>
+  );
+}
+
+function WorkflowDetail({ id, onClose, onOpenJob, notify, canOperate, refreshKey }) {
+  const [wf, setWf] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const load = useCallback(() => api(`/workflows/${encodeURIComponent(id)}`).then(setWf).catch(e => notify('error', e.message)),
+    [id, notify]);
+  useEffect(() => { load(); }, [load, refreshKey]);
+  const act = async (path, done) => {
+    setBusy(true);
+    try { const res = await api(path, { method: 'POST' }); notify('success', done(res)); load(); }
+    catch (e) { notify('error', e.message); }
+    finally { setBusy(false); }
+  };
+  if (!wf) return null;
+  const hasFailed = wf.stages.some(st => st.steps.some(s => s.status === 'DeadLetter' || s.status === 'Failed'));
+  // A Failed workflow waits for its failed steps (retry) or can be cancelled; with on_failure="continue"
+  // it went on without them, so there is nothing to retry.
+  return (
+    <section className="wf-detail" aria-label={`Workflow ${wf.name}`}>
+      <header className="wf-head">
+        <div>
+          <h3>{wf.name} <WfBadge status={wf.status} /></h3>
+          <p className="small muted">{wf.workflow_id} · {wf.done_steps} of {wf.total_steps} steps done
+            {wf.on_failure === 'continue' ? ' · carries on past failed steps' : ''}</p>
+          {wf.reason && <p className="wf-reason">{wf.reason}</p>}
+        </div>
+        <div className="wf-actions">
+          {canOperate && (wf.status === 'Running' || wf.status === 'Failed') && (
+            <button className="btn btn-danger btn-sm" disabled={busy}
+              onClick={() => act(`/workflows/${encodeURIComponent(id)}/cancel`, () => 'Workflow cancelled.')}>
+              <Ban size={14} /> Cancel workflow
+            </button>
+          )}
+          {canOperate && hasFailed && wf.status === 'Failed' && (
+            <button className="btn btn-secondary btn-sm" disabled={busy}
+              onClick={() => act(`/workflows/${encodeURIComponent(id)}/retry`,
+                r => `Retrying ${r.retried} failed step${r.retried === 1 ? '' : 's'}. The workflow carries on when ${r.retried === 1 ? 'it succeeds' : 'they succeed'}.`)}>
+              <RotateCcw size={14} /> Retry failed steps
+            </button>
+          )}
+          <button className="btn btn-ghost btn-sm" onClick={onClose}>Close</button>
+        </div>
+      </header>
+      <ol className="wf-stages">
+        {wf.stages.map(st => (
+          <li key={st.stage} className={`wf-stage ${st.stage === wf.stage && wf.status === 'Running' ? 'current' : ''}`}>
+            <span className="wf-stage-label">{st.group ? `Stage ${st.stage + 1} · ${st.steps.length} at once` : `Stage ${st.stage + 1}`}</span>
+            {st.steps.map(step => {
+              const ran = !['Pending', 'Skipped', 'Gone'].includes(step.status);
+              return (
+                <button key={step.step_id} className="wf-step" disabled={!ran}
+                  onClick={() => ran && onOpenJob(step.step_id)}
+                  title={step.error || (ran ? 'Open this job' : 'Hasn\'t run')}>
+                  <span className="wf-step-name">{step.task}</span>
+                  <WfBadge status={step.status} />
+                </button>
+              );
+            })}
+          </li>
+        ))}
+      </ol>
+    </section>
   );
 }
 
@@ -1029,6 +1172,7 @@ function Dashboard({ me, authEnabled, onSignOut, theme, setTheme }) {
         )}
         {tab === 'workers' && <WorkersView workers={workers} />}
         {tab === 'dead' && <DeadLettersView items={dlq} notify={notify} onOpen={setOpenId} canOperate={canOperate} />}
+        {tab === 'workflows' && <WorkflowsView onOpen={setOpenId} notify={notify} canOperate={canOperate} refreshKey={tick} />}
         {tab === 'history' && <HistoryView taskNames={taskNames} queueNames={queueNames} onOpen={setOpenId} />}
         {tab === 'settings' && <SettingsView me={me} authEnabled={authEnabled} onSignOut={onSignOut} notify={notify} />}
       </main>

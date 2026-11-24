@@ -86,9 +86,9 @@ Fetch the current execution state, result output, or error stacktrace for a spec
 Tasks that exceed their maximum retry count are routed to the Dead Letter Queue (`dlq`).
 
 ### View DLQ Tasks
-Retrieve all tasks currently stored in the Dead Letter Queue.
+Dead letters, newest first, a page at a time.
 
-*   **URL**: `/dlq`
+*   **URL**: `/dlq?offset=0&limit=100` (`limit` 1–500, default 100)
 *   **Method**: `GET`
 *   **Response (200 OK)**:
     ```json
@@ -101,9 +101,11 @@ Retrieve all tasks currently stored in the Dead Letter Queue.
           "retry_count": 3,
           "error": "File not found"
         }
-      ]
+      ],
+      "total": 1240, "offset": 0, "limit": 100
     }
     ```
+    Errors are cut to 1,000 characters (`"error_cut": true`) and entries over 16 KB leave out `args`/`kwargs` (`"args_size"` says how big). `GET /task/{id}` has everything. *(Before 0.6 this returned the whole list, 22 MB for 10,000 dead letters.)*
 
 ### Replay Specific DLQ Task
 Atomically move a failed task back to the active queue (resets retry count to 0).
@@ -236,6 +238,8 @@ Non-string results are stored as JSON. Results over `MAX_RESULT_BYTES` (1 MB) ar
 
 Query: `status`, `task_name`, `queue`, `limit` (1–500). Newest first, drawn from the last `HISTORY_LIMIT` jobs (any status).
 
+Lists (this one, `/tasks/history`, `/dlq`) send a compact record of each job: an `error` over 1,000 characters is cut (`"error_cut": true`), a `result` over 2 KB is left out (`"result_size"`), and arguments over 16 KB are left out (`"args_size"`). `GET /task/{id}` returns the whole record. Each step of a workflow has `workflow_id`.
+
 ### Search finished jobs — `GET /tasks/history`
 
 Searches every kept finished job (the newest `FINISHED_JOBS_KEPT`, 50,000 by default), newest first. Query:
@@ -253,7 +257,7 @@ Searches every kept finished job (the newest `FINISHED_JOBS_KEPT`, 50,000 by def
 {"tasks": [ /* job records, as GET /task/{id} */ ], "next": "1795412000.41|1", "scanned": 5000, "kept": 48211}
 ```
 
-One request looks at up to 5,000 jobs. When `next` isn't `null`, pass it as `cursor` to continue further back; it can be non-null even when `tasks` is empty (nothing matched among the 5,000 looked at). Jobs that finished before 0.5.0 aren't in this index.
+One request looks at up to 5,000 jobs (and reads at most 32 MB of arguments/results for a text search; arguments and results over 16 KB aren't text-searched). `since`/`until` must be real times and `cursor` the `next` of a previous page, else `422`. When `next` isn't `null`, pass it as `cursor` to continue further back; it can be non-null even when `tasks` is empty (nothing matched among the 5,000 looked at). Jobs that finished before 0.5.0 aren't in this index.
 
 ### Queues — `GET /queues`, `POST /queues/{name}/pause`, `POST /queues/{name}/resume`
 
@@ -281,7 +285,19 @@ The dashboard's numbers in the Prometheus text format (viewer role; scrape with 
 
 ### Dead letters
 
-Each `GET /dlq` entry includes `error` (the last exception) and `failed_at`. Entries with `"invalid": true` (task name `"(invalid job)"`) weren't valid jobs at all, such as text pushed onto a queue by hand; they carry `raw` (the first 64 KB of what was sent) and `found_in`, and can't be replayed (`409`), only deleted. At most `DLQ_LIMIT` (10,000) dead letters are kept; beyond that the oldest are dropped. `replay` and `retry_all` put jobs back on their **original priority queue** with a valid fence token. Each dead letter can only be taken once: if two people replay (or delete) the same job at the same moment, the second gets `409` and the job runs once.
+Each `GET /dlq` entry includes `error` (the last exception) and `failed_at`. Entries with `"invalid": true` (task name `"(invalid job)"`) weren't valid jobs at all, such as text pushed onto a queue by hand; they carry `raw` (the first 64 KB of what was sent) and `found_in`, and can't be replayed (`409`), only deleted. At most `DLQ_LIMIT` (10,000) dead letters are kept; beyond that the oldest are dropped. `replay` and `retry_all` put jobs back on their **original priority queue** with a new fence token, so a late answer from an earlier run of the same job is ignored. Each dead letter can only be taken once: if two people replay (or delete) the same job at the same moment, the second gets `409` and the job runs once. Replaying is refused (`409`) while a job with the same id is waiting or running (the id was used again): that would run two copies at once. `retry_all` skips those (`skipped_in_use`) and queues a job that was dead-lettered twice only once (`duplicates_removed`).
+
+### Workflows
+
+| | |
+|---|---|
+| `GET /workflows?status=&limit=50` | The newest workflows: name, status, steps done/failed |
+| `GET /workflows/{id}` | One workflow: every stage and step with its status, times and error |
+| `POST /workflows` | Start one (operator): `{"name", "on_failure": "stop"\|"continue", "steps": [...]}`; a step may have `priority` and `queue`. `422` for wrong arguments, a bad priority or an unknown queue (nothing starts), `404` for an unknown task. Accepts `Idempotency-Key`. See [WORKFLOWS.md](WORKFLOWS.md#from-other-languages) |
+| `POST /workflows/{id}/cancel` | Cancel a Running or Failed workflow: waiting steps cancelled, running ones stopped, later ones never start (`409` if it already finished) |
+| `POST /workflows/{id}/retry` | Run a Failed workflow's failed steps again; it carries on when they succeed (`409` otherwise, e.g. with `on_failure: "continue"`) |
+
+Status: `Running`, `Succeeded`, `PartlySucceeded` (with `on_failure: "continue"`), `Failed` (with `reason`) or `Cancelled`. Steps that never ran are `Pending` (later stages of a running workflow) or `Skipped`.
 
 ---
 

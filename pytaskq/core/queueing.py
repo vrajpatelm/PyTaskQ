@@ -99,14 +99,95 @@ def queue_keys(queue: str = DEFAULT_QUEUE) -> list[str]:
     return [queue_key(p, queue) for p in PRIORITIES]
 
 
+def clean_text(text: Any) -> str:
+    """
+    Text that Redis (UTF-8) can store. Lone surrogates, which Python uses for bytes
+    that aren't UTF-8 (file names from os.listdir, output decoded with
+    surrogateescape), become \\udcff escapes instead of failing the save (break test E2).
+    """
+    if not isinstance(text, str):
+        text = str(text)
+    try:
+        text.encode("utf-8")
+        return text
+    except UnicodeEncodeError:
+        return text.encode("utf-8", "backslashreplace").decode("utf-8")
+
+
+def cut_text(text: str, limit: int) -> str:
+    """At most `limit` bytes of UTF-8: the start and the end, with how much was left out between them."""
+    data = text.encode("utf-8")
+    if limit <= 0 or len(data) <= limit:
+        return text
+    head = data[: limit * 3 // 4].decode("utf-8", "ignore")
+    tail = data[-(limit // 4):].decode("utf-8", "ignore")
+    return f"{head} … [{len(data) - limit:,} bytes cut; MAX_ERROR_BYTES={limit}] … {tail}"
+
+
+def error_text(exc: BaseException) -> str:
+    """
+    "Type: message" for a failed job, safe to store and log: clean text, at most
+    MAX_ERROR_BYTES (an exception carrying a whole HTTP body or SQL dump used to be
+    stored and sent everywhere in full, break test E8), and never failing itself.
+    """
+    try:
+        message = str(exc)
+    except Exception:
+        message = f"(its message couldn't be read: {object.__repr__(exc)})"
+    limit = int(settings.MAX_ERROR_BYTES or 0)
+    if limit and len(message) > limit * 4:       # don't even copy a huge message around
+        message = message[: limit * 2] + message[-limit:]
+    return cut_text(clean_text(f"{type(exc).__name__}: {message}"), limit)
+
+
+class _ResultNotes(list):
+    pass
+
+
+def _jsonable(value, notes: _ResultNotes, depth: int = 0):
+    """NaN/Infinity → None (JSON has no such numbers), noting what was changed."""
+    if isinstance(value, float) and (value != value or value in (float("inf"), float("-inf"))):
+        if "nan" not in notes:
+            notes.append("nan")
+        return None
+    if depth > 50:
+        return value
+    if isinstance(value, dict):
+        return {k: _jsonable(v, notes, depth + 1) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_jsonable(v, notes, depth + 1) for v in value]
+    return value
+
+
+def encode_result_noted(result: Any) -> tuple[str, list[str]]:
+    """
+    The result as stored, and what had to be changed to store it:
+    "nan" (NaN/Infinity became null, break test E11), "text" (values JSON can't
+    hold, such as sets, bytes or objects, became their text). Strings are stored
+    as they are (cleaned of invalid characters).
+    """
+    if isinstance(result, str):
+        return clean_text(result), []
+    notes = _ResultNotes()
+
+    def as_text(value):
+        if "text" not in notes:
+            notes.append("text")
+        return str(value)
+    try:
+        return clean_text(json.dumps(result, default=as_text, allow_nan=False)), list(notes)
+    except ValueError:
+        try:
+            return clean_text(json.dumps(_jsonable(result, notes), default=as_text, allow_nan=False)), list(notes)
+        except (TypeError, ValueError):
+            return clean_text(str(result)), ["text"]
+    except TypeError:
+        return clean_text(str(result)), ["text"]
+
+
 def encode_result(result: Any) -> str:
     """Store strings as-is, everything else as JSON (falls back to str())."""
-    if isinstance(result, str):
-        return result
-    try:
-        return json.dumps(result, default=str)
-    except (TypeError, ValueError):
-        return str(result)
+    return encode_result_noted(result)[0]
 
 
 def _clean(mapping: dict) -> dict:
@@ -269,6 +350,7 @@ def _meta(payload: dict, raw: str, status: str, now: float, delay_seconds: float
         "created_at": now,
         "scheduled_for": now + delay_seconds if delay_seconds > 0 else None,
         "retry_count": payload.get("retry_count", 0),
+        "workflow_id": (payload.get("workflow") or {}).get("id") if isinstance(payload.get("workflow"), dict) else None,
         "payload": raw,
     })
 
@@ -343,6 +425,14 @@ async def find_duplicate(r, key: Optional[str], payload: dict, delay_seconds: fl
 ENQUEUE_SCRIPT = WAKE_LUA + """
 local unpack = unpack or table.unpack
 if ARGV[11] == '1' then redis.call('DEL', '__PYTASKQ__pytaskq:oom-probe') end
+-- This very call already queued the job: the client re-sent the script after losing the reply
+-- (a dropped connection, a failover). Answer "queued" again; never queue it twice (break test E4).
+for i = 13, #ARGV - 1, 2 do
+    if ARGV[i] == 'enqueue_nonce' then
+        if redis.call('HGET', KEYS[2], 'enqueue_nonce') == ARGV[i + 1] then return {1} end
+        break
+    end
+end
 if ARGV[7] ~= '' then
     local existing = redis.call('GET', KEYS[5])
     if existing then return {2, existing} end
@@ -427,6 +517,7 @@ async def enqueue(r, payload: dict, delay_seconds: float = 0, created_by: Option
         now = await clock.sync(r) if delay_seconds > 0 else clock.now()
         status = SCHEDULED if delay_seconds > 0 else QUEUED
         meta = _meta(payload, raw, status, now, delay_seconds)
+        meta["enqueue_nonce"] = uuid.uuid4().hex       # recognises this call if it's re-sent
         if created_by:
             meta["created_by"] = created_by
         if note:
@@ -502,6 +593,7 @@ if removed == 0 then
     removed = redis.call('ZREM', KEYS[4], ARGV[1])
 end
 if removed > 0 then
+    if KEYS[7] then redis.call('ZREM', KEYS[7], ARGV[4]) end   -- its rate_limit turn is free again (D8)
     redis.call('HSET', KEYS[5], 'status', 'Cancelled', 'finished_at', ARGV[2])
     redis.call('EXPIRE', KEYS[5], tonumber(ARGV[3]))
     pytaskq_keep(KEYS[6], ARGV[4], ARGV[2], tonumber(ARGV[5]), ARGV[6])
@@ -523,7 +615,7 @@ redis.call('HSET', KEYS[1], 'cancel_requested_at', ARGV[2], 'cancel_requested_by
 redis.call('PUBLISH', '__PYTASKQ__events:global', 'update')
 return 'Stopping'
 """
-CANCEL_REQUEST_TTL = 3600
+CANCEL_REQUEST_TTL = 7 * 86400     # kept until the job is cancelled (the worker deletes it then)
 STOPPING = "Stopping"     # cancel() result: the job is running; its worker stops it within a second or two
 
 
@@ -546,14 +638,22 @@ async def cancel(r, task_id: str, by: Optional[str] = None) -> tuple[bool, str]:
     if status == PROCESSING or not payload:
         return await _request_stop(r, task_id, by)
     ok = await r.eval(
-        CANCEL_SCRIPT, 6,
+        CANCEL_SCRIPT, 7,
         *queue_keys(payload_queue(meta)), rkey("delayed_tasks"), task_key(task_id), FINISHED_KEY,
+        rkey(f"limit:turns:{meta.get('task_name', '')}"),
         payload, str(clock.now()), int(settings.RESULT_TTL), task_id, *keep_args(),
     )
     if ok:
         if by:
             await r.hset(task_key(task_id), "cancelled_by", by)
         await r.publish(EVENTS_CHANNEL, "update")
+        try:
+            info = json.loads(payload).get("workflow")
+        except (ValueError, AttributeError):
+            info = None
+        if isinstance(info, dict):
+            from pytaskq import workflows      # a cancelled step stops its workflow
+            await workflows.step_finished(r, info, "cancelled", error="cancelled")
         return True, CANCELLED
     # Not on its queue any more: a worker took it just now. Ask that worker to stop it.
     return await _request_stop(r, task_id, by)
@@ -571,7 +671,7 @@ def _reject_constant(name):
 
 def public_view(meta: dict) -> dict:
     """Task hash minus internal fields, with JSON fields decoded for clients."""
-    out = {k: v for k, v in meta.items() if k != "payload"}
+    out = {k: v for k, v in meta.items() if k not in ("payload", "enqueue_nonce", "wf_result")}
     if "args" not in out and meta.get("payload"):
         # Since 0.4.1 the arguments are stored once, inside the payload.
         try:
@@ -624,10 +724,7 @@ async def recent_tasks(r, limit: int = 50, status: Optional[str] = None, task_na
             break
         chunk = [i for i in ids if i not in seen]
         seen.update(chunk)
-        async with r.pipeline(transaction=False) as pipe:
-            for tid in chunk:
-                pipe.hgetall(task_key(tid))
-            rows = await pipe.execute()
+        rows = await read_summaries(r, chunk)
         for meta in rows:
             if not meta:
                 continue  # expired
@@ -637,7 +734,7 @@ async def recent_tasks(r, limit: int = 50, status: Optional[str] = None, task_na
                 continue
             if queue and payload_queue(meta) != queue:
                 continue
-            out.append(public_view(meta))
+            out.append(list_view(meta))
             if len(out) >= limit:
                 return out
         if len(ids) < stop - start + 1:
@@ -647,8 +744,96 @@ async def recent_tasks(r, limit: int = 50, status: Optional[str] = None, task_na
     return out
 
 
-SEARCH_BATCH = 500
-SEARCH_SCAN_MAX = 5000      # finished jobs one search request looks at; the cursor continues from there
+SEARCH_BATCH = 200
+SEARCH_SCAN_MAX = 5000          # finished jobs one search request looks at; the cursor continues from there
+SEARCH_BYTES_MAX = 32_000_000   # bytes of arguments/results one text search reads; the cursor continues
+TEXT_FIELD_MAX = 16_384         # a text search looks at arguments/results up to this size (larger: not searched)
+LIST_ARGS_MAX = 16_384          # job lists include arguments up to this size (else "args_size"; the job's page has them)
+LIST_RESULT_MAX = 2_048         # job lists include results up to this size (else "result_size")
+LIST_ERROR_MAX = 1_000          # job lists show this much of an error (the job's page has it all)
+
+# The small fields a job list needs. Lists used to read whole records, so a few jobs with
+# megabyte-sized arguments, results or errors made every list request megabytes (break tests D7, E8).
+SUMMARY_FIELDS = ("task_id", "task_name", "status", "queue", "priority", "created_at", "scheduled_for", "workflow_id",
+                  "started_at", "finished_at", "duration_ms", "retry_count", "error", "note", "worker_id",
+                  "cancelled_by", "cancel_requested_at", "cancel_requested_by", "progress", "progress_message",
+                  "waiting_for", "result_dropped", "next_retry_at", "created_by", "args", "kwargs")
+
+
+async def read_summaries(r, task_ids: list[str], text_search: bool = False) -> list[Optional[dict]]:
+    """
+    Job records for lists, without reading big fields: the small fields, plus the payload
+    (arguments) and result only when they're small. Missing records come back as None.
+    With text_search, payloads/results up to TEXT_FIELD_MAX are read (for matching);
+    "_bytes" says how many bytes were read.
+    """
+    if not task_ids:
+        return []
+    async with r.pipeline(transaction=False) as pipe:
+        for tid in task_ids:
+            key = task_key(tid)
+            pipe.hmget(key, SUMMARY_FIELDS)
+            pipe.hstrlen(key, "payload")
+            pipe.hstrlen(key, "result")
+        raw = await pipe.execute()
+    args_max = TEXT_FIELD_MAX if text_search else LIST_ARGS_MAX
+    result_max = TEXT_FIELD_MAX if text_search else LIST_RESULT_MAX
+    metas, wanted = [], []
+    for i, tid in enumerate(task_ids):
+        values, payload_len, result_len = raw[3 * i], int(raw[3 * i + 1] or 0), int(raw[3 * i + 2] or 0)
+        meta = {k: v for k, v in zip(SUMMARY_FIELDS, values) if v is not None}
+        if not meta:
+            metas.append(None)
+            continue
+        meta.setdefault("task_id", tid)
+        if payload_len > args_max:
+            meta["args_size"] = payload_len
+        if result_len > result_max:
+            meta["result_size"] = result_len
+        metas.append(meta)
+        wanted.append((meta, tid, payload_len and payload_len <= args_max, result_len and result_len <= result_max))
+    fetch = [(m, tid, want_p, want_r) for m, tid, want_p, want_r in wanted if want_p or want_r]
+    if fetch:
+        async with r.pipeline(transaction=False) as pipe:
+            for _, tid, want_p, want_r in fetch:
+                pipe.hmget(task_key(tid), ["payload" if want_p else "-", "result" if want_r else "-"])
+            got = await pipe.execute()
+        for (meta, _, want_p, want_r), (payload, result) in zip(fetch, got):
+            if want_p and payload is not None:
+                meta["payload"] = payload
+            if want_r and result is not None:
+                meta["result"] = result
+            meta["_bytes"] = len(payload or "") + len(result or "")
+    return metas
+
+
+def list_view(meta: dict) -> dict:
+    """public_view for lists: small enough to send many of (see read_summaries)."""
+    out = public_view({k: v for k, v in meta.items() if k != "_bytes"})
+    if isinstance(out.get("error"), str) and len(out["error"]) > LIST_ERROR_MAX:
+        out["error"] = out["error"][:LIST_ERROR_MAX] + " …"
+        out["error_cut"] = True
+    if "result_size" in out:
+        out.pop("result", None)
+    return out
+
+
+def dead_letter_view(raw: str) -> Optional[dict]:
+    """A dead-letter entry for lists: its error cut short and big arguments left out (break test E9)."""
+    try:
+        item = json.loads(raw, parse_constant=_reject_constant)
+    except ValueError:
+        return None
+    if not isinstance(item, dict):
+        return None
+    if isinstance(item.get("error"), str) and len(item["error"]) > LIST_ERROR_MAX:
+        item["error"] = item["error"][:LIST_ERROR_MAX] + " …"
+        item["error_cut"] = True
+    if len(raw) > LIST_ARGS_MAX:
+        item.pop("args", None)
+        item.pop("kwargs", None)
+        item["args_size"] = len(raw)
+    return item
 
 
 def _matches_text(meta: dict, text: str) -> bool:
@@ -671,6 +856,9 @@ async def search_finished(r, *, status: Optional[str] = None, task_name: Optiona
     """
     limit = max(1, min(int(limit), 500))
     text = (text or "").strip().lower()[:200]
+    for name, value in (("since", since), ("until", until)):
+        if value is not None and not math.isfinite(float(value)):
+            raise ValueError(f"{name} must be a time in Unix seconds, got {value!r}")      # D9
     top = float("inf") if until is None else float(until)
     bottom = "-inf" if since is None else repr(float(since))
     skip = 0
@@ -678,7 +866,9 @@ async def search_finished(r, *, status: Optional[str] = None, task_name: Optiona
         # "score|n": continue below finish time `score`, after the first n jobs finished at exactly that time.
         try:
             score, n = cursor.split("|", 1)
-            top, skip = min(top, float(score)), max(0, int(n))
+            top, skip = min(top, float(score)), int(n)
+            if not math.isfinite(top) or not 0 <= skip <= 10_000_000:
+                raise ValueError
         except ValueError:
             raise ValueError("cursor isn't valid: use the `next` value of the previous page") from None
     top_arg = "+inf" if top == float("inf") else repr(top)
@@ -686,18 +876,17 @@ async def search_finished(r, *, status: Optional[str] = None, task_name: Optiona
     out: list[dict] = []
     position = skip                # how far into ZREVRANGEBYSCORE(top, bottom) we've read
     same_score, same = top, skip   # jobs read so far that finished at exactly `same_score`
-    scanned = 0
+    scanned = read = 0
     at_end = False
-    while scanned < SEARCH_SCAN_MAX and len(out) < limit:
+    while scanned < SEARCH_SCAN_MAX and len(out) < limit and read < SEARCH_BYTES_MAX:
         chunk = await r.zrevrangebyscore(FINISHED_KEY, top_arg, bottom, start=position,
                                          num=min(SEARCH_BATCH, SEARCH_SCAN_MAX - scanned), withscores=True)
         if not chunk:
             at_end = True
             break
-        async with r.pipeline(transaction=False) as pipe:
-            for tid, _ in chunk:
-                pipe.hgetall(task_key(tid))
-            rows = await pipe.execute()
+        # Small fields only (and arguments/results up to TEXT_FIELD_MAX for a text search): a search used
+        # to read every whole record, ~10 GB in the worst case (break test D7).
+        rows = await read_summaries(r, [tid for tid, _ in chunk], text_search=bool(text))
         for (tid, score), meta in zip(chunk, rows):
             position += 1
             scanned += 1
@@ -710,9 +899,10 @@ async def search_finished(r, *, status: Optional[str] = None, task_name: Optiona
                 continue
             if queue and payload_queue(meta) != queue:
                 continue
+            read += meta.get("_bytes", 0)
             if text and not _matches_text(meta, text):
                 continue
-            out.append(public_view(meta))
+            out.append(list_view(meta))
             if len(out) >= limit:
                 break
     if not at_end:

@@ -44,6 +44,18 @@ export const STATUS = {
 };
 
 export const FINAL = new Set(['Success', 'Failed', 'DeadLetter', 'Cancelled']);
+
+// Workflows and their steps (steps that never ran are Pending or Skipped).
+export const WF_STATUS = {
+  Running:         { label: 'Running', tone: 'running' },
+  Succeeded:       { label: 'Succeeded', tone: 'success' },
+  PartlySucceeded: { label: 'Partly succeeded', tone: 'warning' },
+  Failed:          { label: 'Failed', tone: 'danger' },
+  Cancelled:       { label: 'Cancelled', tone: 'muted' },
+  Pending:         { label: 'Not started', tone: 'muted' },
+  Skipped:         { label: 'Skipped', tone: 'muted' },
+  Gone:            { label: 'Expired', tone: 'muted' },
+};
 export const CANCELLABLE = new Set(['Queued', 'Scheduled', 'RetryScheduled', 'Processing']);
 
 export function timeAgo(ts) {

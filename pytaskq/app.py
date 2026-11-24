@@ -45,19 +45,23 @@ import hmac
 import inspect
 import json
 import os
+import logging
 import re
 import time
 from typing import Any, Callable, Optional
 
+from pytaskq import context
 from pytaskq.core import queueing
 from pytaskq.core.config import settings
 from pytaskq.net import SAFE_OPENER, assert_safe_url
+
+logger = logging.getLogger("pytaskq")
 
 TASK_TYPES = ("cpu", "io", "async")
 
 # Option names `delay()` treats as queue options rather than task kwargs —
 # unless the task function itself declares a parameter with that name.
-_DELAY_OPTIONS = ("priority", "queue", "on_success_url", "idempotency_key")
+_DELAY_OPTIONS = ("priority", "queue", "on_success_url", "idempotency_key", "countdown", "task_id")
 
 
 def _redis():
@@ -225,12 +229,17 @@ class PyTaskQ:
             type, func = func, None
 
         def decorator(fn: Callable) -> Callable:
-            is_async = inspect.iscoroutinefunction(fn)
+            is_async = context.is_async_callable(fn)       # also behind decorators (break test E3)
             task_type = type or ("async" if is_async else "cpu")
             if task_type not in TASK_TYPES:
                 raise ValueError(f"type must be one of {TASK_TYPES}, got {task_type!r}")
             if is_async and task_type != "async":
-                raise ValueError(f"{fn.__name__} is `async def`; use type='async' (or leave type unset)")
+                fn_name = getattr(fn, "__name__", repr(fn))
+                if inspect.iscoroutinefunction(fn):
+                    raise ValueError(f"{fn_name} is `async def`; use type='async' (or leave type unset)")
+                logger.warning(f"Task {fn_name}: an `async def` behind a decorator, registered with type={task_type!r}. "
+                               f"It runs as an async task (on the event loop), which is what its code needs.")
+                task_type = "async"
             if task_type == "async" and not is_async:
                 raise ValueError(f"{fn.__name__} has type='async' but is not an `async def` function")
             prio = priority or self.default_priority
@@ -274,17 +283,24 @@ class PyTaskQ:
                 "rate_limit": rate_limit.strip() if rate_limit else None,
                 "rate_interval": rate_interval,
             }
-            own_params = set(inspect.signature(fn).parameters)
+            signature = inspect.signature(fn)
+            own_params = set(signature.parameters)
 
             def _split(kwargs: dict) -> tuple[dict, dict]:
                 opts = {k: kwargs.pop(k) for k in _DELAY_OPTIONS if k in kwargs and k not in own_params}
                 return kwargs, opts
 
-            async def apply_async(args=None, kwargs=None, *, priority: Optional[str] = None,
-                                  queue: Optional[str] = None,
-                                  countdown: float = 0, on_success_url: Optional[str] = None,
-                                  task_id: Optional[str] = None, idempotency_key: Optional[str] = None) -> dict:
-                payload = queueing.new_payload(
+            def _check_arguments(args, kwargs) -> None:
+                # The same check the API does (422): a call that can't work fails here, at once, not as
+                # a dead letter in a worker after every retry (break test E10).
+                try:
+                    signature.bind(*(args or ()), **(kwargs or {}))
+                except TypeError as e:
+                    raise TypeError(f"{task_name}: {e} (the job wasn't queued)") from None
+
+            def _payload(args, kwargs, priority, queue, on_success_url, task_id):
+                _check_arguments(args, kwargs)
+                return queueing.new_payload(
                     task_name, args, kwargs,
                     priority=priority or prio,
                     queue=task_queue if queue is None else queue,
@@ -293,6 +309,12 @@ class PyTaskQ:
                     timeout=limit,
                     task_id=task_id,
                 )
+
+            async def apply_async(args=None, kwargs=None, *, priority: Optional[str] = None,
+                                  queue: Optional[str] = None,
+                                  countdown: float = 0, on_success_url: Optional[str] = None,
+                                  task_id: Optional[str] = None, idempotency_key: Optional[str] = None) -> dict:
+                payload = _payload(args, kwargs, priority, queue, on_success_url, task_id)
                 return await queueing.enqueue(_redis(), payload, delay_seconds=countdown,
                                               idempotency_key=idempotency_key)
 
@@ -305,17 +327,26 @@ class PyTaskQ:
                 return await apply_async(args, kwargs, countdown=delay_seconds, **opts)
 
             def delay_sync(*args, **kwargs) -> dict:
-                """Enqueue from synchronous code (no running event loop)."""
+                """Enqueue from synchronous code (no running event loop). Takes the same options as delay()."""
                 kwargs, opts = _split(kwargs)
+                payload = _payload(args, kwargs, opts.get("priority"), opts.get("queue"),
+                                   opts.get("on_success_url"), opts.get("task_id"))
                 return _run_sync(lambda r: queueing.enqueue(
-                    r,
-                    queueing.new_payload(task_name, args, kwargs, priority=opts.get("priority") or prio,
-                                         queue=opts.get("queue", task_queue),
-                                         on_success_url=opts.get("on_success_url"),
-                                         max_retries=retries, timeout=limit),
+                    r, payload, delay_seconds=opts.get("countdown") or 0,
                     idempotency_key=opts.get("idempotency_key"),
                 ))
 
+            def s(*args, **kwargs):
+                """A workflow step that receives the previous stage's result as its first argument."""
+                from pytaskq.workflows import Step
+                return Step(task_name, args, kwargs)
+
+            def si(*args, **kwargs):
+                """A workflow step that doesn't receive the previous stage's result."""
+                from pytaskq.workflows import Step
+                return Step(task_name, args, kwargs, immutable=True)
+
+            fn.s, fn.si = s, si
             fn.delay = delay
             fn.schedule = schedule
             fn.apply_async = apply_async
@@ -344,7 +375,7 @@ class PyTaskQ:
         return queueing.public_view(meta) if meta else None
 
     async def wait(self, task_id: str, timeout: float = 30, poll_interval: float = 0.25) -> dict:
-        """Wait until the task reaches a final state; raises TimeoutError otherwise.
+        """Wait until the task reaches a final state; raises TimeoutError otherwise (LookupError for an unknown id).
 
         Checks often at first (every 20 ms) and less often as time passes (up to
         `poll_interval`), so a quick job's result comes back quickly without a
@@ -354,7 +385,12 @@ class PyTaskQ:
         delay = min(0.02, poll_interval)
         while True:
             info = await self.status(task_id)
-            if info and info.get("status") in queueing.FINAL_STATES:
+            if info is None:
+                # Every queued job has a record from the moment it's queued: no record means a wrong id,
+                # or a finished job whose record expired or was trimmed. Waiting can't help (break test D11).
+                raise LookupError(f"No job with id {task_id!r}: the id is wrong, or the job finished and its "
+                                  f"record is gone (RESULT_TTL / FINISHED_JOBS_KEPT).")
+            if info.get("status") in queueing.FINAL_STATES:
                 return info
             if time.monotonic() >= deadline:
                 raise TimeoutError(f"Task {task_id} did not finish within {timeout}s")
@@ -369,6 +405,64 @@ class PyTaskQ:
         """
         ok, _ = await queueing.cancel(_redis(), task_id)
         return ok
+
+    # ── workflows ────────────────────────────────────────────────────────────
+    async def workflow(self, flow, *, name: Optional[str] = None, on_failure: str = "stop",
+                       workflow_id: Optional[str] = None, idempotency_key: Optional[str] = None) -> dict:
+        """
+        Start a workflow: `chain(a.s(), group(b.s(1), b.s(2)), c.s())`. Stages run one
+        after another; a group's steps run at the same time. Each step gets the
+        previous stage's result first (`.si()` to opt out). See pytaskq.workflows.
+        on_failure: "stop" (the workflow is Failed when a step fails for good) or
+        "continue" (that step's result is None and the workflow goes on).
+        Each step runs on its task's queue and priority unless `.set()` says otherwise.
+        idempotency_key: the same key (within IDEMPOTENCY_TTL) returns the first workflow
+        with "duplicate": True instead of starting a second one.
+        """
+        from pytaskq import workflows
+        plan = workflows.plan_of(flow)
+        workflows.remember_queues(self.TASKS)
+        return await workflows.start(_redis(), plan, name=name, on_failure=on_failure, registry=self.TASKS,
+                                     workflow_id=workflow_id, idempotency_key=idempotency_key)
+
+    async def workflow_status(self, workflow_id: str) -> Optional[dict]:
+        """The workflow and each step's state (None if unknown)."""
+        from pytaskq import workflows
+        return await workflows.status(_redis(), workflow_id)
+
+    async def wait_workflow(self, workflow_id: str, timeout: float = 60, poll_interval: float = 0.5) -> dict:
+        """Wait until the workflow finishes (Succeeded, PartlySucceeded, Failed or Cancelled)."""
+        from pytaskq import workflows
+        deadline = time.monotonic() + timeout
+        delay = 0.05
+        while True:
+            info = await workflows.status(_redis(), workflow_id)
+            if info is None:
+                raise LookupError(f"No workflow with id {workflow_id!r}")
+            if info["status"] in workflows.FINAL:
+                return info
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f"Workflow {workflow_id} did not finish within {timeout}s")
+            await asyncio.sleep(min(delay, max(0.0, deadline - time.monotonic())))
+            delay = min(delay * 1.5, poll_interval)
+
+    async def cancel_workflow(self, workflow_id: str) -> bool:
+        """
+        Cancel a running or failed workflow: waiting steps won't run, running ones are
+        stopped, later stages never start. False if it had already finished.
+        """
+        from pytaskq import workflows
+        before = await workflows.cancel(_redis(), workflow_id)
+        return before in (workflows.RUNNING, workflows.FAILED)
+
+    async def retry_workflow(self, workflow_id: str) -> int:
+        """
+        Run a Failed workflow's failed steps again; it carries on when they succeed. Returns
+        how many (0 for a workflow that isn't Failed, e.g. one that used on_failure="continue").
+        """
+        from pytaskq import workflows
+        workflows.remember_queues(self.TASKS)
+        return await workflows.retry_failed(_redis(), workflow_id)
 
     async def pause_queue(self, queue: str) -> bool:
         """

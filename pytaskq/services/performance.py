@@ -237,6 +237,14 @@ async def _missed_cron(r) -> list[dict]:
 async def _redis_suggestions(r, mem: dict, turned_away: dict) -> list[dict]:
     """Problems with Redis itself: set up to delete keys, (nearly) full, or its data was lost."""
     out = [_suggest(p["level"], p["title"], p["detail"]) for p in redis_health.problems(mem)]
+    if mem and not mem.get("max_bytes"):
+        out.append(_suggest(
+            "warning", "Redis has no memory limit (maxmemory 0)",
+            "Without `maxmemory`, Redis grows until the machine or container runs out of memory, and then the "
+            "operating system kills it, losing everything since the last save. Set `maxmemory` below the memory "
+            "Redis really has (the shipped compose files use 400mb), with `maxmemory-policy noeviction`. "
+            "PyTaskQ then refuses new jobs when it's full instead.",
+        ))
     if not any("full" in x["title"] for x in out):
         try:
             ret = await redis_health.retention(r)

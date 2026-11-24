@@ -31,7 +31,8 @@ PyTaskQ runs Python functions in the background. Your app queues a job, a worker
 | `pytaskq/core/redis_client.py` | The shared Redis connection pool (and Redis Sentinel) |
 | `pytaskq/core/keys.py` | Every key name, with the optional `REDIS_KEY_PREFIX` |
 | `pytaskq/core/fleet.py` | Comparing workers' versions and shared settings |
-| `pytaskq/context.py` | What a running task can ask: `progress()`, `cancelled()`, `current_task_id()` |
+| `pytaskq/context.py` | What a running task can ask: `progress()`, `cancelled()`, `current_task_id()`; calling task code safely (`call_task`) |
+| `pytaskq/workflows.py` | Workflows: `chain`, `group`, the step-done script, the sweep for lost stages |
 | `pytaskq/services/prometheus.py` | `/metrics/prometheus` |
 | `pytaskq/core/pressure.py`, `services/performance.py` | Counting refused requests, and the advice in *Settings → Performance* |
 | `pytaskq/services/live.py` | Live dashboard updates |
@@ -58,7 +59,10 @@ With `REDIS_KEY_PREFIX=shop`, every key below (and the pub/sub channel) starts w
 | `pytaskq:wake:{queue}` | List | Wake-up tokens: queueing a job pushes one, an idle worker waits on them (at most 100 per queue) |
 | `pytaskq:paused` | Hash | Paused queues, with who paused them and when |
 | `cancel:{id}` | String | A request to stop a running job (expires after an hour) |
-| `limit:running:{task}`, `limit:rate:{task}` | Sorted set, String | `max_concurrency` leases (renewed by the worker's heartbeat) and the next free start time under `rate_limit` |
+| `limit:running:{task}`, `limit:waiting:{task}` | Sorted sets | `max_concurrency` leases, one per running attempt (renewed by the worker's heartbeat; `<id>@promoted` = a place kept for the job that waited longest), and the jobs waiting in line, oldest first |
+| `limit:turns:{task}`, `limit:started:{task}` | Sorted set, String | `rate_limit` turns reserved per job (a cancelled job's turn is removed) and the time of the latest real start |
+| `wf:{id}`, `wf:{id}:results:{stage}`, `pytaskq:workflows` | Hash, Hash, Sorted set | A workflow (plan, stage, counts, status), each stage's results, and the list of workflows |
+| `pytaskq:cron:skipped` | Hash | Cron ticks skipped because their queue was paused |
 | `pytaskq:cron`, `pytaskq:cron:missed` | Hash | The latest tick handled for each scheduled task, and how many runs each missed |
 | `fence:{id}` | String | The job's fence token (see *Fencing* below) |
 | `active_workers`, `worker:{id}` | Sorted set, Hash | Which workers are alive (heartbeat, on Redis's clock), and each one's counters, health, version and shared settings |
@@ -110,6 +114,8 @@ stateDiagram-v2
 - **Cancelling a running job.** The API sets `cancel:{id}`; the worker running the job checks once a second for its own jobs and stops it (process stopped, coroutine cancelled, or thread abandoned), then records `Cancelled` in one script that checks the fence token.
 - **Progress.** `progress()` stores the newest value in the worker's memory; the worker writes it to the job's record about once a second, only while the job is still running there.
 - **Fleet check.** Workers advertise their version and shared settings in their heartbeat; the dashboard compares them with its own.
+- **Workflows.** A finishing step runs `STEP_DONE_SCRIPT`: it records the result and, only for the last step of a stage, moves the workflow to the next stage; the worker then queues that stage's steps with fixed ids (`<workflow>.<stage>.<index>`), on the queue and priority fixed for each step when the workflow started. A step's job doesn't carry the previous result: the worker reads it from `wf:{id}:results:{stage}` right before running the step. Cancelling a workflow sets a cancel request for every remaining step id, which the start script checks. The leader's sweep, for a stage that hasn't moved for 30 s, counts steps that finished without telling the workflow (from the `wf_result` kept on their job) and queues steps that were never queued; steps already counted are skipped. Nothing polls.
+- **Lost replies.** redis-py re-sends a command when the connection drops after sending it. The scripts recognise their own repeat: the enqueue script by a per-call nonce stored in the record, the outcome scripts because the job is no longer in the processing list and the record already shows the outcome.
 - **A worker without the task.** If two apps share a queue, a worker can take a job whose task it doesn't have. It hands the job back (through the delayed set) for a worker that has it, for up to 10 minutes, without counting a retry.
 - **Task registry.** Each worker advertises its tasks every minute, so the dashboard can build its *Run a task* forms and the API can reject unknown task names. Workers running different apps are all listed, and a task drops out about 5 minutes after nothing advertises it.
 

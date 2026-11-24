@@ -1,6 +1,27 @@
 # Upgrading
 
-The last release on PyPI before 0.5.0 was **0.3.1**. Versions 0.4.0 to 0.4.2 were tagged on GitHub but never published, so this guide goes straight from 0.3.1 to 0.5.0. If you run a 0.4.x build from GitHub, skip what you already have; the [CHANGELOG](../CHANGELOG.md) lists every version.
+## From 0.5.0 to 0.6.0
+
+0.6.0 fixes every problem found by two break tests of 0.5.0 (one of them slowed every new install: idle workers on redis-py 8 picked up jobs up to 4 s late and logged a false error every 10 s) and adds workflows. Waiting jobs keep working; nothing needs converting. Upgrade the dashboard and every worker together.
+
+What behaves differently:
+
+- **Calling a task with arguments it can't take** (`task.delay(1, 2, 3)` when it takes one) raises `TypeError` in your code at once. Before, the job was queued and dead-lettered later.
+- **`delay(x, countdown=30)`** now waits 30 s (it used to pass `countdown` to your function). Same for `task_id=`, and `delay_sync()` accepts both. If your function has its own parameter named `countdown` or `task_id`, it still gets it.
+- **`app.wait(id)`** raises `LookupError` at once for an id with no record, instead of waiting the whole timeout.
+- **`sys.exit()` / `KeyboardInterrupt` inside a task** fail the job (`TaskExited`) instead of stopping the worker.
+- **`GET /dlq`** returns 100 dead letters at a time (`offset`, `limit`, `total`), and job lists send compact records (long errors cut, big results/arguments left out with their size). `GET /task/{id}` still has everything.
+- **Error texts** are cut to `MAX_ERROR_BYTES` (4 KB).
+- **`max_concurrency`** jobs wait in line and start the moment a place frees up (before: about one start a second, in random order). **`rate_limit`** never lets two starts closer than the limit, even after a pause or a replay.
+- **Cron runs for a paused queue are skipped**, not piled up.
+- **Replaying a dead letter** is refused while a job with the same id is waiting or running.
+- New settings: `REDIS_SOCKET_TIMEOUT` (15), `REDIS_CONNECT_TIMEOUT` (5), `MAX_ERROR_BYTES` (4096). The defaults are right for almost everyone.
+
+New: [workflows](WORKFLOWS.md) (`chain`, `group`, a Workflows tab).
+
+## From 0.3.1 to 0.5.0
+
+The last release on PyPI before 0.5.0 was **0.3.1**. Versions 0.4.0 to 0.4.2 were tagged on GitHub but never published, so this section goes straight from 0.3.1 to 0.5.0. If you run a 0.4.x build from GitHub, skip what you already have; the [CHANGELOG](../CHANGELOG.md) lists every version. Coming from 0.3.1, read this section, then the one above.
 
 Jobs already waiting in Redis keep working: no data needs converting, and no key is renamed.
 
@@ -9,10 +30,10 @@ Jobs already waiting in Redis keep working: no data needs converting, and no key
 Upgrade the dashboard and **every** worker to the same version, with the same `.env`.
 
 ```bash
-pip install -U pytaskq            # 0.5.0
+pip install -U pytaskq            # 0.6.0
 ```
 
-or with Docker, set `PYTASKQ_VERSION=0.5.0` in `deploy/.env` (or `FROM ghcr.io/vrajpatelm/pytaskq:0.5` for your worker image), then:
+or with Docker, set `PYTASKQ_VERSION=0.6.0` in `deploy/.env` (or `FROM ghcr.io/vrajpatelm/pytaskq:0.6` for your worker image), then:
 
 ```bash
 docker compose -f docker-compose.prod.yml pull

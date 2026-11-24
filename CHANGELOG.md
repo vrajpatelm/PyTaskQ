@@ -2,6 +2,50 @@
 
 All notable changes to PyTaskQ. Versions follow [semantic versioning](https://semver.org/).
 
+## 0.6.0 — 2026-11-24
+
+Fixes everything two break tests of 0.5.0 found (#3: D1–D11, #4: E1–E11), and adds workflows. New guide: `docs/WORKFLOWS.md`; `docs/UPGRADING.md` has a 0.5.0 → 0.6.0 section.
+
+### Upgrading from 0.5.0
+- The SDK checks a job's arguments against the task's signature and raises `TypeError` at once (`delay()`, `apply_async()`, `delay_sync()`), like the API's `422`.
+- `delay()` / `delay_sync()` accept `countdown=` and `task_id=` as options (before, `countdown` was passed to the task as an argument and the job ran at once).
+- `app.wait()` raises `LookupError` for an unknown id instead of waiting out the timeout.
+- `GET /dlq` is paged (`offset`, `limit` ≤ 500, default 100; `total`). Job lists (`/tasks`, `/tasks/history`, `/dlq`) send compact records; `GET /task/{id}` has everything.
+- Error texts are cut to `MAX_ERROR_BYTES` (4 KB).
+- Cron ticks for a paused queue are skipped instead of piling up.
+
+### Added
+- **Workflows**: `chain(...)`, `group(...)`, `task.s()` / `task.si()`; results passed to the next stage (a list after a group); `on_failure="stop"|"continue"`; retry failed steps and the workflow resumes; cancel; `app.workflow()`, `workflow_status()`, `wait_workflow()`, `cancel_workflow()`, `retry_workflow()`; `GET/POST /workflows…`; a Workflows tab with each stage and step. Stage changes are atomic in Redis (no result backend, no polling); lost stages are re-queued by the leader. Steps run on their task's queue and priority; a stage's results are stored once and read by the next stage's steps; `Idempotency-Key` on `POST /workflows` and `app.workflow(idempotency_key=)`.
+- Break test #5 (workflows together with the older features), all fixed before release: a later stage ignored its task's queue and priority (W1); a Failed workflow whose other steps finished after the failure never resumed after a retry (W2); retrying a step of an `on_failure="continue"` workflow was accepted but ignored, now refused (W3); cancelling one step left its siblings running (W4); a step queued while its workflow was being cancelled still ran (W5); the recovery sweep re-ran a finished step whose record was trimmed (W6) and never counted a step whose worker stopped before telling the workflow (W7); a bad priority or queue left a workflow stuck in Running (W8, W12); a group's results were copied into every job of the next stage (W9: +126 MB for 5 MB of results); a failed or step-cancelled workflow never expired.
+- Settings `REDIS_SOCKET_TIMEOUT` (15), `REDIS_CONNECT_TIMEOUT` (5), `MAX_ERROR_BYTES` (4096).
+- *Settings → Performance* warns when Redis has no `maxmemory`.
+
+### Fixed (break test #4)
+- **E1 (critical)** `sys.exit()` or `KeyboardInterrupt` inside any task stopped the whole worker, and the job then stopped every worker it was handed to. Now the job fails with `TaskExited`.
+- **E2** A result or error containing text that isn't valid UTF-8 left the job stuck in *Processing*, running again on every restart. Text is cleaned; any outcome that can't be saved becomes a dead letter with the reason.
+- **E3** An `async def` behind an ordinary decorator never ran (marked Success with `"<coroutine object…>"`). It now runs as an async task; returned coroutines are awaited and generators read.
+- **E4** After a lost Redis reply, the client's automatic re-send made the caller see `TaskIdInUse` for a queued job (or run it twice), and a failure could become two dead letters. The scripts now recognise their own repeat.
+- **E5** With Redis Sentinel, idle workers timed out every 7 s (the primary got Sentinel's 2 s timeout).
+- **E6** Two containers with the same `WORKER_NAME`, hostname and pid 1: the second took the first one's running job. Restarts are now recognised by a boot id.
+- **E7** Replaying a dead letter while the same id was running started a second copy. Refused now (`409`); replays get a new fence token; "Replay all" queues a doubly dead-lettered job once.
+- **E8** Error messages had no size limit (20 MB errors → 60 MB list responses). Cut to 4 KB; lists send previews.
+- **E9** `GET /dlq` returned everything (22 MB for 10,000). Paged.
+- **E10** SDK argument mistakes reached the worker; `countdown` in `delay()` became an argument.
+- **E11** `NaN`/`Infinity` results were stored as invalid JSON. Stored as `null`, with a warning (also for values stored as their text).
+
+### Fixed (break test #3)
+- **D1** With redis-py 8 (every new install), idle workers got a `TimeoutError` every 10 s and picked up jobs up to 4 s late. Connections now have an explicit 15 s read timeout above the 5 s idle wait, and a timed-out wait counts as "no work".
+- **D2** With redis-py 5–7, a connection dropped silently by a NAT/firewall froze the worker forever while its heartbeat looked fine. Timeouts and TCP keepalive on every connection; the heartbeat thread also checks that the worker's own connections answer, reopens them, and stops the worker if that doesn't help.
+- **D3** `max_concurrency` was exceeded when IO jobs timed out or were cancelled (3 running with a limit of 1). Leases are per attempt and kept until the thread really returns.
+- **D4** `rate_limit` let jobs through in bursts after a pause, a busy period or a DLQ replay. A turn is re-checked right before the start.
+- **D5** A cancelled job could start again after its worker restarted. The cancel request is checked right before every start.
+- **D6** `max_concurrency` managed about one start per second, in random order. A finishing job now starts the one that waited longest at once: 20 × 0.1 s jobs take 2 s instead of 70.
+- **D7** History search read up to 5,000 whole records (up to ~10 GB). It reads small fields only, and caps what a text search reads.
+- **D8** Cancelled rate-limited jobs kept their turns (a new job waited for all of them). Cancelling gives the turn back.
+- **D9** `/tasks/history` answered `500` for `since=nan` and huge cursors. `422`.
+- **D10** Pausing a queue didn't pause cron; ticks piled up and all ran on resume. They're skipped.
+- **D11** `progress(10**400)` failed the job; `wait()` on an unknown id waited the whole timeout; no warning for a Redis without `maxmemory`; outdated advice text; a double period in a log line.
+
 ## 0.5.0 — 2026-11-22
 
 The first release on PyPI since 0.3.1: it includes everything from 0.4.0, 0.4.1 and 0.4.2 below, which were tagged on GitHub but never published. New in 0.5.0: a review of PyTaskQ from its foundations up (how jobs are stored, picked up, scheduled and kept), followed by the features that review called for. New guides: `docs/TASKS.md` (writing tasks), `docs/GUARANTEES.md` (what PyTaskQ promises and what it doesn't) and `docs/UPGRADING.md` (from 0.3.1).

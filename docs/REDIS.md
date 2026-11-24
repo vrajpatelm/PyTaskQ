@@ -70,6 +70,18 @@ A Redis restart (an upgrade, a crash, `docker compose restart redis`) is handled
 - Workers pause and continue. A job that finished while Redis was down keeps its result in memory, which is saved once Redis is back.
 - Open dashboards show "Redis unreachable" and continue updating on their own once Redis answers. *(Before 0.4.2 they froze until reloaded.)*
 
+## When the network drops a connection
+
+A NAT gateway, firewall, cloud load balancer or Docker's network can drop an idle connection without telling either side. Each PyTaskQ connection to Redis therefore has:
+
+| Setting | Default | |
+|---|---|---|
+| `REDIS_SOCKET_TIMEOUT` | 15 | Seconds one command may take before the connection counts as dead and is reopened (at least 3) |
+| `REDIS_CONNECT_TIMEOUT` | 5 | Seconds to open a connection |
+| TCP keepalive | on | Probes an idle connection after 30 s, every 10 s |
+
+Workers wait for new jobs with a blocking command that always ends below that timeout (5 s, or less when the timeout is set low), so an idle worker never mistakes its own wait for a failure. *(0.5.0 with redis-py 8 did: idle workers logged "Redis error: TimeoutError" every 10 s and picked up jobs up to 4 s late. With redis-py 5–7 a silently dropped connection could freeze a worker for good while its heartbeat said it was fine.)* As a last line of defence, a worker whose own connections get no answer for a minute while Redis is reachable reopens them, and stops (exit code 1, so it's restarted) if that doesn't help.
+
 ## When Redis loses its data
 
 A Redis restarted **without its data volume**, a `FLUSHALL`, or eviction with the wrong policy leaves Redis empty or partly empty. Everything is gone: waiting jobs, history, dead letters, accounts and API tokens.
@@ -116,7 +128,7 @@ REDIS_PASSWORD=…                        # Redis's password (or put it in REDIS
 # REDIS_SENTINEL_PASSWORD=…             # only if the Sentinels themselves need one
 ```
 
-PyTaskQ asks the Sentinels which server is the primary and follows it when it changes. Tested with a real failover (the primary killed while jobs were being queued): the replica took over and PyTaskQ was queueing again within about 3 seconds, without losing a job that had been confirmed. During those seconds the API answers `503` with `Retry-After`, and workers wait and carry on.
+PyTaskQ asks the Sentinels which server is the primary and follows it when it changes. The Sentinels get short 2 s timeouts; the primary's connections get `REDIS_SOCKET_TIMEOUT` like any other. *(In 0.5.0 the primary got the Sentinels' 2 s timeout too, so idle workers timed out every 7 s.)* Tested with a real failover (the primary killed while jobs were being queued): the replica took over and PyTaskQ was queueing again within about 3 seconds, without losing a job that had been confirmed. During those seconds the API answers `503` with `Retry-After`, and workers wait and carry on.
 
 ### Waiting for a replica: `REDIS_WAIT_REPLICAS`
 

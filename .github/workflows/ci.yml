@@ -25,12 +25,17 @@ concurrency:
 
 jobs:
   tests:
-    name: Tests (Python ${{ matrix.python }})
+    # Both ends of what we support: the oldest Python with the oldest redis-py we allow, and the newest of
+    # both (redis-py 8 changed connection timeouts; break test D1 slipped through when only one was tested).
+    name: Tests (Python ${{ matrix.python }}, redis-py ${{ matrix.redis }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        python: ["3.10", "3.12", "3.13"]
+        include:
+          - { python: "3.10", redis: "5.0.8" }
+          - { python: "3.12", redis: "6.4.0" }
+          - { python: "3.13", redis: "latest" }
     steps:
       - uses: actions/checkout@v4
 
@@ -39,10 +44,15 @@ jobs:
           python-version: ${{ matrix.python }}
           cache: pip
 
+      - name: Install Redis (for the tests that need a real server)
+        run: sudo apt-get update -q && sudo apt-get install -y -q redis-server && sudo systemctl stop redis-server || true
+
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+          if [ "${{ matrix.redis }}" != "latest" ]; then pip install "redis==${{ matrix.redis }}"; fi
+          python -c "import redis; print('redis-py', redis.__version__)"
 
       - name: Run tests
         run: python -m pytest -q

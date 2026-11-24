@@ -24,7 +24,9 @@ False, cancelled() returns False, current_task_id() returns None.
 
 from __future__ import annotations
 
+import asyncio
 import contextvars
+import inspect
 import threading
 import time
 from dataclasses import dataclass, field
@@ -39,6 +41,7 @@ class Job:
     report: Callable[[str, Optional[float], Optional[str]], None]
     cancel: threading.Event = field(default_factory=threading.Event)
     stop: Optional[Callable[[], object]] = None      # set by the worker while the job runs
+    left_running: Optional[object] = None            # an IO thread still running after a timeout/cancel
 
 
 _current: contextvars.ContextVar[Optional[Job]] = contextvars.ContextVar("pytaskq_job", default=None)
@@ -48,7 +51,11 @@ def _check(percent, message) -> tuple[Optional[float], Optional[str]]:
     if percent is not None:
         if isinstance(percent, bool) or not isinstance(percent, (int, float)) or percent != percent:
             raise ValueError(f"progress() takes a percentage from 0 to 100, got {percent!r}")
-        percent = round(min(100.0, max(0.0, float(percent))), 1)
+        try:
+            percent = float(percent)
+        except OverflowError:            # an int too big for a float (break test D11)
+            percent = 100.0 if percent > 0 else 0.0
+        percent = round(min(100.0, max(0.0, percent)), 1)
     if message is not None:
         message = str(message)[:MAX_MESSAGE]
     return percent, message
@@ -90,6 +97,90 @@ def run_as(job: Optional[Job], func, args, kwargs):
     token = _current.set(job)
     try:
         return func(*args, **kwargs)
+    finally:
+        _current.reset(token)
+
+
+# ── Calling task code safely ─────────────────────────────────────────────────
+
+class TaskExited(Exception):
+    """A task called sys.exit() / exit() or raised KeyboardInterrupt: the job fails, the worker carries on."""
+
+
+def _exited(e: BaseException) -> TaskExited:
+    if isinstance(e, SystemExit):
+        code = e.code if e.code is not None else 0
+        return TaskExited(f"The task called sys.exit({code!r}). A task can't stop the worker; the job counts as "
+                          f"failed. Raise an exception instead (a library or CLI parser such as argparse or "
+                          f"click may have called it).")
+    return TaskExited(f"The task raised {type(e).__name__}. A task can't stop the worker; the job counts as "
+                      f"failed. Only the worker's own Ctrl+C or SIGTERM stops it.")
+
+
+def is_async_callable(fn) -> bool:
+    """
+    True for `async def` functions, also behind decorators (functools.wraps) and
+    for objects with `async def __call__`. Such tasks run on the event loop.
+    """
+    if inspect.iscoroutinefunction(fn):
+        return True
+    try:
+        if inspect.iscoroutinefunction(inspect.unwrap(fn)):
+            return True
+    except ValueError:            # a __wrapped__ loop
+        pass
+    call = getattr(fn, "__call__", None)
+    return not inspect.isfunction(fn) and not inspect.ismethod(fn) and inspect.iscoroutinefunction(call)
+
+
+async def _collect_async(gen) -> list:
+    return [item async for item in gen]
+
+
+def _finish_value(value):
+    """What a sync call returned, made real: run a coroutine it returned, read out a generator."""
+    if inspect.isawaitable(value):
+        # A decorator without async support around an `async def`: the call only created the
+        # coroutine. Run it here (in this thread or process) instead of storing "<coroutine …>".
+        async def wait():
+            return await value
+        value = asyncio.run(wait())
+    if inspect.isasyncgen(value):
+        return asyncio.run(_collect_async(value))
+    if inspect.isgenerator(value):
+        return list(value)            # its code only runs when it's read
+    return value
+
+
+def call_task(job: Optional[Job], func, args, kwargs):
+    """
+    Run a task's code in a thread or a CPU process. Whatever the code does, the
+    worker survives: sys.exit() and KeyboardInterrupt become TaskExited (break test
+    E1), and a returned coroutine or generator is run or read (E3).
+    """
+    token = _current.set(job)
+    try:
+        return _finish_value(func(*args, **kwargs))
+    except (SystemExit, KeyboardInterrupt) as e:
+        raise _exited(e) from None
+    finally:
+        _current.reset(token)
+
+
+async def acall_task(job: Optional[Job], func, args, kwargs):
+    """call_task for the event loop: awaits whatever the call returns."""
+    token = _current.set(job)
+    try:
+        value = func(*args, **kwargs)
+        if inspect.isawaitable(value):
+            value = await value
+        if inspect.isasyncgen(value):
+            value = await _collect_async(value)
+        elif inspect.isgenerator(value):
+            value = list(value)
+        return value
+    except (SystemExit, KeyboardInterrupt) as e:
+        raise _exited(e) from None
     finally:
         _current.reset(token)
 

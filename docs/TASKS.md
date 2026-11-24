@@ -53,7 +53,8 @@ job = await send_receipt.apply_async(                                  # every o
 job["task_id"]
 ```
 
-- `.delay()` and `.delay_sync()` also accept `priority=`, `queue=`, `on_success_url=` and `idempotency_key=` as keyword arguments, unless your function has a parameter with that name.
+- `.delay()` and `.delay_sync()` also accept `priority=`, `queue=`, `countdown=` (seconds to wait), `task_id=`, `on_success_url=` and `idempotency_key=` as keyword arguments, unless your function has a parameter with that name.
+- **Arguments are checked when you queue the job**, against the function's signature: `send_receipt.delay(1, 2, 3, 4)` raises `TypeError` at once (the job isn't queued) instead of failing in a worker after every retry.
 - **`idempotency_key`** makes a retried call safe: the same key (within `IDEMPOTENCY_TTL`, a day) returns the original job with `"duplicate": True` instead of queueing a second one. Use it whenever the caller might send the same request twice (a retry after a timeout, a double click).
 - **`task_id`** lets you choose the id. Reusing the id of a job that is still waiting or running raises `TaskIdInUse`; the id of a finished job can be reused.
 - **`on_success_url`** gets a signed `POST` when the job succeeds (header `X-PyTaskQ-Signature: sha256=…`, HMAC of the body with `WEBHOOK_SECRET`). Delivery is itself a job, so it's retried.
@@ -71,7 +72,7 @@ info["result"]        # strings as returned; anything else as JSON text
 info = await app.wait(job["task_id"], timeout=30)   # until it finishes; TimeoutError otherwise
 ```
 
-`wait()` checks every 20 ms at first and less often as time passes, so a quick job's result comes back at once without a long wait flooding Redis.
+`wait()` checks every 20 ms at first and less often as time passes, so a quick job's result comes back at once without a long wait flooding Redis. For an id that has no record (a typo, or a finished job whose record is gone) it raises `LookupError` at once instead of waiting the whole timeout.
 
 A finished job's record is kept for `RESULT_TTL` (a day), but only the newest `FINISHED_JOBS_KEPT` (50,000) finished jobs are kept; older ones go first. Search them in the dashboard's **History** tab or with `GET /tasks/history`.
 
@@ -142,17 +143,16 @@ def call_partner_api(item_id): ...
 
 Both limits hold **across every worker**, not per worker, and both are kept in Redis.
 
-**`rate_limit`** spreads starts evenly: `"100/m"` starts at most one job every 0.6 seconds, `"10/s"` one every 0.1 s. Each job reserves its start time when a worker first takes it, then waits in the schedule until then (once; it doesn't keep checking). A job waiting for its turn shows `Queued` with *Waiting for its turn under rate_limit=100/m: starts at 14:03:05 UTC* in the dashboard.
+**`rate_limit`** spreads starts evenly: `"100/m"` starts at most one job every 0.6 seconds, `"10/s"` one every 0.1 s. Each job reserves its turn when a worker first takes it, then waits in the schedule until then (once; it doesn't keep checking). Right before it starts, the turn is checked again: two starts are never closer than the limit allows, even when turns passed while the queue was paused, the workers were busy or the jobs sat in the dead letters (those get a new turn instead of all starting at once). A cancelled job gives its turn back. A job waiting for its turn shows `Queued` with *Waiting for its turn under rate_limit=100/m: starts at 14:03:05 UTC* in the dashboard.
 
-**`max_concurrency`** counts the jobs of that task running right now. A job over the limit goes back to the schedule and checks again after a short wait that grows up to 10 seconds. If a worker dies while running one, its place frees up after about a minute (2 × `WORKER_HEARTBEAT_TTL`): it's a lease the worker renews while the job runs.
+**`max_concurrency`** counts the attempts of that task running right now. A job over the limit waits in line; when a running one finishes, the job that has waited longest starts at once, with the free place kept for it. So the jobs run back to back, in the order they started waiting (the few a worker takes at the very same moment may swap places). Measured: 20 jobs of 0.1 s with `max_concurrency=1` took 2 seconds. Each place is a lease the worker renews while the job runs: if a worker dies, its places free up after about a minute (2 × `WORKER_HEARTBEAT_TTL`). An IO job that timed out or was cancelled keeps its place until its thread really returns (Python can't stop a thread), so the limit holds on bad days too.
 
 Waiting for either limit **never uses up a retry**, and a retry takes a new turn. The limits apply to starts, not to how long a job runs.
 
 Good to know:
 
-- They're best for keeping a modest amount of work in line. With thousands of jobs waiting behind `max_concurrency=1`, each one checks back every few seconds; give such work its own queue and a worker with a small `WORKER_IO_WORKERS` instead.
 - They're per task name. Two tasks that share a quota need to share a task (or a queue with a dedicated worker).
-- Only workers running 0.5 or later enforce them.
+- Only workers running 0.5 or later enforce them (0.6 for the ordering and the stricter checks).
 
 ## Pausing a queue
 
@@ -161,7 +161,19 @@ await app.pause_queue("emails")     # workers start no new jobs from it
 await app.resume_queue("emails")
 ```
 
-Or the pause button next to each queue in the dashboard, or `POST /queues/emails/pause`. Pausing takes effect at once: running jobs finish, new jobs can still be queued and simply wait, and scheduled jobs keep moving onto the queue. Useful during an incident with a downstream service, or a deploy of the code a queue's tasks call.
+Or the pause button next to each queue in the dashboard, or `POST /queues/emails/pause`. Pausing takes effect at once: running jobs finish, new jobs can still be queued and simply wait, and scheduled jobs keep moving onto the queue. Scheduled (cron) runs of tasks on a paused queue are skipped, so they don't pile up and all run at once when you resume. Useful during an incident with a downstream service, or a deploy of the code a queue's tasks call.
+
+## Several jobs as one: workflows
+
+Run steps one after another or at the same time, passing results on, shown as one workflow in the dashboard:
+
+```python
+from pytaskq import chain, group
+
+await app.workflow(chain(download.s(url), group(resize.s(size=64), resize.s(size=512)), publish.s()))
+```
+
+Everything about them: [WORKFLOWS.md](WORKFLOWS.md).
 
 ## Writing tasks that behave well
 
@@ -170,3 +182,7 @@ Or the pause button next to each queue in the dashboard, or `POST /queues/emails
 - **Never block the event loop** in `async def` tasks: use `await`, or make it a plain function with `type="io"`.
 - **Keep arguments and results small.** Store files and big data elsewhere and pass their location.
 - **Report progress** for anything that takes more than a few seconds, and check `cancelled()` in long IO loops.
+- **Fail by raising an exception.** `sys.exit()`, `exit()` or `KeyboardInterrupt` inside a task (argparse and click call `sys.exit` on bad input) fail that job with `TaskExited`; they never stop the worker.
+- **Return plain JSON values** (dict, list, str, int, float, bool, None). `NaN`/`Infinity` are stored as `null` and sets, bytes or objects as their text, with a warning in the worker's log. Text that isn't valid UTF-8 (file names from `os.listdir()` on Linux, for example) is stored with `\udcff`-style escapes.
+- **Decorators are fine.** An `async def` behind an ordinary decorator still runs as an async task, a returned coroutine is run, and a generator's items are collected into a list (its code only runs when it's read).
+- **Errors are cut** to `MAX_ERROR_BYTES` (4 KB: the start and the end) before they're stored, logged and sent to the dashboard. Put big details in your own logs.

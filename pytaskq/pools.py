@@ -110,8 +110,10 @@ def _child_main(conn, modules: tuple) -> None:
             return
         func, args, kwargs, *rest = job
         try:
-            value = context.run_as(_child_job(conn, rest[0] if rest else None), func, args, kwargs)
-        except BaseException as e:     # SystemExit too: a task calling sys.exit() fails, it doesn't end the process
+            value = context.call_task(_child_job(conn, rest[0] if rest else None), func, args, kwargs)
+        except BaseException as e:     # anything else that isn't an Exception: still the job's failure, as text
+            if not isinstance(e, Exception):
+                e = context.TaskExited(f"The task raised {type(e).__name__}: {e}")
             _send_error(conn, e)
             continue
         try:
@@ -142,7 +144,7 @@ def _child_job(conn, task_id):
 
 def _raise_child_error(msg) -> None:
     _, exc, type_name, message, tb = msg
-    if exc is None:
+    if exc is None or not isinstance(exc, Exception):     # never re-raise SystemExit & co in the worker
         exc = type(type_name, (Exception,), {})(message)
     exc.__cause__ = _RemoteTraceback(tb)
     raise exc
@@ -399,7 +401,7 @@ class CpuPool:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _call(job, func, args, kwargs):
-    return context.run_as(job, func, args, kwargs)
+    return context.call_task(job, func, args, kwargs)
 
 
 class IoPool:
@@ -453,6 +455,8 @@ class IoPool:
                 if not cf.done():
                     keep_slot = True
                     self._hold_until_done(cf, fut, label)
+                    if job is not None:
+                        job.left_running = cf     # its max_concurrency place is kept until it returns
                 if isinstance(e, asyncio.TimeoutError):
                     raise TaskTimeoutError(
                         f"Task exceeded {timeout:g}s limit. Python can't stop a running thread, so its code may "

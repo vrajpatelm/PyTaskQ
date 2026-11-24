@@ -1,5 +1,4 @@
 import asyncio
-import json
 
 from pytaskq.core import queueing, redis_client
 from pytaskq.core.config import settings
@@ -33,11 +32,8 @@ async def _get_dashboard_data(tenant_id: str = "global", include_dlq: bool = Tru
     completed, failed = (int(v or 0) for v in totals)
     dlq_tasks = []
     for raw in (rest[0] if rest else []):
-        try:
-            item = json.loads(raw, parse_constant=_reject_constant)
-        except ValueError:
-            continue
-        if isinstance(item, dict):
+        item = queueing.dead_letter_view(raw)
+        if item is not None:
             dlq_tasks.append(item)
 
     queues = overview["queues"]

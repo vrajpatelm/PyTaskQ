@@ -18,6 +18,12 @@ class Settings(BaseSettings):
     REDIS_PASSWORD: str = ""
     REDIS_MAX_CONNECTIONS: int = 200   # per process; requests wait for a free one instead of failing
     REDIS_POOL_TIMEOUT: float = 5      # seconds a request waits for a free connection before a 503
+    # How long one Redis command may take before the connection counts as dead (then it's reopened).
+    # Must stay above the workers' idle wait (5 s). Keepalive probes find connections dropped silently
+    # by a NAT, firewall or load balancer.
+    MAX_ERROR_BYTES: int = 4096        # a failed job's error text is cut to this (start and end kept)
+    REDIS_SOCKET_TIMEOUT: float = 15
+    REDIS_CONNECT_TIMEOUT: float = 5
     # High availability (docs/REDIS.md): Redis Sentinel finds the current primary and follows failovers.
     REDIS_SENTINELS: str = ""          # "host1:26379,host2:26379,host3:26379"; wins over REDIS_URL's host
     REDIS_SENTINEL_MASTER: str = "mymaster"   # the name the Sentinels monitor

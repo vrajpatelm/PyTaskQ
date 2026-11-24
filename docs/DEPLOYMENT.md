@@ -67,7 +67,7 @@ The image includes a small example app so you can try PyTaskQ immediately. For r
 
 ```dockerfile
 # Dockerfile.worker
-FROM ghcr.io/vrajpatelm/pytaskq:0.5
+FROM ghcr.io/vrajpatelm/pytaskq:0.6
 COPY requirements.txt .
 RUN pip install --user -r requirements.txt     # your task's own dependencies
 COPY tasks.py .
@@ -130,7 +130,7 @@ Why not just copy the file into Redis? Redis keeps an append-only log of every c
 ## Upgrading
 
 ```bash
-# in .env: PYTASKQ_VERSION=0.5.0
+# in .env: PYTASKQ_VERSION=0.6.0
 docker compose -f docker-compose.prod.yml exec backup sh /backup-loop.sh once   # backup first
 docker compose -f docker-compose.prod.yml pull
 docker compose -f docker-compose.prod.yml up -d
