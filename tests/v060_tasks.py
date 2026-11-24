@@ -95,3 +95,25 @@ def cpu_wrapped_coroutine():
 def cpu_generator(n):
     for i in range(n):
         yield i * i
+
+
+@queue.task(type="io", max_concurrency=1, timeout=0.7, max_retries=1)
+def mc_hang(tag=""):
+    log("mc_start", tag)
+    time.sleep(2)
+    log("mc_end", tag)
+    return tag
+
+
+@queue.task(type="io", max_concurrency=1, max_retries=0)
+def mc_short(n=0):
+    log("mcs_start", n)
+    time.sleep(0.1)
+    log("mcs_end", n)
+    return n
+
+
+@queue.task(type="io", rate_limit="2/s", max_retries=0)
+def rl_task(n=0):
+    log("rl_start", n)
+    return n

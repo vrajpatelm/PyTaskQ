@@ -41,6 +41,7 @@ class Job:
     report: Callable[[str, Optional[float], Optional[str]], None]
     cancel: threading.Event = field(default_factory=threading.Event)
     stop: Optional[Callable[[], object]] = None      # set by the worker while the job runs
+    left_running: Optional[object] = None            # an IO thread still running after a timeout/cancel
 
 
 _current: contextvars.ContextVar[Optional[Job]] = contextvars.ContextVar("pytaskq_job", default=None)

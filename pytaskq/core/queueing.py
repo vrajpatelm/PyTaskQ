@@ -592,6 +592,7 @@ if removed == 0 then
     removed = redis.call('ZREM', KEYS[4], ARGV[1])
 end
 if removed > 0 then
+    if KEYS[7] then redis.call('ZREM', KEYS[7], ARGV[4]) end   -- its rate_limit turn is free again (D8)
     redis.call('HSET', KEYS[5], 'status', 'Cancelled', 'finished_at', ARGV[2])
     redis.call('EXPIRE', KEYS[5], tonumber(ARGV[3]))
     pytaskq_keep(KEYS[6], ARGV[4], ARGV[2], tonumber(ARGV[5]), ARGV[6])
@@ -613,7 +614,7 @@ redis.call('HSET', KEYS[1], 'cancel_requested_at', ARGV[2], 'cancel_requested_by
 redis.call('PUBLISH', '__PYTASKQ__events:global', 'update')
 return 'Stopping'
 """
-CANCEL_REQUEST_TTL = 3600
+CANCEL_REQUEST_TTL = 7 * 86400     # kept until the job is cancelled (the worker deletes it then)
 STOPPING = "Stopping"     # cancel() result: the job is running; its worker stops it within a second or two
 
 
@@ -636,8 +637,9 @@ async def cancel(r, task_id: str, by: Optional[str] = None) -> tuple[bool, str]:
     if status == PROCESSING or not payload:
         return await _request_stop(r, task_id, by)
     ok = await r.eval(
-        CANCEL_SCRIPT, 6,
+        CANCEL_SCRIPT, 7,
         *queue_keys(payload_queue(meta)), rkey("delayed_tasks"), task_key(task_id), FINISHED_KEY,
+        rkey(f"limit:turns:{meta.get('task_name', '')}"),
         payload, str(clock.now()), int(settings.RESULT_TTL), task_id, *keep_args(),
     )
     if ok:

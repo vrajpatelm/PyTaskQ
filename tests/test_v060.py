@@ -624,3 +624,190 @@ async def test_d4_replay_starts_rate_limit_waits_over(client, r):
     assert (await client.post("/dlq/replay/rl")).status_code == 200
     queued = json.loads(await r.lindex("queue:default", 0))
     assert queued["rate_slot"] is None and queued["waits"] == 0
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Limits and cancelling with real worker processes: D3, D4, D5, D6, D8, D10
+# ═════════════════════════════════════════════════════════════════════════════
+
+class RealWorker:
+    """A real `pytaskq worker` process on the real Redis, logging task runs to runs.log."""
+
+    def __init__(self, url, tmp_path, name=None, io=4):
+        import sys as _sys
+        self.url, self.runlog = url, tmp_path / "runs.log"
+        self.env = {**os.environ, "REDIS_URL": url, "PYTASKQ_AUTH": "off", "PYTHONPATH": os.getcwd(),
+                    "RUNLOG": str(self.runlog), "WORKER_IO_WORKERS": str(io), "WORKER_CPU_WORKERS": "1",
+                    "PYTHONUNBUFFERED": "1"}
+        args = [_sys.executable, "-m", "pytaskq", "worker", "--app", "tests.v060_tasks:queue"]
+        if name:
+            args += ["--name", name]
+        self.log = open(tmp_path / f"worker-{name or 'x'}-{time.time()}.log", "w")
+        self.proc = subprocess.Popen(args, env=self.env, stdout=self.log, stderr=subprocess.STDOUT)
+
+    def lines(self, word):
+        if not self.runlog.exists():
+            return []
+        return [ln.split() for ln in self.runlog.read_text().splitlines() if ln.startswith(word + " ")]
+
+    def stop(self, sig=None):
+        import signal
+        if self.proc.poll() is None:
+            self.proc.send_signal(sig or signal.SIGTERM)
+            try:
+                self.proc.wait(40)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+                self.proc.wait()
+
+
+@pytest.fixture
+async def fleet(redis_url, tmp_path):
+    """Start real workers; an async client on the same Redis database for queueing and checks."""
+    url = redis_url.replace("/0", "/7")
+    with patch.object(settings, "REDIS_URL", url):
+        r = redis_client.make_client()
+    await r.flushdb()
+    started = []
+
+    def start(**kw):
+        w = RealWorker(url, tmp_path, **kw)
+        started.append(w)
+        return w
+    with patch.object(worker.redis_client, "r", r), patch("pytaskq.core.redis_client.r", r):
+        yield r, start
+    for w in started:
+        w.stop()
+    await r.aclose()
+
+
+async def _until(check, timeout=20.0, every=0.1):
+    end = time.monotonic() + timeout
+    while time.monotonic() < end:
+        if await check():
+            return True
+        await asyncio.sleep(every)
+    return False
+
+
+async def _statuses(r, ids):
+    return [await r.hget(f"task:{i}", "status") for i in ids]
+
+
+def _max_overlap(starts, ends):
+    events = sorted([(float(s[-2]), 1) for s in starts] + [(float(e[-2]), -1) for e in ends],
+                    key=lambda x: (x[0], x[1]))
+    now = top = 0
+    for _, d in events:
+        now += d
+        top = max(top, now)
+    return top
+
+
+@needs_redis
+async def test_d3_a_timed_out_io_job_keeps_its_max_concurrency_place_until_it_returns(fleet):
+    r, start = fleet
+    w = start()
+    ids = [(await queueing.enqueue(r, queueing.new_payload("mc_hang", [tag], task_id=f"mc-{tag}", max_retries=1)))["task_id"]
+           for tag in ("a", "b")]
+    assert await _until(lambda: _done(r, ids), 40), await _statuses(r, ids)
+    starts, ends = w.lines("mc_start"), w.lines("mc_end")
+    assert len(starts) == 4, "two attempts each (both time out)"
+    assert _max_overlap(starts, ends) == 1, "never two at once with max_concurrency=1 (was 3)"
+
+
+async def _done(r, ids):
+    return all(s in ("Success", "DeadLetter", "Cancelled") for s in await _statuses(r, ids))
+
+
+@needs_redis
+async def test_d6_max_concurrency_jobs_start_one_after_another_in_order(fleet):
+    r, start = fleet
+    w = start()
+    ids = []
+    for n in range(20):
+        ids.append((await queueing.enqueue(r, queueing.new_payload("mc_short", [n])))["task_id"])
+    began = time.monotonic()
+    assert await _until(lambda: _done(r, ids), 60)
+    took = time.monotonic() - began
+    order = [int(x[1]) for x in w.lines("mcs_start")]
+    assert took < 8, f"20 jobs × 0.1 s took {took:.1f}s (was ~1 start per second: 20+ s)"
+    # The few jobs a worker takes at the very same moment race for the first place; after that they
+    # start in the order they started waiting (before: about one start a second, in random order).
+    assert sorted(order) == list(range(20)) and order[5:] == sorted(order[5:]), f"in order: {order}"
+
+
+def _gaps(lines):
+    times = sorted(float(x[-2]) for x in lines)
+    return [round(b - a, 3) for a, b in zip(times, times[1:])]
+
+
+@needs_redis
+async def test_d4_rate_limited_jobs_dont_burst_after_a_pause(fleet):
+    r, start = fleet
+    w = start()
+    ids = [(await queueing.enqueue(r, queueing.new_payload("rl_task", [n])))["task_id"] for n in range(8)]
+    await asyncio.sleep(1.2)
+    await queueing.pause_queue(r, "default")
+    await asyncio.sleep(3)                           # their reserved turns pass while paused
+    await queueing.resume_queue(r, "default")
+    assert await _until(lambda: _done(r, ids), 30)
+    gaps = _gaps(w.lines("rl_start"))
+    assert min(gaps) >= 0.4, f"2/s means at least 0.5 s apart (was 7 starts in 4 ms): {gaps}"
+
+
+@needs_redis
+async def test_d8_cancelled_rate_limited_jobs_give_their_turns_back(fleet):
+    r, start = fleet
+    w = start()
+    ids = [(await queueing.enqueue(r, queueing.new_payload("rl_task", [n])))["task_id"] for n in range(14)]
+    await asyncio.sleep(1.0)
+    cancelled = 0
+    for task_id in ids:
+        ok, status = await queueing.cancel(r, task_id)
+        cancelled += status == "Cancelled"
+    assert cancelled >= 8
+    await asyncio.sleep(0.6)
+    new = (await queueing.enqueue(r, queueing.new_payload("rl_task", [99])))["task_id"]
+    began = time.monotonic()
+    assert await _until(lambda: _done(r, [new]), 20)
+    assert time.monotonic() - began < 2.0, "the next turn is free again (was: wait for every cancelled turn)"
+
+
+@needs_redis
+async def test_d5_a_cancelled_job_doesnt_start_again_after_a_restart(fleet):
+    r, start = fleet
+    import signal
+    w1 = start(name="w1")
+    tid = (await queueing.enqueue(r, queueing.new_payload("slow_io", [3, "g10"])))["task_id"]
+    assert await _until(lambda: _is(r, tid, "Processing"), 15)
+    await asyncio.sleep(0.5)
+    w1.stop(signal.SIGKILL)                           # the worker dies mid-job
+    ok, status = await queueing.cancel(r, tid, by="ops")
+    assert (ok, status) == (True, "Stopping")
+    w2 = start(name="w1")                             # restarts and puts its job back
+    assert await _until(lambda: _is(r, tid, "Cancelled"), 20), await r.hgetall(f"task:{tid}")
+    await asyncio.sleep(0.5)
+    assert len(w2.lines("slow_start")) == 1, "it ran once (before the crash), never again"
+    info = await r.hgetall(f"task:{tid}")
+    assert info["cancelled_by"] == "ops" and not await r.exists(f"cancel:{tid}")
+
+
+async def _is(r, tid, status):
+    return await r.hget(f"task:{tid}", "status") == status
+
+
+async def test_d10_cron_ticks_for_a_paused_queue_are_skipped_not_piled_up(env):
+    r = env
+    t0 = 1_800_000_000.0 - (1_800_000_000.0 % 60)
+    tasks = {"every_minute": {"handler": lambda: 1, "type": "io", "cron": "* * * * *", "max_retries": 0}}
+    with patch.object(worker, "TASKS", tasks):
+        await worker.run_due_cron_jobs(now=t0 + 1)       # first tick: seen
+        await queueing.pause_queue(r, "default")
+        for minute in range(1, 6):
+            await worker.run_due_cron_jobs(now=t0 + 60 * minute + 1)
+        assert await r.llen(queueing.queue_key("default")) == 1, "only the tick before the pause"
+        assert await r.hget(worker.CRON_SKIPPED_KEY, "every_minute") == "5"
+        await queueing.resume_queue(r, "default")
+        await worker.run_due_cron_jobs(now=t0 + 60 * 6 + 1)
+    assert await r.llen(queueing.queue_key("default")) == 2, "after resume: the next tick only"

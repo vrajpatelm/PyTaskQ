@@ -540,8 +540,10 @@ async def test_7a_max_concurrency_holds_across_workers_and_waiting_uses_no_retri
     assert await r.zcard("delayed_tasks") == 1 and await r.zcard(worker.limit_key("running", "login")) == 2
     gate.set()
     await asyncio.gather(a, b)
-    assert await r.zcard(worker.limit_key("running", "login")) == 0, "finished jobs give their place back"
-    await worker._promote_due_tasks(now=time.time() + 60)
+    # 0.6: the finishing jobs give their place back, and the one waiting is moved onto its queue at
+    # once with the place kept for it (no polling, oldest first).
+    assert await r.zrange(worker.limit_key("running", "login"), 0, -1) == ["l2@promoted"]
+    assert await r.zcard("delayed_tasks") == 0 and await r.llen("queue:default") == 1
     _, c = await _start(r, tasks)
     await c
     info = await r.hgetall("task:l2")
@@ -563,15 +565,16 @@ async def test_7a_a_dead_workers_places_free_up_and_live_ones_are_renewed(env):
     await queueing.enqueue(r, queueing.new_payload("login", [], task_id="l0"))
     _, job = await _start(r, tasks)
     assert await r.hget("task:l0", "status") == "Processing", "expired leases don't count"
-    assert worker._leases == {"l0": key}
+    lease = worker._lease_of["l0"]
+    assert lease.startswith("l0@") and worker._leases == {lease: key}, "one lease per attempt (0.6)"
     sync = fakeredis.FakeRedis(decode_responses=True)
-    sync.zadd(key, {"l0": 1})
+    sync.zadd(key, {lease: 1})
     worker._renew_leases(sync, 1000.0)
-    assert sync.zscore(key, "l0") == 1000.0 + worker.LEASE_TTL and sync.pttl(key) > 0
-    sync.zadd(key, {"l0": 1})
+    assert sync.zscore(key, lease) == 1000.0 + worker.LEASE_TTL and sync.pttl(key) > 0
+    sync.zadd(key, {lease: 1})
     with patch.object(worker.redis_client, "make_sync_client", lambda: sync):
         worker._Heartbeat().beat()                    # the heartbeat thread does it every few seconds
-    assert sync.zscore(key, "l0") > time.time()
+    assert sync.zscore(key, lease) > time.time()
     sync.delete(key)
     worker._renew_leases(sync, 1000.0)
     assert not sync.exists(key), "renewing never re-creates a lease that's gone"
@@ -601,7 +604,9 @@ async def test_7b_rate_limit_reserves_one_start_time_per_job(env):
     with patch.object(clock, "now", lambda: t0 + 0.6):
         await run_one(r, tasks)
     assert await r.hget("task:c1", "status") == "Success"
-    assert float(await r.get(worker.limit_key("rate", "call"))) == t0 + 1.5
+    turns = dict(await r.zrange(worker.limit_key("turns", "call"), 0, -1, withscores=True))
+    assert turns == {"c0": t0, "c1": t0 + 0.6, "c2": t0 + 1.0}, "c1 started on its turn (recorded when it started)"
+    assert float(await r.get(worker.limit_key("started", "call"))) == t0 + 0.6
 
 
 async def test_7b_a_retry_takes_a_new_turn(env):
@@ -615,7 +620,7 @@ async def test_7b_a_retry_takes_a_new_turn(env):
     with patch.object(clock, "now", lambda: t0):
         await run_one(r, tasks)
     assert await r.hget("task:c0", "status") == "RetryScheduled"
-    assert await r.get(worker.limit_key("rate", "call")) is None, "its reserved turn was used"
+    assert float(await r.get(worker.limit_key("started", "call"))) == t0, "it started on its turn"
     retry = json.loads((await r.zrange("delayed_tasks", 0, -1))[0])
     assert retry["rate_slot"] is None and retry["waits"] == 0
 

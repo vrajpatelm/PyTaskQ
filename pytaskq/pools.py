@@ -455,6 +455,8 @@ class IoPool:
                 if not cf.done():
                     keep_slot = True
                     self._hold_until_done(cf, fut, label)
+                    if job is not None:
+                        job.left_running = cf     # its max_concurrency place is kept until it returns
                 if isinstance(e, asyncio.TimeoutError):
                     raise TaskTimeoutError(
                         f"Task exceeded {timeout:g}s limit. Python can't stop a running thread, so its code may "
