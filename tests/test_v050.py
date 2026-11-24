@@ -1144,6 +1144,7 @@ def test_8_sentinel_failover_with_real_redis():
     run = subprocess.run([sys.executable, script], env=env, capture_output=True, text=True, timeout=120)
     assert run.returncode == 0, run.stderr[-2000:]
     out = json.loads(run.stdout.strip().splitlines()[-1])
+    assert out["idle_wait"][0] is None and out["idle_wait"][1] >= 4.5, f"idle wait via Sentinel: {out['idle_wait']}"
     assert out["first_replicas"] == 1, "WAIT confirmed the job reached the replica"
     assert out["new_primary_port"] == 6422, "Sentinel promoted the replica"
     assert out["missing"] == [] and out["queued_now"] == len(out["confirmed"]) == 20

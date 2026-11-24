@@ -46,6 +46,7 @@ from typing import Optional
 import croniter
 from opentelemetry import trace
 from redis import exceptions as redis_errors
+from redis.exceptions import TimeoutError as RedisTimeoutError
 
 from pytaskq import context
 from pytaskq.core import clock
@@ -944,6 +945,8 @@ class _Heartbeat(threading.Thread):
         self._client = None
         self._last_warning = 0.0
         self._last_error = 0.0
+        self._last_stall_warning = 0.0
+        self.gave_up = False
         self.blocked_for = 0.0
 
     def _redis(self):
@@ -963,6 +966,30 @@ class _Heartbeat(threading.Thread):
         c.eval(HEARTBEAT_SCRIPT, 4, rkey("active_workers"), rkey(f"worker:{WORKER_ID}"), WORKERS_KEY, queueing.QUEUES_KEY,
                WORKER_ID, repr(now + HEARTBEAT_TTL), HEARTBEAT_TTL * 4, len(QUEUES), *QUEUES, *fields)
 
+    def _redis_watchdog(self) -> bool:
+        """
+        False when the event loop hasn't heard from Redis for a long time although the
+        loop runs and this thread reaches Redis: its connections hang. First reopen
+        them; if that doesn't help, stop heartbeating (so other workers take over this
+        worker's jobs) and stop the worker with exit code 1 (so it's restarted).
+        """
+        stalled = time.monotonic() - _redis_ok_at
+        if stalled < REDIS_STALL or time.monotonic() - _loop_tick > LOOP_BLOCKED_WARN or _event_loop is None:
+            return True
+        if stalled < REDIS_STALL * 3:
+            if time.monotonic() - self._last_stall_warning > 30:
+                self._last_stall_warning = time.monotonic()
+                logger.error(f"[Watchdog] No answer from Redis on this worker's connections for {stalled:.0f}s, "
+                             f"although Redis is reachable. Reopening them.")
+                _event_loop.call_soon_threadsafe(_reopen_connections)
+            return True
+        if not self.gave_up:
+            self.gave_up = True
+            logger.critical(f"[Watchdog] Still no answer from Redis after {stalled:.0f}s. Stopping this worker "
+                            f"(exit code 1) so its jobs go to other workers and it can be restarted.")
+            _event_loop.call_soon_threadsafe(_stop_stalled_worker)
+        return False
+
     def _watchdog(self) -> None:
         blocked = time.monotonic() - _loop_tick
         if blocked < LOOP_BLOCKED_WARN or time.monotonic() - self._last_warning < 30:
@@ -981,7 +1008,7 @@ class _Heartbeat(threading.Thread):
         next_beat = time.monotonic() + interval
         while not self.stop_event.wait(1.0):
             self._watchdog()
-            if time.monotonic() < next_beat:
+            if time.monotonic() < next_beat or not self._redis_watchdog():
                 continue
             try:
                 self.beat()
@@ -999,6 +1026,35 @@ class _Heartbeat(threading.Thread):
 
     def stop(self) -> None:
         self.stop_event.set()
+
+
+# ── Is the event loop's Redis connection alive? (break test D2) ───────────────
+# The heartbeat thread has its own connection. If the event loop's connections hang (a
+# connection dropped silently and an old redis-py without timeouts), the heartbeat kept saying
+# "alive" while the worker did nothing. The loop marks every Redis answer here; the heartbeat
+# thread checks it.
+_redis_ok_at = time.monotonic()
+REDIS_STALL = 60.0          # seconds without any Redis answer on the event loop → reopen connections
+_event_loop = None
+
+
+def _mark_redis_ok() -> None:
+    global _redis_ok_at
+    _redis_ok_at = time.monotonic()
+
+
+def _reopen_connections() -> None:
+    """(In the event loop) drop every pooled connection, so hanging commands fail and new ones reconnect."""
+    try:
+        asyncio.ensure_future(redis_client.r.connection_pool.disconnect(inuse_connections=True))
+    except Exception:
+        pass
+
+
+def _stop_stalled_worker() -> None:
+    global EXIT_CODE
+    EXIT_CODE = 1
+    shutdown_event.set()
 
 
 async def _loop_ticker():
@@ -1877,6 +1933,9 @@ async def consumer_task():
 
     heart = _Heartbeat()
     _loop_tick = time.monotonic()
+    global _event_loop
+    _event_loop = loop
+    _mark_redis_ok()
     try:
         await loop.run_in_executor(None, heart.beat)   # alive before the first job is taken
     except Exception as e:
@@ -1922,6 +1981,7 @@ async def consumer_task():
             call = pop_call(serving, turn)
             turn += 1
             task_json = await redis_client.r.eval(PRIORITY_POP_SCRIPT, *call)
+            _mark_redis_ok()
 
             if not task_json:
                 sem.release()
@@ -1945,7 +2005,7 @@ async def consumer_task():
 
 # Seconds an idle worker blocks before checking its queues anyway. New jobs wake it at once (wake-up
 # tokens); this only catches jobs queued by PyTaskQ versions before 0.5, which don't send tokens.
-IDLE_WAIT = 5
+IDLE_WAIT = redis_client.idle_wait()    # always below the connection's read timeout (break test D1)
 
 
 async def _wait_for_work(queues: list[str]) -> None:
@@ -1971,7 +2031,13 @@ async def _wait_for_work(queues: list[str]) -> None:
             waiting.cancel()                   # stopping: redis-py drops that connection
             await asyncio.gather(waiting, return_exceptions=True)
     if waiting.done() and not waiting.cancelled():
-        waiting.result()                       # a Redis error: the main loop backs off
+        try:
+            waiting.result()                   # a Redis error: the main loop backs off
+        except RedisTimeoutError:
+            # The wait itself ran out (a slow network, or an older redis-py default): that's
+            # "no work yet", not a failure. The connection is reopened for the next command.
+            pass
+        _mark_redis_ok()
 
 
 _paused: set = set()                    # paused queues (refreshed every PAUSE_CHECK seconds)
@@ -1996,6 +2062,7 @@ async def _pause_watcher():
         await asyncio.sleep(queueing.PAUSE_CHECK)
         try:
             await _refresh_paused()
+            _mark_redis_ok()
         except Exception as e:
             logger.debug(f"[Pause] Couldn't read paused queues ({e})")
 

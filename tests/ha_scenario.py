@@ -77,6 +77,12 @@ async def scenario():
         res = await queueing.enqueue(r, queueing.new_payload("job", [i], task_id=f"j{i}"))
         return res
 
+    # An idle worker's 5 s wait through Sentinel must not time out (break test E5).
+    try:
+        began = time.monotonic()
+        out["idle_wait"] = [await r.blpop(["nothing-here"], timeout=5), round(time.monotonic() - began, 1)]
+    except Exception as e:   # noqa: BLE001
+        out["idle_wait"] = type(e).__name__
     first = await put(0)
     out["first_replicas"] = first.get("replicas")
     out["confirmed"].append("j0")
