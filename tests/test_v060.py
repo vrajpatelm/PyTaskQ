@@ -1165,3 +1165,224 @@ async def test_a_workflow_on_real_workers(fleet):
     assert json.loads(published) == {"published": ["64px of 3 rows", "256px of 3 rows", "1024px of 3 rows"],
                                      "channel": "cdn"}
     assert len(w.lines("wf_resize")) + 0 <= 3
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Break test #5: workflows together with the older features (W1–W12, F11)
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _queued(r, queue="default", priority="default"):
+    return r.lrange(queueing.queue_key(priority, queue) if priority != "default" else queueing.queue_key(queue), 0, -1)
+
+
+async def test_w1_steps_run_on_their_tasks_queue_and_priority_in_every_stage(env):
+    from pytaskq import PyTaskQ
+    r = env
+    q = PyTaskQ()
+
+    @q.task(type="io", max_retries=0)
+    def first():
+        return 1
+
+    @q.task(type="io", max_retries=0, queue="images", priority="high")
+    def thumb(prev):
+        return prev
+
+    with patch("pytaskq.app._redis", lambda: r):
+        wf = await q.workflow(chain(first.s(), thumb.s(), thumb.s().set(priority="low")))
+    workflows._task_queues.clear()          # the worker that finishes stage 0 doesn't know `thumb`
+    await _drain(r, q)
+    step = await r.hgetall(f"task:{wf['workflow_id']}.1.0")
+    assert step["queue"] == "images" and step["priority"] == "high", "the task's own queue and priority"
+    plan = json.loads(await r.hget(workflows.wf_key(wf["workflow_id"]), "plan"))
+    assert plan[2][0]["priority"] == "low" and plan[2][0]["queue"] == "images", ".set() wins over the task's default"
+
+
+async def test_w2_a_retried_step_resumes_a_workflow_whose_siblings_finished_after_the_failure(env):
+    r = env
+    q, calls, (fetch, resize, publish, notify) = _wf_app()
+    with patch("pytaskq.app._redis", lambda: r):
+        # The failing step runs FIRST; its siblings finish while the workflow already says Failed.
+        wf = await q.workflow(chain(group(resize.si(None, size=13), resize.si(None, size=1), resize.si(None, size=2)),
+                                    publish.s()))
+        wf_id = wf["workflow_id"]
+        await _drain(r, q)
+        assert (await q.workflow_status(wf_id))["status"] == "Failed"
+        assert await r.ttl(workflows.wf_key(wf_id)) > 0, "a stopped workflow expires (F11)"
+        q.TASKS["resize"]["handler"] = lambda data, size=64: f"{size}px fixed"
+        assert await q.retry_workflow(wf_id) == 1
+        assert await r.ttl(workflows.wf_key(wf_id)) == -1, "kept while it's going again"
+        await _drain(r, q)
+        info = await q.workflow_status(wf_id)
+    assert info["status"] == "Succeeded", info
+    assert [c for c in calls if c[0] == "publish"] == [("publish", ["13px fixed", "1px/?", "2px/?"])]
+    assert await r.ttl(workflows.wf_key(wf_id)) > 0
+
+
+async def test_w2_replaying_the_dead_letter_also_resumes_and_keeps_the_workflow(env, client):
+    r = env
+    q, calls, (fetch, resize, publish, notify) = _wf_app()
+    with patch("pytaskq.app._redis", lambda: r):
+        wf = await q.workflow(chain(resize.si(None, size=13), notify.si("after")))
+        await _drain(r, q)
+        q.TASKS["resize"]["handler"] = lambda data, size=64: "ok"
+        assert (await client.post("/dlq/retry_all")).status_code == 200
+        await _drain(r, q)
+        info = await q.workflow_status(wf["workflow_id"])
+    assert info["status"] == "Succeeded" and ("notify", "after") in calls
+
+
+async def test_w3_continue_mode_failed_steps_arent_retried_and_a_replay_doesnt_corrupt_counts(env, client):
+    r = env
+    q, calls, (fetch, resize, publish, notify) = _wf_app()
+    with patch("pytaskq.app._redis", lambda: r):
+        wf = await q.workflow(chain(group(resize.si(None, size=13), resize.si(None, size=8)), publish.s()),
+                              on_failure="continue")
+        wf_id = wf["workflow_id"]
+        await _drain(r, q)
+        assert await q.retry_workflow(wf_id) == 0, "it already went on without the failed step"
+        res = await client.post(f"/workflows/{wf_id}/retry")
+        assert res.status_code == 409 and "continue" in res.json()["detail"]
+        # A dead-letter replay still runs the step, but the finished workflow isn't changed by it.
+        await workflows.step_finished(r, {"id": wf_id, "stage": 0, "index": 0}, "ok", "late")
+        info = await q.workflow_status(wf_id)
+    assert info["status"] == "PartlySucceeded" and info["failed_steps"] == 1 and info["done_steps"] == 3
+
+
+async def test_w4_cancelling_one_step_cancels_its_waiting_siblings_and_later_stages(env):
+    r = env
+    q, calls, (fetch, resize, publish, notify) = _wf_app()
+    with patch("pytaskq.app._redis", lambda: r):
+        wf = await q.workflow(chain(group(notify.si("a"), notify.si("b"), notify.si("c")), notify.si("d")))
+        wf_id = wf["workflow_id"]
+        assert (await queueing.cancel(r, f"{wf_id}.0.1"))[0]
+        await _drain(r, q)
+        info = await q.workflow_status(wf_id)
+    assert info["status"] == "Cancelled" and calls == [], "no sibling and no later stage ran"
+    assert {s["status"] for s in info["stages"][0]["steps"]} == {"Cancelled"}
+    assert await r.ttl(workflows.wf_key(wf_id)) > 0, "a cancelled workflow expires (F11)"
+
+
+async def test_w5_a_step_queued_just_after_its_workflow_was_cancelled_doesnt_run(env):
+    r = env
+    q, calls, (fetch, resize, publish, notify) = _wf_app()
+    with patch("pytaskq.app._redis", lambda: r):
+        wf = await q.workflow(chain(notify.si("a"), notify.si("b")))
+        wf_id = wf["workflow_id"]
+        late = []
+
+        async def slow_queue(r_, wf_id_, plan, stage, indexes=None):
+            late.append((plan, stage))                       # the worker is between "advance" and "queue"
+        with patch.object(workflows, "_queue_stage", slow_queue):
+            await _drain(r, q)
+        assert await q.cancel_workflow(wf_id) is True        # the user cancels right now
+        plan, stage = late[0]
+        await workflows._queue_stage(r, wf_id, plan, stage)  # ...and the worker carries on
+        await _drain(r, q)
+        info = await q.workflow_status(wf_id)
+    assert calls == [("notify", "a")], "the step queued after the cancel never started"
+    assert info["status"] == "Cancelled" and info["stages"][1]["steps"][0]["status"] == "Cancelled"
+
+
+async def test_cancelling_a_failed_workflow_stops_its_still_running_siblings(env):
+    r = env
+    q, calls, (fetch, resize, publish, notify) = _wf_app()
+    with patch("pytaskq.app._redis", lambda: r):
+        wf = await q.workflow(chain(group(resize.si(None, size=13), notify.si("x")), notify.si("y")))
+        await _drain(r, q, rounds=1)                         # the first step fails; "x" still waits
+        assert (await q.workflow_status(wf["workflow_id"]))["status"] == "Failed"
+        assert await q.cancel_workflow(wf["workflow_id"]) is True
+        await _drain(r, q)
+    assert ("notify", "x") not in calls and (await q.workflow_status(wf["workflow_id"]))["status"] == "Cancelled"
+
+
+async def test_w6_the_sweep_never_reruns_a_counted_step_whose_record_is_gone(env):
+    r = env
+    q, calls, (fetch, resize, publish, notify) = _wf_app()
+    with patch("pytaskq.app._redis", lambda: r):
+        wf = await q.workflow(chain(group(notify.si("quick"), notify.si("slow")), notify.si("next")))
+        wf_id = wf["workflow_id"]
+        await _drain(r, q, rounds=1)                         # "quick" finishes, "slow" still waits
+        await r.delete(queueing.task_key(f"{wf_id}.0.0"))    # trimmed by FINISHED_JOBS_KEPT / expired
+        with patch.object(workflows, "STUCK_AFTER", 0):
+            assert await workflows.sweep(r) == 0
+        await _drain(r, q)
+    assert calls.count(("notify", "quick")) == 1
+    assert (await q.workflow_status(wf_id))["status"] == "Succeeded"
+
+
+async def test_w7_the_sweep_counts_a_step_whose_worker_stopped_before_telling_the_workflow(env):
+    r = env
+    q, calls, (fetch, resize, publish, notify) = _wf_app()
+    with patch("pytaskq.app._redis", lambda: r):
+        wf = await q.workflow(chain(fetch.s("u"), resize.s(size=5)))
+        wf_id = wf["workflow_id"]
+
+        async def died(*a, **k):
+            pass                                   # the worker died right after saving the job
+        with patch.object(worker, "_workflow_step", died):
+            await _drain(r, q)
+        assert (await q.workflow_status(wf_id))["status"] == "Running"
+        assert (await r.hget(queueing.task_key(f"{wf_id}.0.0"), "status")) == "Success"
+        with patch.object(workflows, "STUCK_AFTER", 0):
+            assert await workflows.sweep(r) == 1
+            assert await workflows.sweep(r) == 0
+        await _drain(r, q)
+    assert ("resize", 5) in calls and (await q.workflow_status(wf_id))["status"] == "Succeeded"
+    assert await r.hget(queueing.task_key(f"{wf_id}.1.0"), "result") == "5px/3", "the dict result came through as a dict"
+    assert "wf_result" not in queueing.public_view(await r.hgetall(queueing.task_key(f"{wf_id}.0.0")))
+
+
+async def test_w8_bad_priority_or_queue_name_is_refused_and_nothing_is_stored(env):
+    r = env
+    q, calls, (fetch, resize, publish, notify) = _wf_app()
+    with patch("pytaskq.app._redis", lambda: r):
+        with pytest.raises(ValueError, match="priority"):
+            await q.workflow(chain(fetch.s("u"), notify.si().set(priority="urgent")))
+        with pytest.raises(ValueError):
+            await q.workflow(chain(fetch.s("u"), notify.si().set(queue="bad name!")))
+    assert await r.zcard(workflows.INDEX_KEY) == 0 and await r.llen(queueing.queue_key("default")) == 0
+
+
+async def test_w9_a_big_fan_in_is_stored_once_not_copied_into_every_next_step(env):
+    r = env
+    q, calls, (fetch, resize, publish, notify) = _wf_app()
+    big = {"rows": "x" * 50_000}
+    q.TASKS["fetch"]["handler"] = lambda url: big
+    with patch("pytaskq.app._redis", lambda: r):
+        wf = await q.workflow(chain(fetch.s("u"), group(*[resize.s(size=i) for i in range(10)])))
+        wf_id = wf["workflow_id"]
+        await _drain(r, q, rounds=1)
+        payloads = await r.lrange(queueing.queue_key("default"), 0, -1)
+        assert len(payloads) == 10 and max(len(p) for p in payloads) < 1000, "the jobs don't carry a copy"
+        assert all(json.loads(p)["workflow"]["input"] is True for p in payloads)
+        await _drain(r, q)
+    assert (await q.workflow_status(wf_id))["status"] == "Succeeded"
+    assert await r.hget(queueing.task_key(f"{wf_id}.1.3"), "result") == f"3px/{'x' * 50_000}"
+
+
+async def test_a_step_whose_workflow_is_gone_fails_with_a_clear_reason(env):
+    r = env
+    q, calls, (fetch, resize, publish, notify) = _wf_app()
+    with patch("pytaskq.app._redis", lambda: r):
+        wf = await q.workflow(chain(fetch.s("u"), resize.s()))
+        await _drain(r, q, rounds=1)
+        await r.delete(workflows.wf_key(wf["workflow_id"]), workflows.results_key(wf["workflow_id"], 0))
+        await _drain(r, q)
+    error = await r.hget(queueing.task_key(f"{wf['workflow_id']}.1.0"), "error")
+    assert "is gone" in error and not any(c[0] == "resize" for c in calls)
+
+
+async def test_w12_the_api_refuses_bad_steps_and_honours_idempotency_keys(client, r):
+    q, calls, _ = _wf_app()
+    await queueing.publish_registry(r, q.specs())
+    bad_priority = await client.post("/workflows", json={"steps": [{"task": "notify", "priority": "urgent"}]})
+    unknown_queue = await client.post("/workflows", json={"steps": [{"task": "notify", "queue": "nope"}]})
+    assert bad_priority.status_code == 422 and "priority" in bad_priority.json()["detail"]
+    assert unknown_queue.status_code == 422 and "Unknown queue" in unknown_queue.json()["detail"]
+    assert await r.zcard(workflows.INDEX_KEY) == 0, "nothing started"
+    body = {"steps": [{"task": "notify", "args": ["hi"]}]}
+    a = await client.post("/workflows", json=body, headers={"Idempotency-Key": "k1"})
+    b = await client.post("/workflows", json=body, headers={"Idempotency-Key": "k1"})
+    assert a.json()["workflow_id"] == b.json()["workflow_id"] and b.json()["duplicate"] is True
+    assert await r.zcard(workflows.INDEX_KEY) == 1

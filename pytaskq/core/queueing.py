@@ -671,7 +671,7 @@ def _reject_constant(name):
 
 def public_view(meta: dict) -> dict:
     """Task hash minus internal fields, with JSON fields decoded for clients."""
-    out = {k: v for k, v in meta.items() if k not in ("payload", "enqueue_nonce")}
+    out = {k: v for k, v in meta.items() if k not in ("payload", "enqueue_nonce", "wf_result")}
     if "args" not in out and meta.get("payload"):
         # Since 0.4.1 the arguments are stored once, inside the payload.
         try:

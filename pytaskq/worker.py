@@ -1798,6 +1798,12 @@ async def _run(r, tasks, task_json, process_pool, thread_pool) -> None:
             func = entry["handler"]
             task_type = entry.get("type", "cpu")
             args, kwargs = tasks.args, tasks.kwargs
+            if tasks.workflow and tasks.workflow.get("input"):
+                # A workflow step gets the previous stage's result first. It's read now, from the
+                # workflow, instead of being copied into every step's job when the stage was queued.
+                from pytaskq import workflows
+                previous = await workflows.stage_input(r, tasks.workflow["id"], int(tasks.workflow.get("stage", 0)))
+                args = [previous, *args]
             ctx = _jobs.get(task_id) or context.Job(task_id, _progress.put)
 
             if context.is_async_callable(func) or task_type == "async":
@@ -1846,6 +1852,14 @@ async def _run(r, tasks, task_json, process_pool, thread_pool) -> None:
             return
 
         encoded, dropped = _storable_result(result)
+        if tasks.workflow:
+            # Kept with the job, so the leader can still pass it on if this worker stops between
+            # saving the job and telling its workflow (break test #5, W7).
+            from pytaskq import workflows
+            wf_result = workflows.result_json(result)
+            if not settings.MAX_RESULT_BYTES or len(wf_result) <= settings.MAX_RESULT_BYTES:
+                await _with_retries(lambda _: r.hset(queueing.task_key(task_id), "wf_result", wf_result),
+                                    "keep a workflow step's result", task_id)
         finished_at = clock.now()
         duration_ms = round((finished_at - (started_at or finished_at)) * 1000, 1)
 

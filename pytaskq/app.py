@@ -408,19 +408,22 @@ class PyTaskQ:
 
     # ── workflows ────────────────────────────────────────────────────────────
     async def workflow(self, flow, *, name: Optional[str] = None, on_failure: str = "stop",
-                       workflow_id: Optional[str] = None) -> dict:
+                       workflow_id: Optional[str] = None, idempotency_key: Optional[str] = None) -> dict:
         """
         Start a workflow: `chain(a.s(), group(b.s(1), b.s(2)), c.s())`. Stages run one
         after another; a group's steps run at the same time. Each step gets the
         previous stage's result first (`.si()` to opt out). See pytaskq.workflows.
         on_failure: "stop" (the workflow is Failed when a step fails for good) or
         "continue" (that step's result is None and the workflow goes on).
+        Each step runs on its task's queue and priority unless `.set()` says otherwise.
+        idempotency_key: the same key (within IDEMPOTENCY_TTL) returns the first workflow
+        with "duplicate": True instead of starting a second one.
         """
         from pytaskq import workflows
         plan = workflows.plan_of(flow)
         workflows.remember_queues(self.TASKS)
         return await workflows.start(_redis(), plan, name=name, on_failure=on_failure, registry=self.TASKS,
-                                     workflow_id=workflow_id)
+                                     workflow_id=workflow_id, idempotency_key=idempotency_key)
 
     async def workflow_status(self, workflow_id: str) -> Optional[dict]:
         """The workflow and each step's state (None if unknown)."""
@@ -444,13 +447,19 @@ class PyTaskQ:
             delay = min(delay * 1.5, poll_interval)
 
     async def cancel_workflow(self, workflow_id: str) -> bool:
-        """Cancel a running workflow (its waiting and running steps too). False if it already finished."""
+        """
+        Cancel a running or failed workflow: waiting steps won't run, running ones are
+        stopped, later stages never start. False if it had already finished.
+        """
         from pytaskq import workflows
         before = await workflows.cancel(_redis(), workflow_id)
-        return before == workflows.RUNNING
+        return before in (workflows.RUNNING, workflows.FAILED)
 
     async def retry_workflow(self, workflow_id: str) -> int:
-        """Run a failed workflow's failed steps again; it carries on when they succeed. Returns how many."""
+        """
+        Run a Failed workflow's failed steps again; it carries on when they succeed. Returns
+        how many (0 for a workflow that isn't Failed, e.g. one that used on_failure="continue").
+        """
         from pytaskq import workflows
         workflows.remember_queues(self.TASKS)
         return await workflows.retry_failed(_redis(), workflow_id)

@@ -293,9 +293,9 @@ Each `GET /dlq` entry includes `error` (the last exception) and `failed_at`. Ent
 |---|---|
 | `GET /workflows?status=&limit=50` | The newest workflows: name, status, steps done/failed |
 | `GET /workflows/{id}` | One workflow: every stage and step with its status, times and error |
-| `POST /workflows` | Start one (operator): `{"name", "on_failure": "stop"\|"continue", "steps": [...]}`; see [WORKFLOWS.md](WORKFLOWS.md#from-other-languages) |
-| `POST /workflows/{id}/cancel` | Cancel it and its waiting/running steps (`409` if it already finished) |
-| `POST /workflows/{id}/retry` | Run its failed steps again; it carries on when they succeed (`409` if none failed) |
+| `POST /workflows` | Start one (operator): `{"name", "on_failure": "stop"\|"continue", "steps": [...]}`; a step may have `priority` and `queue`. `422` for wrong arguments, a bad priority or an unknown queue (nothing starts), `404` for an unknown task. Accepts `Idempotency-Key`. See [WORKFLOWS.md](WORKFLOWS.md#from-other-languages) |
+| `POST /workflows/{id}/cancel` | Cancel a Running or Failed workflow: waiting steps cancelled, running ones stopped, later ones never start (`409` if it already finished) |
+| `POST /workflows/{id}/retry` | Run a Failed workflow's failed steps again; it carries on when they succeed (`409` otherwise, e.g. with `on_failure: "continue"`) |
 
 Status: `Running`, `Succeeded`, `PartlySucceeded` (with `on_failure: "continue"`), `Failed` (with `reason`) or `Cancelled`. Steps that never ran are `Pending` (later stages of a running workflow) or `Skipped`.
 

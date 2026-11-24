@@ -588,6 +588,8 @@ function WorkflowDetail({ id, onClose, onOpenJob, notify, canOperate, refreshKey
   };
   if (!wf) return null;
   const hasFailed = wf.stages.some(st => st.steps.some(s => s.status === 'DeadLetter' || s.status === 'Failed'));
+  // A Failed workflow waits for its failed steps (retry) or can be cancelled; with on_failure="continue"
+  // it went on without them, so there is nothing to retry.
   return (
     <section className="wf-detail" aria-label={`Workflow ${wf.name}`}>
       <header className="wf-head">
@@ -598,13 +600,13 @@ function WorkflowDetail({ id, onClose, onOpenJob, notify, canOperate, refreshKey
           {wf.reason && <p className="wf-reason">{wf.reason}</p>}
         </div>
         <div className="wf-actions">
-          {canOperate && wf.status === 'Running' && (
+          {canOperate && (wf.status === 'Running' || wf.status === 'Failed') && (
             <button className="btn btn-danger btn-sm" disabled={busy}
               onClick={() => act(`/workflows/${encodeURIComponent(id)}/cancel`, () => 'Workflow cancelled.')}>
               <Ban size={14} /> Cancel workflow
             </button>
           )}
-          {canOperate && hasFailed && wf.status !== 'Cancelled' && (
+          {canOperate && hasFailed && wf.status === 'Failed' && (
             <button className="btn btn-secondary btn-sm" disabled={busy}
               onClick={() => act(`/workflows/${encodeURIComponent(id)}/retry`,
                 r => `Retrying ${r.retried} failed step${r.retried === 1 ? '' : 's'}. The workflow carries on when ${r.retried === 1 ? 'it succeeds' : 'they succeed'}.`)}>

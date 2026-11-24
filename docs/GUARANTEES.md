@@ -92,7 +92,7 @@ All times that machines compare (heartbeats, when a scheduled job is due, cron t
 
 ## Workflows
 
-The next stage of a workflow starts exactly once, even when the last steps of a stage finish at the same moment or a worker dies in between. A step that runs twice is counted once. [WORKFLOWS.md](WORKFLOWS.md#what-it-guarantees)
+The next stage of a workflow starts exactly once, even when the last steps of a stage finish at the same moment or a worker dies in between. A step that runs twice is counted once, and a counted step is never re-run by the recovery sweep. Once a workflow is cancelled, none of its remaining steps starts. Each step runs on its task's own queue and priority. [WORKFLOWS.md](WORKFLOWS.md#what-it-guarantees)
 
 ## Connections
 
