@@ -100,7 +100,7 @@ def problems(mem: dict) -> list[dict]:
             "title": (f"Redis is full ({_mb(used)} of {_mb(limit)})" if full
                       else f"Redis is {used * 100 / limit:.0f}% full ({_mb(used)} of {_mb(limit)})"),
             "detail": ("New jobs are refused (503) until workers finish waiting ones, which frees memory. Raise "
-                       "`maxmemory`, add workers, lower RESULT_TTL / HISTORY_LIMIT, or clear old dead letters."
+                       "`maxmemory`, add workers, lower FINISHED_JOBS_KEPT, or clear old dead letters."
                        if full else
                        "When it's full, new jobs are refused until workers catch up. Raise `maxmemory` or add "
                        "workers before that happens."),

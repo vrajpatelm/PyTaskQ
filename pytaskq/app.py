@@ -61,7 +61,7 @@ TASK_TYPES = ("cpu", "io", "async")
 
 # Option names `delay()` treats as queue options rather than task kwargs —
 # unless the task function itself declares a parameter with that name.
-_DELAY_OPTIONS = ("priority", "queue", "on_success_url", "idempotency_key")
+_DELAY_OPTIONS = ("priority", "queue", "on_success_url", "idempotency_key", "countdown", "task_id")
 
 
 def _redis():
@@ -283,17 +283,24 @@ class PyTaskQ:
                 "rate_limit": rate_limit.strip() if rate_limit else None,
                 "rate_interval": rate_interval,
             }
-            own_params = set(inspect.signature(fn).parameters)
+            signature = inspect.signature(fn)
+            own_params = set(signature.parameters)
 
             def _split(kwargs: dict) -> tuple[dict, dict]:
                 opts = {k: kwargs.pop(k) for k in _DELAY_OPTIONS if k in kwargs and k not in own_params}
                 return kwargs, opts
 
-            async def apply_async(args=None, kwargs=None, *, priority: Optional[str] = None,
-                                  queue: Optional[str] = None,
-                                  countdown: float = 0, on_success_url: Optional[str] = None,
-                                  task_id: Optional[str] = None, idempotency_key: Optional[str] = None) -> dict:
-                payload = queueing.new_payload(
+            def _check_arguments(args, kwargs) -> None:
+                # The same check the API does (422): a call that can't work fails here, at once, not as
+                # a dead letter in a worker after every retry (break test E10).
+                try:
+                    signature.bind(*(args or ()), **(kwargs or {}))
+                except TypeError as e:
+                    raise TypeError(f"{task_name}: {e} (the job wasn't queued)") from None
+
+            def _payload(args, kwargs, priority, queue, on_success_url, task_id):
+                _check_arguments(args, kwargs)
+                return queueing.new_payload(
                     task_name, args, kwargs,
                     priority=priority or prio,
                     queue=task_queue if queue is None else queue,
@@ -302,6 +309,12 @@ class PyTaskQ:
                     timeout=limit,
                     task_id=task_id,
                 )
+
+            async def apply_async(args=None, kwargs=None, *, priority: Optional[str] = None,
+                                  queue: Optional[str] = None,
+                                  countdown: float = 0, on_success_url: Optional[str] = None,
+                                  task_id: Optional[str] = None, idempotency_key: Optional[str] = None) -> dict:
+                payload = _payload(args, kwargs, priority, queue, on_success_url, task_id)
                 return await queueing.enqueue(_redis(), payload, delay_seconds=countdown,
                                               idempotency_key=idempotency_key)
 
@@ -314,14 +327,12 @@ class PyTaskQ:
                 return await apply_async(args, kwargs, countdown=delay_seconds, **opts)
 
             def delay_sync(*args, **kwargs) -> dict:
-                """Enqueue from synchronous code (no running event loop)."""
+                """Enqueue from synchronous code (no running event loop). Takes the same options as delay()."""
                 kwargs, opts = _split(kwargs)
+                payload = _payload(args, kwargs, opts.get("priority"), opts.get("queue"),
+                                   opts.get("on_success_url"), opts.get("task_id"))
                 return _run_sync(lambda r: queueing.enqueue(
-                    r,
-                    queueing.new_payload(task_name, args, kwargs, priority=opts.get("priority") or prio,
-                                         queue=opts.get("queue", task_queue),
-                                         on_success_url=opts.get("on_success_url"),
-                                         max_retries=retries, timeout=limit),
+                    r, payload, delay_seconds=opts.get("countdown") or 0,
                     idempotency_key=opts.get("idempotency_key"),
                 ))
 
@@ -353,7 +364,7 @@ class PyTaskQ:
         return queueing.public_view(meta) if meta else None
 
     async def wait(self, task_id: str, timeout: float = 30, poll_interval: float = 0.25) -> dict:
-        """Wait until the task reaches a final state; raises TimeoutError otherwise.
+        """Wait until the task reaches a final state; raises TimeoutError otherwise (LookupError for an unknown id).
 
         Checks often at first (every 20 ms) and less often as time passes (up to
         `poll_interval`), so a quick job's result comes back quickly without a
@@ -363,7 +374,12 @@ class PyTaskQ:
         delay = min(0.02, poll_interval)
         while True:
             info = await self.status(task_id)
-            if info and info.get("status") in queueing.FINAL_STATES:
+            if info is None:
+                # Every queued job has a record from the moment it's queued: no record means a wrong id,
+                # or a finished job whose record expired or was trimmed. Waiting can't help (break test D11).
+                raise LookupError(f"No job with id {task_id!r}: the id is wrong, or the job finished and its "
+                                  f"record is gone (RESULT_TTL / FINISHED_JOBS_KEPT).")
+            if info.get("status") in queueing.FINAL_STATES:
                 return info
             if time.monotonic() >= deadline:
                 raise TimeoutError(f"Task {task_id} did not finish within {timeout}s")

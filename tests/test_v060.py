@@ -811,3 +811,138 @@ async def test_d10_cron_ticks_for_a_paused_queue_are_skipped_not_piled_up(env):
         await queueing.resume_queue(r, "default")
         await worker.run_due_cron_jobs(now=t0 + 60 * 6 + 1)
     assert await r.llen(queueing.queue_key("default")) == 2, "after resume: the next tick only"
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Sizes and inputs: D7, D9, D11, E8 (lists), E9, E10
+# ═════════════════════════════════════════════════════════════════════════════
+
+async def _big_finished(r, n, size):
+    for i in range(n):
+        tid = f"big-{i}"
+        await r.hset(f"task:{tid}", mapping={
+            "task_id": tid, "task_name": "export", "status": "Success", "finished_at": 1_700_000_000 + i,
+            "result": "R" * size, "payload": json.dumps({"args": ["A" * size], "kwargs": {}}),
+            "error": "", "queue": "default"})
+        await r.zadd(queueing.FINISHED_KEY, {tid: 1_700_000_000 + i})
+        await r.lpush(queueing.RECENT_KEY, tid)
+
+
+async def test_d7_history_search_doesnt_read_whole_records(client, r):
+    await _big_finished(r, 60, 300_000)
+    calls = []
+    real = r.pipeline
+
+    def counting(*a, **k):
+        pipe = real(*a, **k)
+        execute = pipe.execute
+
+        async def run(*ea, **ek):
+            out = await execute(*ea, **ek)
+            calls.append(sum(len(str(x)) for x in out))
+            return out
+        pipe.execute = run
+        return pipe
+    with patch.object(r, "pipeline", counting):
+        res = await client.get("/tasks/history", params={"status": "Success"})
+        search = await client.get("/tasks/history", params={"q": "nomatchzzz"})
+    assert res.status_code == 200 and len(res.content) < 200_000, "a list, not 60 × 600 KB"
+    assert all(t["result_size"] == 300_000 and "result" not in t for t in res.json()["tasks"])
+    assert search.json()["tasks"] == [] and sum(calls) < 1_000_000, f"read {sum(calls):,} bytes"
+
+
+async def test_e8_job_lists_send_previews_and_the_job_page_everything(client, r):
+    await r.hset("task:e1", mapping={"task_id": "e1", "task_name": "x", "status": "DeadLetter",
+                                     "error": "E" * 50_000, "result": "", "queue": "default"})
+    await r.lpush(queueing.RECENT_KEY, "e1")
+    listed = (await client.get("/tasks")).json()["tasks"][0]
+    assert len(listed["error"]) < 1100 and listed["error_cut"] is True
+    full = (await client.get("/task/e1")).json()["result"]
+    assert len(full["error"]) == 50_000
+
+
+async def test_e9_dead_letters_come_in_pages(client, r):
+    for i in range(250):
+        p = queueing.new_payload("x", ["A" * 20_000], task_id=f"d{i}")
+        p.update(error="boom", failed_at=time.time())
+        await r.lpush("dlq", json.dumps(p))
+    page = (await client.get("/dlq")).json()
+    assert len(page["tasks"]) == 100 and page["total"] == 250 and page["offset"] == 0
+    assert "args" not in page["tasks"][0] and page["tasks"][0]["args_size"] > 20_000
+    last = (await client.get("/dlq", params={"offset": 200, "limit": 100})).json()
+    assert len(last["tasks"]) == 50
+    assert (await client.get("/dlq", params={"limit": 501})).status_code == 422
+
+
+@pytest.mark.parametrize("params", [{"since": "nan"}, {"until": "nan"}, {"since": "inf"},
+                                    {"cursor": "1|99999999999999999999"}, {"cursor": "nan|0"}])
+async def test_d9_history_search_answers_bad_input_with_422(client, r, params):
+    res = await client.get("/tasks/history", params=params)
+    assert res.status_code == 422, res.text
+
+
+def test_d11_progress_with_a_huge_number_doesnt_fail_the_job():
+    from pytaskq.context import _check
+    assert _check(10 ** 400, None) == (100.0, None)
+    assert _check(-(10 ** 400), None) == (0.0, None)
+
+
+async def test_d11_waiting_for_an_unknown_job_says_so(r):
+    from pytaskq import PyTaskQ
+    q = PyTaskQ()
+    with patch("pytaskq.app._redis", lambda: r):
+        began = time.monotonic()
+        with pytest.raises(LookupError, match="No job with id 'nope'"):
+            await q.wait("nope", timeout=30)
+    assert time.monotonic() - began < 1
+
+
+async def test_d11_no_maxmemory_is_a_warning_in_performance(client, r):
+    from pytaskq.core import redis_health
+
+    async def memory(_):
+        return {"used_bytes": 10_000_000, "max_bytes": 0, "percent": 0, "policy": "noeviction"}
+    with patch.object(redis_health, "memory", memory):
+        found = (await client.get("/system/performance")).json()["suggestions"]
+        health = (await client.get("/health")).json()
+    assert any(s["title"] == "Redis has no memory limit (maxmemory 0)" for s in found)
+    assert not any("memory limit" in w for w in health.get("warnings", [])), "not a health problem by itself"
+
+
+async def test_e10_the_sdk_checks_arguments_and_knows_countdown(r):
+    from pytaskq import PyTaskQ
+    q = PyTaskQ()
+
+    @q.task(type="io")
+    def echo(x=0, tag=""):
+        return x
+    with patch("pytaskq.app._redis", lambda: r), patch("pytaskq.app._run_sync",
+                                                        lambda fn: asyncio.get_event_loop().run_until_complete(fn(r))):
+        with pytest.raises(TypeError, match="echo: too many positional arguments"):
+            await echo.apply_async(args=[1, 2, 3, 4])
+        with pytest.raises(TypeError, match="unexpected keyword argument 'colour'"):
+            await echo.delay(colour="red")
+        job = await echo.delay(x=1, countdown=30)
+    assert job["status"] == "scheduled", "countdown is an option, not an argument"
+    stored = json.loads(await r.hget(f"task:{job['task_id']}", "payload"))
+    assert stored["kwargs"] == {"x": 1}
+    assert await r.llen(queueing.queue_key("default")) == 0
+
+
+def test_e10_delay_sync_takes_countdown_and_task_id(redis_url):
+    from pytaskq import PyTaskQ
+    import redis as redis_sync
+    url = redis_url.replace("/0", "/8")
+    q = PyTaskQ()
+
+    @q.task(type="io")
+    def echo(x=0):
+        return x
+    with patch.object(settings, "REDIS_URL", url):
+        job = echo.delay_sync(x=2, countdown=60, task_id="sync-1")
+        with pytest.raises(TypeError):
+            echo.delay_sync(1, 2, 3)
+    rs = redis_sync.Redis.from_url(url, decode_responses=True)
+    assert job["task_id"] == "sync-1" and job["status"] == "scheduled"
+    assert rs.zcard("delayed_tasks") == 1 and rs.hget("task:sync-1", "status") == "Scheduled"
+    rs.flushdb()

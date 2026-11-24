@@ -2,7 +2,7 @@ import json
 import time
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 
 from pytaskq.core import queueing, redis_client
 from pytaskq.core.config import settings
@@ -69,9 +69,19 @@ def _parse(raw: str):
 
 
 @router.get("")
-async def get_dlq():
-    items = [_parse(raw) for raw in await redis_client.r.lrange(DLQ_KEY, 0, -1)]
-    return {"tasks": [i for i in items if i is not None]}   # unreadable entries are skipped
+async def get_dlq(offset: int = Query(0, ge=0), limit: int = Query(100, ge=1, le=500)):
+    """
+    Dead letters, newest first, a page at a time (`offset`, `limit` up to 500; `total` is how many there
+    are). Errors are cut to 1,000 characters and big arguments left out; `GET /task/{id}` has them all.
+    It used to send the whole list with full arguments: 22 MB for 10,000 dead letters (break test E9).
+    """
+    async with redis_client.r.pipeline(transaction=False) as pipe:
+        pipe.lrange(DLQ_KEY, offset, offset + limit - 1)
+        pipe.llen(DLQ_KEY)
+        raws, total = await pipe.execute()
+    items = [queueing.dead_letter_view(raw) for raw in raws]
+    return {"tasks": [i for i in items if i is not None],    # unreadable entries are skipped
+            "total": int(total), "offset": offset, "limit": limit}
 
 
 async def _find(task_id: str):

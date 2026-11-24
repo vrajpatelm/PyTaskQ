@@ -1292,7 +1292,7 @@ async def _record_failure(r, tasks, task_json, task_id, error, max_retries) -> s
             logger.warning(f"[DLQ] More than DLQ_LIMIT ({settings.DLQ_LIMIT}) dead letters; the oldest was dropped.")
         logger.error(f"[DLQ] Task {task_id} failed after {tasks.retry_count} retries. Moving to DLQ. ({error})")
         return "DeadLetter"
-    logger.error(f"Task {task_id} failed: {error}. Retry {tasks.retry_count}/{max_retries} scheduled.")
+    logger.error(f"Task {task_id} failed: {error.rstrip('.')}. Retry {tasks.retry_count}/{max_retries} scheduled.")
     return "RetryScheduled"
 
 

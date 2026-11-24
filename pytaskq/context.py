@@ -51,7 +51,11 @@ def _check(percent, message) -> tuple[Optional[float], Optional[str]]:
     if percent is not None:
         if isinstance(percent, bool) or not isinstance(percent, (int, float)) or percent != percent:
             raise ValueError(f"progress() takes a percentage from 0 to 100, got {percent!r}")
-        percent = round(min(100.0, max(0.0, float(percent))), 1)
+        try:
+            percent = float(percent)
+        except OverflowError:            # an int too big for a float (break test D11)
+            percent = 100.0 if percent > 0 else 0.0
+        percent = round(min(100.0, max(0.0, percent)), 1)
     if message is not None:
         message = str(message)[:MAX_MESSAGE]
     return percent, message
