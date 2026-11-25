@@ -18,7 +18,11 @@ Thank you for your interest in contributing to this project! Please review the g
     cp .env.example .env
     ```
 4.  **Local Services**: Ensure a local Redis server is active on `localhost:6379`.
-5.  **Checks on every commit**:
+5.  **Dashboard**: the built bundle isn't in git. Build it once (and after frontend changes):
+    ```powershell
+    cd frontend; npm ci; npm run build      # writes pytaskq/static/
+    ```
+6.  **Checks on every commit**:
     ```powershell
     pre-commit install          # ruff, mypy, whitespace and YAML/TOML checks before each commit
     ```

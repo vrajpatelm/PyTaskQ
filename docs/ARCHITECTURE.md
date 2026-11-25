@@ -39,7 +39,7 @@ PyTaskQ runs Python functions in the background. Your app queues a job, a worker
 | `pytaskq/services/live.py` | Live dashboard updates |
 | `pytaskq/tracing.py` | Optional OpenTelemetry tracing |
 | `pytaskq/net.py` | Webhook URL safety checks |
-| `frontend/` | The dashboard (React + Vite), built into `pytaskq/static/` |
+| `frontend/` | The dashboard (React + Vite), built into `pytaskq/static/` (not committed: CI, releases and the Dockerfile build it) |
 
 ## What's in Redis
 

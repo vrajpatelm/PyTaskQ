@@ -4,9 +4,8 @@
 #   other-os  – the suite on Windows (required) and macOS (experimental)
 #   typecheck – mypy over the package
 #   lint      – ruff, limited to rules that catch real bugs (not style)
-#   dashboard – lints and builds the React dashboard, and checks that the
-#               bundle committed in pytaskq/static matches the source
-#   package   – builds the wheel, installs it in a clean environment and
+#   dashboard – lints and builds the React dashboard (the bundle isn't committed)
+#   package   – builds the wheel with that bundle, installs it in a clean environment and
 #               checks the CLI and bundled dashboard work
 #   docker    – builds the Docker image and runs it end to end (Redis +
 #               dashboard + worker, sign in, queue a job)
@@ -134,20 +133,23 @@ jobs:
       - run: npm run lint
       - run: npm run build
 
-      - name: Committed bundle is up to date
-        working-directory: .
-        run: |
-          if [ -n "$(git status --porcelain pytaskq/static)" ]; then
-            echo "::error::pytaskq/static is out of date. Run 'cd frontend && npm run build' and commit the result."
-            git status --short pytaskq/static
-            exit 1
-          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dashboard
+          path: pytaskq/static/
+          if-no-files-found: error
 
   package:
     name: Package
+    needs: dashboard
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4      # the bundle the dashboard job built
+        with:
+          name: dashboard
+          path: pytaskq/static/
 
       - uses: actions/setup-python@v5
         with:
