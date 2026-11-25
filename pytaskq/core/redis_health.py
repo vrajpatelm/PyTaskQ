@@ -2,21 +2,13 @@
 pytaskq.core.redis_health — is Redis set up so it can't lose jobs?
 ==================================================================
 
-Three things can make Redis lose or refuse PyTaskQ's data without any error
-showing up in PyTaskQ itself. This module notices them, so the log, `/health`
-and *Settings → Performance* can say so:
+Notices three ways Redis can silently lose or refuse data, for the log, `/health`
+and *Settings → Performance*:
 
-* **Eviction.** With `maxmemory` set and any `maxmemory-policy` other than
-  `noeviction`, Redis deletes keys to make room: whole queues, job records,
-  idempotency keys, sessions, even accounts. Nothing reports an error.
-* **Full memory.** With `noeviction` (the right policy) Redis refuses writes
-  once `maxmemory` is reached. New jobs are refused, which is correct, but
-  workers must still be able to take and finish the jobs that are waiting,
-  since that's what frees memory. Scripts that must work when Redis is full
-  start with OOM_PROBE (see below).
-* **Data loss.** A Redis restarted without its volume, or a wiped database,
-  comes back empty. PyTaskQ keeps a marker key; when it disappears while
-  PyTaskQ is running, the data is gone, and that is logged and shown.
+* **Eviction:** any `maxmemory-policy` other than `noeviction` deletes keys to make room.
+* **Full memory:** with `noeviction`, writes are refused at `maxmemory`. Workers must still
+  take and finish waiting jobs (that frees memory), so those scripts start with OOM_PROBE.
+* **Data loss:** a marker key that disappears while PyTaskQ runs means the data is gone.
 """
 
 from __future__ import annotations
@@ -30,14 +22,9 @@ from pytaskq.core.keys import k as rkey, fill_scripts
 
 logger = logging.getLogger("pytaskq")
 
-# Redis refuses a memory-growing command in a script when it's out of memory,
-# but only if it is the script's FIRST write: once a script has written
-# something it must be allowed to finish (Redis 5, 6 and 7 all behave this way).
-# Deleting a key that never exists is a write that uses no memory, so a script
-# starting with this line can move a job, save a result or renew a lock even
-# when Redis is full. Used only for steps that free memory overall or keep the
-# fleet running (taking and finishing jobs, heartbeats, leader election) —
-# never for queueing new work.
+# When Redis is full it refuses a memory-growing command only as a script's FIRST write. Deleting a
+# key that never exists is a write that needs no memory, so a script starting with this can still
+# finish. Only for steps that free memory or keep the fleet running, never for queueing new work.
 OOM_PROBE = "redis.call('DEL', '__PYTASKQ__pytaskq:oom-probe')\n"
 
 INSTALL_KEY = rkey("pytaskq:install")       # hash: created_at, data_lost_at (marker for data loss)
@@ -122,10 +109,7 @@ _seen_marker = False
 async def check_data(r, who: str = "PyTaskQ") -> Optional[float]:
     """
     Create the marker if it's missing; return the time data loss was detected, if ever.
-
-    Call it now and then (every few seconds). The first call in a process only
-    creates or reads the marker. If a later call finds it gone, Redis lost its
-    data while this process was running: it's logged loudly, and recorded.
+    If a later call in this process finds the marker gone, Redis lost its data: logged and recorded.
     """
     global _seen_marker
     now = time.time()
@@ -160,12 +144,8 @@ RATE_WINDOW = 600                # seconds of finished jobs used to measure the 
 
 async def retention(r) -> dict:
     """
-    Where memory for finished-job records is heading at the current rate.
-
-    Finished jobs are kept for RESULT_TTL, but at most FINISHED_JOBS_KEPT of
-    them, so their memory settles at min(rate × RESULT_TTL, FINISHED_JOBS_KEPT)
-    records. Comparing that with what's stored now says how much more memory
-    Redis will need, before it runs out instead of after.
+    Where memory for finished-job records is heading at the current rate: it settles at
+    min(rate × RESULT_TTL, FINISHED_JOBS_KEPT) records.
     """
     from pytaskq.core import clock, queueing
     from pytaskq.core.config import settings

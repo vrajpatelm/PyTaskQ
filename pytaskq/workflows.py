@@ -14,29 +14,20 @@ pytaskq.workflows — several jobs as one piece of work
     )
     await app.wait_workflow(wf["workflow_id"])
 
-A workflow is a list of **stages** run one after another. A stage is one step
-or a `group` of steps that run at the same time. Each step is an ordinary job
-(retries, timeouts, limits, cancelling, the dashboard all apply).
+A workflow is a list of stages run one after another; a stage is one step or a
+`group` of steps run at the same time. Each step is an ordinary job.
 
-Passing results on: a step receives the previous stage's result as its first
-argument (`task.s(...)`): one value after a single step, a list (in the
-group's order) after a group. `task.si(...)` doesn't receive it. The first
-stage receives nothing.
+A step gets the previous stage's result as its first argument (`task.s(...)`):
+one value after a single step, a list after a group. `task.si(...)` doesn't.
 
-When a step fails for good (it's dead-lettered after its retries):
-  on_failure="stop" (default)  the workflow is Failed; later stages don't run.
-                               Fix the cause, then retry the failed steps
-                               (dashboard or `app.retry_workflow()`): it carries on.
-  on_failure="continue"        the step counts as done with the result None,
-                               and the workflow carries on; it ends PartlySucceeded.
+When a step fails for good:
+  on_failure="stop" (default)  the workflow is Failed; retry the failed steps to carry on.
+  on_failure="continue"        the step's result is None; the workflow ends PartlySucceeded.
 
-How it's built: everything a workflow needs is in Redis next to the jobs. When
-a step finishes, one Lua script records its result and, only for the last step
-of a stage, moves the workflow to the next stage, so two steps finishing at
-the same moment can never both (or neither) start the next stage. The next
-stage's steps get fixed ids (`<workflow id>.<stage>.<index>`), so if the
-worker dies between the two, the leader's sweep queues the missing steps
-without ever queuing one twice. No result backend, no polling.
+One Lua script records each finished step and, for the last step of a stage,
+moves to the next stage, so a stage starts exactly once. Steps have fixed ids
+(`<workflow id>.<stage>.<index>`), so the leader's sweep can queue missing
+steps without duplicates.
 """
 
 from __future__ import annotations
@@ -55,9 +46,22 @@ logger = logging.getLogger("pytaskq")
 RUNNING, SUCCEEDED, PARTLY, FAILED, CANCELLED = "Running", "Succeeded", "PartlySucceeded", "Failed", "Cancelled"
 FINAL = {SUCCEEDED, PARTLY, FAILED, CANCELLED}
 INDEX_KEY = rkey("pytaskq:workflows")         # sorted set: workflow id → created time
+# Sorted set: running workflow id → its stage's start (or the last sweep), so the sweep reads only
+# workflows that may be stuck.
+RUNNING_KEY = rkey("pytaskq:workflows:running")
+SWEEP_BATCH = 500                            # stuck-looking workflows the sweep reads per round
 WORKFLOWS_KEPT = 10_000                      # the newest workflows listed; older ones are forgotten
 STUCK_AFTER = 30                             # seconds before the sweep queues a stage's missing steps
 MAX_STEPS = 1_000
+
+
+class WorkflowIdInUse(queueing.TaskIdInUse):
+    """app.workflow(workflow_id=…) named a workflow that already exists."""
+
+    def __init__(self, wf_id: str):
+        ValueError.__init__(self, f"workflow id {wf_id!r} is already in use. Let PyTaskQ pick the id, or use "
+                                  f"idempotency_key= to start a workflow only once.")
+        self.task_id, self.status = wf_id, "in use"
 
 
 def wf_key(wf_id: str) -> str:
@@ -80,7 +84,8 @@ class Step:
     def __init__(self, task_name: str, args: Iterable[Any] = (), kwargs: Optional[dict] = None,
                  immutable: bool = False):
         self.task_name, self.args, self.kwargs = task_name, list(args), dict(kwargs or {})
-        self.immutable, self.options = immutable, {}
+        self.immutable = immutable
+        self.options: dict[str, Any] = {}
 
     def set(self, *, priority: Optional[str] = None, queue: Optional[str] = None) -> "Step":
         """Run this step with another priority or on another queue than its task's default."""
@@ -115,7 +120,7 @@ class chain:
     def __init__(self, *stages):
         if not stages:
             raise TypeError("chain() needs at least one step")
-        self.stages = []
+        self.stages: list = []
         for s in stages:
             if isinstance(s, chain):
                 self.stages.extend(s.stages)
@@ -161,11 +166,16 @@ def plan_from_json(data: list) -> list[list[dict]]:
 
 # ── Lua ───────────────────────────────────────────────────────────────────────
 
-# A step finished. KEYS: workflow hash, the stage's results
+# A step finished. KEYS: workflow hash, the stage's results [, RUNNING_KEY]
 # ARGV: stage, index, result JSON, ok ("1" succeeded, "0" failed for good, "c" cancelled), now, error, step id
+#       [, workflow id]
 # Returns {code, next stage, revived}: code 0 nothing to do, 1 counted, 2 the workflow failed/was cancelled,
 # 3 the workflow finished, 4 start the next stage. revived = 1 when a retried step brought a Failed workflow back.
 STEP_DONE_SCRIPT = """
+local function running(score)
+    if not KEYS[3] then return end
+    if score then redis.call('ZADD', KEYS[3], score, ARGV[8]) else redis.call('ZREM', KEYS[3], ARGV[8]) end
+end
 local status = redis.call('HGET', KEYS[1], 'status')
 if not status or status == 'Cancelled' then return {0, 0, 0} end
 local stage, idx = tonumber(ARGV[1]), ARGV[2]
@@ -181,11 +191,13 @@ if ARGV[4] ~= '1' then
     if ARGV[4] == 'c' then
         redis.call('HSET', KEYS[1], 'status', 'Cancelled', 'finished_at', ARGV[5], 'reason',
                    'Step ' .. ARGV[7] .. ' was cancelled.')
+        running(nil)
         return {2, 0, 0}
     end
     if redis.call('HGET', KEYS[1], 'on_failure') ~= 'continue' then
         redis.call('HSET', KEYS[1], 'status', 'Failed', 'finished_at', ARGV[5], 'reason',
                    'Step ' .. ARGV[7] .. ' failed: ' .. ARGV[6])
+        running(nil)
         return {2, 0, 0}
     end
     redis.call('HSET', KEYS[2], idx, 'null')     -- "continue": counts as done, with the result None
@@ -200,33 +212,37 @@ else
             redis.call('HSET', KEYS[1], 'status', 'Running')
             redis.call('HDEL', KEYS[1], 'finished_at', 'reason')
             status, revived = 'Running', 1
+            running(ARGV[5])
         end
     end
 end
 redis.call('HINCRBY', KEYS[1], 'done_steps', 1)
 redis.call('HSET', KEYS[1], 'updated_at', ARGV[5])
 if stage ~= current then return {1, 0, revived} end
--- Count down even while the workflow is Failed: siblings that finish after a failure are done,
--- and the retried step is then the last one (break test #5, W2).
+-- Count down even while Failed, so a retried step can be the stage's last one.
 local left = redis.call('HINCRBY', KEYS[1], 'left', -1)
 if status ~= 'Running' or left > 0 then return {1, 0, revived} end
 local stages = tonumber(redis.call('HGET', KEYS[1], 'stages'))
 if stage + 1 >= stages then
     local failed = tonumber(redis.call('HGET', KEYS[1], 'failed_steps') or '0')
     redis.call('HSET', KEYS[1], 'status', failed > 0 and 'PartlySucceeded' or 'Succeeded', 'finished_at', ARGV[5])
+    running(nil)
     return {3, 0, revived}
 end
 redis.call('HSET', KEYS[1], 'stage', stage + 1, 'left', redis.call('HGET', KEYS[1], 'size:' .. (stage + 1)),
            'stage_started_at', ARGV[5])
+running(ARGV[5])
 return {4, stage + 1, revived}
 """
 
-# Cancel a workflow, atomically against a finishing step. KEYS: workflow hash   ARGV: now, reason
+# Cancel a workflow, atomically against a finishing step.
+# KEYS: workflow hash [, RUNNING_KEY]   ARGV: now, reason [, workflow id]
 # Returns the status before ('Running' and 'Failed' are cancelled; anything else is left alone).
 CANCEL_WORKFLOW_SCRIPT = """
 local status = redis.call('HGET', KEYS[1], 'status')
 if status == 'Running' or status == 'Failed' then
     redis.call('HSET', KEYS[1], 'status', 'Cancelled', 'finished_at', ARGV[1], 'reason', ARGV[2])
+    if KEYS[2] then redis.call('ZREM', KEYS[2], ARGV[3]) end
 end
 return status or false
 """
@@ -238,9 +254,8 @@ fill_scripts(globals())
 
 def _resolve(spec: dict, defaults: Optional[dict]) -> None:
     """
-    Fix a step's queue and priority when the workflow starts: what `.set()` asked for, else
-    its task's own (break test #5, W1: a later stage used to fall back to "default" for
-    both, because the process queuing it didn't know the task). Refuses bad values.
+    Fix a step's queue and priority when the workflow starts (`.set()`, else its task's own),
+    since a later stage may be queued by a process that doesn't know the task. Refuses bad values.
     """
     defaults = defaults or {}
     priority = spec.get("priority") or defaults.get("priority") or "default"
@@ -307,11 +322,12 @@ async def start(r, plan: list[list[dict]], *, name: Optional[str] = None, on_fai
     if created_by:
         fields["created_by"] = created_by
     if not await r.hsetnx(wf_key(wf_id), "workflow_id", wf_id):
-        raise queueing.TaskIdInUse(f"workflow id {wf_id!r} is already in use")
+        raise WorkflowIdInUse(wf_id)
     async with r.pipeline(transaction=True) as pipe:
         pipe.hset(wf_key(wf_id), mapping=fields)
         pipe.zadd(INDEX_KEY, {wf_id: now})
         pipe.zremrangebyrank(INDEX_KEY, 0, -WORKFLOWS_KEPT - 1)
+        pipe.zadd(RUNNING_KEY, {wf_id: now})
         await pipe.execute()
     await _queue_stage(r, wf_id, plan, 0)
     logger.info(f"[Workflow] Started {wf_id} ({fields['name']}): {fields['total_steps']} step(s) in "
@@ -321,10 +337,8 @@ async def start(r, plan: list[list[dict]], *, name: Optional[str] = None, on_fai
 
 def step_payload(wf_id: str, plan: list, stage: int, index: int) -> dict:
     """
-    The job of one step. A step that takes the previous stage's result doesn't carry a
-    copy of it: the worker reads it from the workflow's results when the step starts
-    ("input"), so a big fan-in is stored once, not once per step of the next stage
-    (break test #5, W9: 20 × 250 KB results → a group of 10 took +126 MB).
+    The job of one step. The previous stage's result isn't copied in: the worker reads it
+    from the workflow's results when the step starts ("input"), so it's stored once.
     """
     spec = plan[stage][index]
     payload = queueing.new_payload(spec["task"], spec["args"], spec["kwargs"], task_id=step_id(wf_id, stage, index),
@@ -410,9 +424,9 @@ async def step_finished(r, info: dict, outcome: str, value: Any = None, error: s
         outcome, error = "failed", (f"its result ({len(encoded):,} bytes) is over MAX_RESULT_BYTES, too big to pass "
                                     f"to the next stage")
     ok = {"ok": "1", "failed": "0", "cancelled": "c"}[outcome]
-    reply = await r.eval(STEP_DONE_SCRIPT, 2, wf_key(wf_id), results_key(wf_id, stage),
+    reply = await r.eval(STEP_DONE_SCRIPT, 3, wf_key(wf_id), results_key(wf_id, stage), RUNNING_KEY,
                          stage, index, encoded, ok, repr(clock.now()), queueing.cut_text(error or "", 1000),
-                         step_id(wf_id, stage, index))
+                         step_id(wf_id, stage, index), wf_id)
     code = int(reply[0])
     if len(reply) > 2 and int(reply[2]):
         await _keep(r, wf_id)                     # a retried step brought it back: it mustn't expire now
@@ -420,8 +434,8 @@ async def step_finished(r, info: dict, outcome: str, value: Any = None, error: s
         logger.warning(f"[Workflow] {wf_id} stopped: step {step_id(wf_id, stage, index)} "
                        f"{'was cancelled' if outcome == 'cancelled' else 'failed'}.")
         if outcome == "cancelled":
-            await _stop_steps(r, wf_id, by="a cancelled step")    # its siblings and later stages (W4)
-        await _finish(r, wf_id)                   # a stopped workflow expires like a finished one (F11)
+            await _stop_steps(r, wf_id, by="a cancelled step")    # its siblings and later stages
+        await _finish(r, wf_id)                   # a stopped workflow expires like a finished one
     elif code == 3:
         await _finish(r, wf_id)
     elif code == 4:
@@ -444,10 +458,9 @@ async def _keep(r, wf_id: str) -> None:
 
 async def _stop_steps(r, wf_id: str, by: Optional[str] = None) -> None:
     """
-    A cancelled workflow's steps don't run: the waiting and running ones of the current
-    stage are cancelled, and every step of it and of later stages gets a cancel request,
-    which a worker checks right before starting a job. So a step queued a moment after
-    the cancel (its stage was just finishing) doesn't start either (break test #5, W5).
+    Stop a cancelled workflow's steps: cancel the current stage's waiting and running ones, and
+    set a cancel request for every remaining step id, so a step queued just after the cancel
+    doesn't start either (workers check it right before starting).
     """
     data = await r.hmget(wf_key(wf_id), "plan", "stage")
     if not data[0]:
@@ -478,22 +491,55 @@ async def _finish(r, wf_id: str) -> None:
     logger.info(f"[Workflow] {wf_id} finished: {status}.")
 
 
+_backfilled = False
+
+
+async def _backfill_running(r) -> None:
+    """Add running workflows started by older versions (which didn't use RUNNING_KEY)."""
+    ids = await r.zrange(INDEX_KEY, 0, -1)
+    for i in range(0, len(ids), SWEEP_BATCH):
+        chunk = ids[i:i + SWEEP_BATCH]
+        async with r.pipeline(transaction=False) as pipe:
+            for wf_id in chunk:
+                pipe.hmget(wf_key(wf_id), "status", "stage_started_at")
+            rows = await pipe.execute()
+        found = {wf_id: float(started or 0) for wf_id, (st, started) in zip(chunk, rows) if st == RUNNING}
+        if found:
+            await r.zadd(RUNNING_KEY, found, nx=True)
+
+
 async def sweep(r) -> int:
     """
     Leader, every few seconds, for running workflows whose stage hasn't moved for STUCK_AFTER:
-      - a step that finished (or failed, or was cancelled) but whose workflow was never told
-        (its worker died in between) is counted now, from its job record (W7);
+      - a step that finished, failed or was cancelled but whose workflow was never told
+        (its worker died in between) is counted now, from its job record;
       - a step that was never queued (the worker that finished the previous stage died in
         between) is queued now.
-    A step already counted is never touched, even when its job record is gone (W6: the
-    sweep used to re-run a finished step whose record FINISHED_JOBS_KEPT had trimmed).
+    A step already counted is never touched, even when its job record is gone.
     """
+    global _backfilled
+    if not _backfilled:
+        await _backfill_running(r)
+        _backfilled = True
     fixed = 0
     now = clock.now()
-    for wf_id in await r.zrevrangebyscore(INDEX_KEY, "+inf", now - 7 * 86400, start=0, num=500):
-        data = await r.hmget(wf_key(wf_id), "status", "stage", "stage_started_at", "plan")
-        if data[0] != RUNNING or not data[3] or now - float(data[2] or now) < STUCK_AFTER:
+    ids = await r.zrangebyscore(RUNNING_KEY, "-inf", now - STUCK_AFTER, start=0, num=SWEEP_BATCH)
+    if not ids:
+        return 0
+    async with r.pipeline(transaction=False) as pipe:
+        for wf_id in ids:
+            pipe.hmget(wf_key(wf_id), "status", "stage", "stage_started_at", "plan")
+        rows = await pipe.execute()
+    gone, later = [], {}
+    for wf_id, data in zip(ids, rows):
+        if data[0] != RUNNING or not data[3]:
+            gone.append(wf_id)                       # finished, stopped or expired
             continue
+        started = float(data[2] or now)
+        if now - started < STUCK_AFTER:
+            later[wf_id] = started                   # its stage moved meanwhile
+            continue
+        later[wf_id] = now                           # look again after another STUCK_AFTER
         plan, stage = json.loads(data[3]), int(data[1])
         done = set(await r.hkeys(results_key(wf_id, stage)))
         open_ = [i for i in range(len(plan[stage])) if str(i) not in done]
@@ -526,6 +572,12 @@ async def sweep(r) -> int:
                                f"(the worker that finished the previous stage stopped in between).")
         if len(missing) < len(open_):
             logger.warning(f"[Workflow] {wf_id}: counted step(s) whose worker stopped before telling the workflow.")
+    async with r.pipeline(transaction=False) as pipe:
+        if gone:
+            pipe.zrem(RUNNING_KEY, *gone)
+        if later:
+            pipe.zadd(RUNNING_KEY, later, xx=True)
+        await pipe.execute()
     return fixed
 
 
@@ -601,7 +653,8 @@ async def cancel(r, wf_id: str, by: Optional[str] = None) -> Optional[str]:
     Cancel a running (or failed) workflow: its waiting steps won't run, running ones are
     stopped, later stages never start. Returns the status before, None if unknown.
     """
-    before = await r.eval(CANCEL_WORKFLOW_SCRIPT, 1, wf_key(wf_id), repr(clock.now()), f"Cancelled by {by or 'app'}.")
+    before = await r.eval(CANCEL_WORKFLOW_SCRIPT, 2, wf_key(wf_id), RUNNING_KEY, repr(clock.now()),
+                          f"Cancelled by {by or 'app'}.", wf_id)
     if before not in (RUNNING, FAILED):
         return before
     await _stop_steps(r, wf_id, by=by)
@@ -616,8 +669,7 @@ async def retry_failed(r, wf_id: str) -> int:
     if not data:
         return 0
     if data.get("status") != FAILED:
-        # Only a stopped workflow waits for its failed steps. With on_failure="continue" the
-        # workflow already went on without them (break test #5, W3), so there's nothing to resume.
+        # Only a stopped workflow waits for its failed steps; "continue" already went on without them.
         return 0
     plan = json.loads(data["plan"])
     failed = [k for k in data if k.startswith("failed:")]
@@ -631,7 +683,7 @@ async def retry_failed(r, wf_id: str) -> int:
             await queueing.enqueue(r, payload, max_bytes=0, note=f"Retried from workflow {wf_id}.")
         except queueing.TaskIdInUse:
             continue
-        # Its old dead letter isn't needed any more (and "Replay all" mustn't run it a second time).
+        # Drop its old dead letter, so "Replay all" doesn't run it a second time.
         for raw in await r.lrange(rkey("dlq"), 0, -1):
             if f'"task_id": "{tid}"' in raw:
                 await r.lrem(rkey("dlq"), 1, raw)

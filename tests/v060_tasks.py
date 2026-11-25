@@ -119,6 +119,12 @@ def rl_task(n=0):
     return n
 
 
+@queue.task(type="io", rate_limit="10/s", max_retries=0)
+def rl_fast(n=0):
+    log("rlf_start", n)
+    return n
+
+
 @queue.task(type="io", max_retries=0)
 def wf_fetch(url=""):
     log("wf_fetch", url)

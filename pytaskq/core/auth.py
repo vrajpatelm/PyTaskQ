@@ -240,7 +240,10 @@ async def update_user(r, username: str, *, role: Optional[str] = None,
         await r.hset(_k_user(username), mapping=changes)
     if disabled:
         await revoke_all_sessions(r, username)
-    return await get_user(r, username)
+    updated = await get_user(r, username)
+    if updated is None:                       # deleted meanwhile
+        raise AuthError("User not found.", 404)
+    return updated
 
 
 async def delete_user(r, username: str) -> None:
@@ -272,12 +275,8 @@ async def set_password(r, username: str, new_password: str, keep_session_sha: Op
 # ── login throttling ─────────────────────────────────────────────────────────
 
 async def _reserve_attempt(r, username: str, ip: str) -> tuple[int, int]:
-    """Count this attempt BEFORE checking the password; returns (attempts by user, by IP).
-
-    Counting first is what makes the limit hold under parallel requests: 40
-    guesses sent at once used to all pass a "fewer than 10 so far?" check before
-    any of them was recorded.
-    """
+    """Count this attempt BEFORE checking the password (so the limit holds under parallel requests);
+    returns (attempts by user, by IP)."""
     async with r.pipeline(transaction=True) as pipe:
         for key in (rkey(f"auth:fail:user:{username}"), rkey(f"auth:fail:ip:{ip}")):
             pipe.incr(key)
@@ -418,11 +417,9 @@ async def user_for_api_token(r, token: str) -> Optional[User]:
     return user
 
 
-# Resolve a session or API token to its user in ONE Redis round trip.
-# Every authenticated request runs this, so it used to cost three sequential
-# calls (credential → user → "last used" write). Nothing is cached: revoking a
-# token, ending a session or disabling a user takes effect on the next request.
-# "last used" is written at most once per TOKEN_TOUCH_SECONDS, not on every call.
+# Resolve a session or API token to its user in one round trip (every authenticated request runs it).
+# Nothing is cached: revoking a token, ending a session or disabling a user takes effect on the next
+# request. "last used" is written at most once per TOKEN_TOUCH_SECONDS.
 # KEYS[1] credential key   ARGV: kind ("session"|"token"), now, touch interval
 LOOKUP_SCRIPT = """
 local username
@@ -555,12 +552,8 @@ def setup_banner(code: str, why: str = "") -> str:
 
 async def announce_setup_code(r, log, why: str = "no accounts exist any more") -> Optional[str]:
     """
-    If nobody can sign in and there's no setup code either, make one and log it.
-
-    The code used to be created only when the dashboard started. After Redis
-    lost its data (a restart without its volume, a flush, eviction), every
-    account was gone and the dashboard asked for a code that didn't exist.
-    Safe to call often, and from several API processes: only one creates a code.
+    If nobody can sign in and there's no setup code either (e.g. Redis lost its data), make one
+    and log it. Safe to call often, and from several API processes: only one creates a code.
     """
     if not settings.auth_enabled or await r.exists(K_SETUP_CODE) or await user_count(r) > 0:
         return None

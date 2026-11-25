@@ -2,6 +2,28 @@
 
 All notable changes to PyTaskQ. Versions follow [semantic versioning](https://semver.org/).
 
+## Unreleased
+
+### Fixed
+- A job could stay stuck in a worker's processing list, never running, until that worker stopped: when Redis moved a job to a worker but the reply was lost (Redis restart, failover, dropped connection), the worker never received it, and the sweeper only recovers dead workers' lists. Each worker now checks its own list every 30 s and puts back jobs it never received.
+- A cancel request that came too late to stop a run (the job succeeded or was dead-lettered first) was kept for a week and silently cancelled the job when it was replayed from dead letters, or when its id was reused. The request now ends with its run; a cancelled job's retries still never run.
+- `rate_limit` above about one start a second ran at about one a second (`"5/s"` gave 1/s). Waiting jobs are now released when their turn comes rather than on a one-second tick, and a job whose turn is due but whose previous start ran a few milliseconds late keeps its place in line.
+- `rate_limit` starts could be closer than the limit (0.17 s apart at `"5/s"`): the worker sent its own idea of the current time, which could be stale by the time Redis ran the check, or skewed between machines. The check now uses Redis's clock.
+- When a worker was killed (`kill -9`, the out-of-memory killer), its CPU processes kept running forever, each holding a full Python interpreter's memory: a forked process inherits the pipes' other ends, so it never saw its own pipe close. CPU processes now exit within a second of their worker's death.
+- The workflow sweep only looked at the 500 newest workflows of the last 7 days, so an older stuck workflow stayed Running forever. Running workflows are now tracked in their own sorted set (`pytaskq:workflows:running`); the sweep reads only the ones that may be stuck, in one pipelined round trip. Workflows started by 0.6.0 are added on the first sweep after upgrading.
+
+### Fixed (found by type checking)
+- `app.workflow(workflow_id=…)` with an id already in use raised `TypeError` instead of an "already in use" error. It now raises `WorkflowIdInUse` (a `TaskIdInUse`).
+- Changing a user's role while the user was being deleted returned nothing instead of a 404.
+
+### Changed
+- The package is typed (`py.typed`) and checked with mypy in CI. Coverage is measured in CI and must stay at 84% or more. CI also runs the suite on Windows (required) and macOS (experimental).
+- Classifiers say Linux and Windows instead of "OS Independent".
+- The worker's Lua scripts moved to `pytaskq/worker_scripts.py` (still importable from `pytaskq.worker`).
+- Added `SECURITY.md`, `CODE_OF_CONDUCT.md`, issue and pull request templates, Dependabot and a pre-commit configuration. `[dev]` now includes mypy, pytest-cov and pre-commit.
+- Code comments trimmed: release history and issue references removed, contracts kept.
+- Tests that start real workers keep the existing `PYTHONPATH` instead of replacing it. CI also runs on Python 3.14.
+
 ## 0.6.0 — 2026-11-24
 
 Fixes everything two break tests of 0.5.0 found (#3: D1–D11, #4: E1–E11), and adds workflows. New guide: `docs/WORKFLOWS.md`; `docs/UPGRADING.md` has a 0.5.0 → 0.6.0 section.

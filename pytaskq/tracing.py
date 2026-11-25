@@ -15,19 +15,12 @@ What one trace shows:
                 └─ enqueue _deliver_webhook                  (follow-up job)
                      └─ run _deliver_webhook
 
-How the trace crosses Redis: a queued job is just JSON, so there are no HTTP
-headers to carry the trace. When a job is queued, the current trace context is
-written into the job as `trace_carrier` ({"traceparent": "00-<trace>-<span>-01"});
-the worker reads it back and continues the same trace.
+The trace context travels inside the job as `trace_carrier` (a job is JSON, with no HTTP
+headers); the worker continues the same trace. `task.delay()` inside your own span, and a
+`traceparent` header sent to the API, join your trace.
 
-If your own app already uses OpenTelemetry, `task.delay()` called inside one of
-your spans joins your trace too, and a `traceparent` header sent to the REST API
-is continued.
-
-Privacy: spans record task names, job ids, attempt numbers, worker ids, the
-route template (`/task/{task_id}`) and status codes. They never record URLs
-(invite links carry secrets in their path), query strings, headers, request
-bodies or job arguments.
+Privacy: spans never record URLs (invite links carry secrets in their path), query strings,
+headers, request bodies or job arguments.
 """
 
 from __future__ import annotations

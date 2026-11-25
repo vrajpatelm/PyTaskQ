@@ -1,6 +1,8 @@
 # Runs on every push to main and on every pull request.
 # Independent jobs, so one failure doesn't hide the others:
-#   tests     – the pytest suite on the oldest and newest supported Pythons
+#   tests     – the pytest suite on the oldest and newest supported Pythons, with a coverage floor
+#   other-os  – the suite on Windows (required) and macOS (experimental)
+#   typecheck – mypy over the package
 #   lint      – ruff, limited to rules that catch real bugs (not style)
 #   dashboard – lints and builds the React dashboard, and checks that the
 #               bundle committed in pytaskq/static matches the source
@@ -25,8 +27,8 @@ concurrency:
 
 jobs:
   tests:
-    # Both ends of what we support: the oldest Python with the oldest redis-py we allow, and the newest of
-    # both (redis-py 8 changed connection timeouts; break test D1 slipped through when only one was tested).
+    # The oldest Python with the oldest redis-py we allow, and the newest of both.
+    # The 3.12 run also measures coverage and fails below the floor.
     name: Tests (Python ${{ matrix.python }}, redis-py ${{ matrix.redis }})
     runs-on: ubuntu-latest
     strategy:
@@ -34,8 +36,9 @@ jobs:
       matrix:
         include:
           - { python: "3.10", redis: "5.0.8" }
-          - { python: "3.12", redis: "6.4.0" }
+          - { python: "3.12", redis: "6.4.0", coverage: true }
           - { python: "3.13", redis: "latest" }
+          - { python: "3.14", redis: "latest" }
     steps:
       - uses: actions/checkout@v4
 
@@ -55,7 +58,45 @@ jobs:
           python -c "import redis; print('redis-py', redis.__version__)"
 
       - name: Run tests
+        if: ${{ !matrix.coverage }}
         run: python -m pytest -q
+
+      - name: Run tests with coverage
+        if: ${{ matrix.coverage }}
+        run: python -m pytest -q --cov --cov-report=term --cov-fail-under=84
+
+  other-os:
+    # The suite without a real Redis server (those tests skip). Windows is supported for development;
+    # macOS is checked but not yet claimed, so its result doesn't fail the build.
+    name: Tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    continue-on-error: ${{ matrix.experimental }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: windows-latest, experimental: false }
+          - { os: macos-latest, experimental: true }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: python -m pip install --upgrade pip && pip install -r requirements.txt
+      - run: python -m pytest -q
+
+  typecheck:
+    name: Type check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: python -m pip install --upgrade pip && pip install -e ".[dev]"
+      - run: mypy
 
   lint:
     name: Lint

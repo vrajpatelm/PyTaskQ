@@ -89,7 +89,7 @@ Send an `Idempotency-Key` header to make a retried request safe: the same key (w
 ## What it guarantees
 
 - **The next stage starts exactly once.** When a step finishes, one Lua script records its result and, only for the last step of its stage, moves the workflow on. Two steps finishing at the same moment can't both start the next stage, or neither.
-- **No lost stages.** The next stage's steps have fixed ids, so queuing one twice is impossible. If a worker dies right after finishing a stage but before queuing the next one, the leader notices within a minute and queues the missing steps. If it dies after saving a step's result but before telling the workflow, the leader counts that step from its job record (with its result) instead of running it again.
+- **No lost stages.** The next stage's steps have fixed ids, so queuing one twice is impossible. If a worker dies right after finishing a stage but before queuing the next one, the leader notices within a minute and queues the missing steps, however many workflows there are. If it dies after saving a step's result but before telling the workflow, the leader counts that step from its job record (with its result) instead of running it again.
 - **A step that runs twice** (a crash, a re-sent reply) is counted once, and a step that's already counted is never run again by the leader, even after its job record expired or was trimmed.
 - **Cancelled means cancelled.** Once a workflow is cancelled, none of its remaining steps starts.
 - Results are passed through Redis as JSON, so they must fit `MAX_RESULT_BYTES` (1 MB) and be JSON-able (other values arrive as their text). For bigger data, return a location (a file path, an S3 key).

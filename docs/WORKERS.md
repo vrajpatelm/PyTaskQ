@@ -130,7 +130,7 @@ Docker's own limit is 10 seconds by default, after which it kills the worker out
 
 ## When a worker crashes
 
-Each worker sends a heartbeat every `WORKER_HEARTBEAT_TTL / 3` seconds (10 by default). One worker, the leader, checks every 10 seconds for workers whose heartbeat is older than `WORKER_HEARTBEAT_TTL` (30 s) and puts their jobs back at the front of their queues. A job is therefore picked up again within about 40 seconds of its worker crashing.
+Each worker sends a heartbeat every `WORKER_HEARTBEAT_TTL / 3` seconds (10 by default). One worker, the leader, checks every 10 seconds for workers whose heartbeat is older than `WORKER_HEARTBEAT_TTL` (30 s) and puts their jobs back at the front of their queues. A job is therefore picked up again within about 40 seconds of its worker crashing. The crashed worker's CPU processes notice within a second that it's gone and exit, so they don't keep running (and holding memory) on their own.
 
 **Faster recovery with a worker name.** Give each worker a stable name and a restarted worker puts its own unfinished jobs back the moment it starts:
 

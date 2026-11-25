@@ -2,28 +2,12 @@
 pytaskq.pools — where task code runs
 =====================================
 
-A worker runs `type="cpu"` tasks in separate processes (real parallelism, no
-GIL) and `type="io"` tasks in threads. Both pools are built so that one bad
-job can't break the worker:
+`type="cpu"` tasks run in separate processes, `type="io"` tasks in threads.
 
-* **A job only starts its clock when it really starts.** A job waits for a
-  free process or thread first, and its `timeout` counts from the moment its
-  function is called. Before 0.4.1, a burst of CPU jobs timed out while
-  waiting in line, without ever running.
-
-* **CPU jobs that time out are stopped.** Each CPU process runs one job at a
-  time and the pool knows which job each process runs, so a hung job's process
-  is killed and replaced. The other jobs keep running.
-
-* **A crashed process is replaced.** When the process running a job dies (the
-  out-of-memory killer, a crashing C extension, `os._exit`), that job fails
-  with a clear error, gets its normal retries, and a fresh process takes the
-  slot. Before 0.4.1 this froze the whole worker.
-
-* **Threads can't be stopped, so they're counted.** Python has no way to kill
-  a thread. An IO job that times out keeps its thread until its function
-  returns, and that thread isn't given new work meanwhile. The worker reports
-  these "stuck" threads; IO tasks should set their own network timeouts.
+* A job's `timeout` counts from when its function is called, not while it waits for a slot.
+* Each CPU process runs one job at a time; a timed-out job's process is killed and replaced.
+* A crashed CPU process fails only its own job and is replaced.
+* Threads can't be stopped: a timed-out IO job keeps its thread ("stuck") until it returns.
 """
 
 from __future__ import annotations
@@ -81,8 +65,29 @@ def _send_error(conn, exc: BaseException, prefix: str = "") -> None:
         conn.send(("err", None, type(exc).__name__, message, tb))
 
 
+PARENT_CHECK = 1.0      # seconds between a CPU process's checks that its worker is still alive
+
+
+def _exit_with_parent() -> None:
+    """
+    Exit when the worker dies (kill -9, OOM). A forked process inherits the parent's ends of the
+    pipes, so it never sees its own pipe close; on POSIX its parent id changes when it's orphaned.
+    """
+    if os.name == "nt":
+        return              # spawned processes inherit no pipes: the closed pipe ends them
+    parent = os.getppid()
+
+    def watch():
+        while True:
+            time.sleep(PARENT_CHECK)
+            if os.getppid() != parent:
+                os._exit(1)
+    threading.Thread(target=watch, name="pytaskq-parent-watch", daemon=True).start()
+
+
 def _child_main(conn, modules: tuple) -> None:
     """One CPU process: import the app, then run one job at a time until told to stop."""
+    _exit_with_parent()
     # The worker handles Ctrl+C and SIGTERM itself and decides what happens to
     # running jobs, so a terminal's Ctrl+C mustn't kill jobs half-way.
     try:
@@ -221,9 +226,8 @@ class CpuPool:
     """
     A fixed number of processes for type="cpu" tasks, each running one job at a time.
 
-    Unlike `concurrent.futures.ProcessPoolExecutor`, it knows which process runs
-    which job: a job that times out or crashes costs only its own process,
-    which is replaced, and the pool never becomes unusable.
+    Unlike ProcessPoolExecutor, it knows which process runs which job, so a job that
+    times out or crashes costs only its own process, which is replaced.
     """
 
     def __init__(self, size: int, modules: tuple = (), mp_context=None):
@@ -309,6 +313,7 @@ class CpuPool:
                 await loop.run_in_executor(self._threads, fresh.kill)
                 return
             self.restarts += 1
+            assert self._idle is not None            # set by start()
             self._idle.put_nowait(fresh)
             return
         self.broken_reason = "The worker couldn't start new CPU processes."
@@ -408,10 +413,8 @@ class IoPool:
     """
     Threads for type="io" tasks (and for type="cpu" when there's no process pool).
 
-    A job holds its thread slot until its function returns, even after its
-    timeout: Python can't stop a thread, and giving that thread's slot to a new
-    job would only make the new job wait behind the stuck one (and time out
-    without running). `stuck` counts those threads.
+    A job holds its slot until its function returns, even after its timeout (Python
+    can't stop a thread); `stuck` counts those threads.
     """
 
     def __init__(self, size: int, executor: Optional[ThreadPoolExecutor] = None):
@@ -470,13 +473,14 @@ class IoPool:
     def _hold_until_done(self, cf, fut, label) -> None:
         key = id(cf)
         self.stuck[key] = (label[0], label[1], time.time())
-        loop = self._loop
+        loop, free = self._loop, self._free
+        assert loop is not None and free is not None      # set by _slots() before any job runs
         fut.add_done_callback(lambda f: f.cancelled() or f.exception())   # don't warn about an unread error
 
         def finished(_):
             def release():
                 if self.stuck.pop(key, None) is not None:
-                    self._free.release()
+                    free.release()
             try:
                 loop.call_soon_threadsafe(release)
             except RuntimeError:

@@ -6,26 +6,19 @@ Start one (or many, on many machines) with:
 
     pytaskq worker --app myproject.tasks:queue
 
-Each worker serves a set of named queues (by default, the queues its own tasks
-live on; or `--queues a,b`). It pops jobs in strict priority order (high →
-default → low), taking turns between its queues at the same priority, runs them
-in a process pool (type="cpu"), a thread pool (type="io") or directly on the
-event loop (async def), and records status, timings and results in Redis.
-Background loops (only on the elected leader) handle cron schedules, delayed
-retries and recovery of tasks from crashed workers.
+Each worker serves a set of named queues (its tasks' queues, or `--queues a,b`).
+It pops jobs by weighted priority (PRIORITY_WEIGHTS), runs them in a process
+pool (type="cpu"), a thread pool (type="io") or on the event loop (async def),
+and records the outcome in Redis. Background loops on the elected leader handle
+cron, delayed jobs and recovery from crashed workers.
 
-How a job is kept safe (0.4.1):
-  * A job sits in this worker's `processing_queue` from the moment it's popped
-    until its outcome is written. The outcome and the removal from that list
-    are ONE Lua script, so a job can't end up "finished but still listed" or
-    "listed as finished but lost". If Redis is unreachable at that moment, the
-    worker keeps the outcome in memory and retries until Redis is back.
-  * The heartbeat runs in its own thread with its own Redis connection, so a
-    task that blocks the event loop doesn't make a healthy worker look dead
-    (which used to make the same job run twice). The same thread warns when
-    the event loop is blocked, naming the task responsible.
-  * Times other machines compare against (heartbeats, retry and schedule
-    times) use Redis's clock, not this machine's.
+How a job is kept safe:
+  * A popped job stays in this worker's `processing_queue` until its outcome is
+    written; the outcome and the removal are one Lua script. If Redis is down
+    then, the outcome is kept in memory and retried.
+  * The heartbeat runs in its own thread with its own connection, so a blocked
+    event loop doesn't make a healthy worker look dead.
+  * Times compared across machines use Redis's clock.
 """
 
 import asyncio
@@ -36,11 +29,12 @@ import random
 import re
 import signal
 import socket
+import sys
 import threading
 import time
 import uuid
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Any, Optional
 
 import croniter
 from opentelemetry import trace
@@ -53,14 +47,13 @@ from pytaskq.core import fleet
 from pytaskq.core import queueing
 from pytaskq.core import redis_client
 from pytaskq.core import redis_health
-from pytaskq.core.redis_health import OOM_PROBE
 from pytaskq.core.config import settings
 from pytaskq.pools import CpuPool, IoPool, PoolBroken, ProcessCrashed, TaskTimeoutError  # noqa: F401  (re-exported)
 from pytaskq.schemas.requests import Taskloader, Taskresult  # noqa: F401  (Taskresult kept for API compat)
 from pytaskq.tracing import extract_trace_context, init_tracer, inject_trace_context  # noqa: F401  (re-exported)
 from pytaskq.core.keys import fill_scripts, k as rkey, strip as strip_prefix
 
-TASKS = {}
+TASKS: dict[str, dict] = {}
 APP_NAME = ""
 QUEUES: list[str] = []          # the queues this worker serves (set at startup)
 QUEUES_OVERRIDE = ""            # `pytaskq worker --queues a,b` (else WORKER_QUEUES, else its tasks' queues)
@@ -91,7 +84,7 @@ logging.basicConfig(
 logger = logging.getLogger("worker")
 
 HOSTNAME = socket.gethostname()
-BOOT_ID = uuid.uuid4().hex          # this run of this worker process (break test E6)
+BOOT_ID = uuid.uuid4().hex          # this run of this worker process
 WORKER_ID = f"{HOSTNAME}-{os.getpid()}-{uuid.uuid4().hex[:6]}"
 TASK_TIMEOUT = float(os.getenv("TASK_TIMEOUT", str(settings.TASK_TIMEOUT)))
 HEARTBEAT_TTL = max(3, int(settings.WORKER_HEARTBEAT_TTL))
@@ -133,16 +126,15 @@ def resolve_queues(explicit: str = "") -> list[str]:
     return list(dict.fromkeys(names))
 
 
-def priority_schedule(setting: str = None) -> list[str]:
+def priority_schedule(setting: Optional[str] = None) -> list[str]:
     """
     Which priority each pop prefers, in turn: the PRIORITY_WEIGHTS cycle.
 
     "6,3,1" (the default) gives a cycle of 10 where 6 pops prefer high, 3
     default and 1 low, spread out (smooth weighted round-robin:
     high, default, high, low, high, default, high, high, default, high…).
-    A pop whose preferred priority is empty takes the next one, so with only
-    one kind of job waiting, every pop takes it. Strict priority ("strict")
-    made low and default jobs wait forever while high ones kept arriving.
+    A pop whose preferred priority is empty takes the next one. "strict" always
+    prefers high, which can starve default and low.
     """
     raw = (settings.PRIORITY_WEIGHTS if setting is None else setting).strip().lower()
     if raw == "strict":
@@ -198,7 +190,7 @@ def pop_call(queues: list[str], turn: int = 0) -> list:
     return [len(keys) + 2, _processing_key(), *keys, queueing.PAUSED_KEY, *names]
 
 
-def cron_zone(name: str):
+def cron_zone(name: Optional[str]):
     """A tzinfo for a cron time zone name ("UTC" works even without a time zone database)."""
     if not name or name.strip().upper() == "UTC":
         return timezone.utc
@@ -220,7 +212,7 @@ def worker_name(raw: str) -> str:
 
 shutdown_event = asyncio.Event()
 _hard_stop = asyncio.Event()        # the shutdown grace period is over: stop retrying, stop waiting
-active_tasks = set()
+active_tasks: set[asyncio.Task] = set()
 _running: dict[str, str] = {}       # task id → task name, for jobs running right now
 _running_async: dict[str, str] = {}  # the same, for async tasks (they run on the event loop)
 _loop_tick = time.monotonic()       # updated every second by the event loop (watchdog)
@@ -229,428 +221,12 @@ _started_at = 0.0
 tracer = init_tracer("pytaskq-worker")
 _pools: dict = {"cpu": None, "io": None}
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Lua scripts. Each one is a single atomic step in Redis.
-# ─────────────────────────────────────────────────────────────────────────────
-
-# Kept for compatibility (0.4.0 used it for results). KEYS: fence, task hash
-FENCE_SCRIPT = """
-local current = redis.call('get', KEYS[1])
-if current == false or current == ARGV[1] then
-    redis.call('hset', KEYS[2], 'task_id', ARGV[2], 'status', ARGV[3], 'result', ARGV[4])
-    redis.call('expire', KEYS[2], tonumber(ARGV[5]) or 86400)
-    return 1
-else
-    return 0
-end
-"""
-
-# On timeout, invalidate this attempt — but only if it still owns the job.
-# If the sweeper already handed the job to another worker, bumping the fence
-# would wrongly make THIS attempt's retry the current one. Returns -1 then.
-TIMEOUT_FENCE_SCRIPT = OOM_PROBE + """
-local current = redis.call('get', KEYS[1])
-if current == false or current == ARGV[1] then
-    local token = redis.call('incr', KEYS[1])
-    redis.call('expire', KEYS[1], 86400)
-    return token
-end
-return -1
-"""
-
-# Starts with OOM_PROBE: taking a job must work when Redis is full, since
-# finishing jobs is what frees memory (moving a job uses no extra memory).
-# KEYS: processing list, the queue lists in order [, paused-queues hash]
-# ARGV (optional): the queue name of each list. With it, a paused queue is skipped here, in the same
-# step as the pop, so pausing takes effect at once (workers' cached copy only saves them idle checks).
-PRIORITY_POP_SCRIPT = OOM_PROBE + """
-local dest = KEYS[1]
-local last, paused, skip = #KEYS, nil, {}
-if #ARGV > 0 then
-    paused, last = KEYS[#KEYS], #KEYS - 1
-end
-for i = 2, last do
-    local name = ARGV[i - 1]
-    if paused and skip[name] == nil then
-        skip[name] = redis.call('HEXISTS', paused, name) == 1
-    end
-    if not (paused and skip[name]) then
-        local val = redis.call('RPOPLPUSH', KEYS[i], dest)
-        if val then
-            return val
-        end
-    end
-end
-return nil
-"""
-
-# Take or keep the leader lock, in one step (a GET then EXPIRE could extend
-# another worker's lock).  KEYS: lock   ARGV: worker id, seconds
-LEADER_SCRIPT = OOM_PROBE + """
-if redis.call('SET', KEYS[1], ARGV[1], 'NX', 'EX', tonumber(ARGV[2])) then return 1 end
-if redis.call('GET', KEYS[1]) == ARGV[1] then
-    redis.call('EXPIRE', KEYS[1], tonumber(ARGV[2]))
-    return 1
-end
-return 0
-"""
-
-# A job succeeded: save the result and take it off this worker's processing list.
-# KEYS: processing list, fence, task hash, worker hash, completed counter, finished-jobs set
-# ARGV: payload, my fence token, strict (1 = a retry after a lost reply), task id, result,
-#       finished_at, duration_ms, result_dropped, result TTL, jobs kept, task-key prefix
-# Returns 1 saved, 0 stale attempt (a newer one owns the job), -1 nothing to do (already done).
-COMPLETE_SCRIPT = queueing.KEEP_LUA + """
-local removed = redis.call('LREM', KEYS[1], 1, ARGV[1])
--- Already done by this very call: the client re-sent it after losing the reply (break test E4).
-if removed == 0 and (ARGV[3] == '1' or redis.call('HGET', KEYS[3], 'status') == 'Success') then return -1 end
-local current = redis.call('GET', KEYS[2])
-if current and current ~= ARGV[2] then
-    redis.call('PUBLISH', '__PYTASKQ__events:global', 'update')
-    return 0
-end
-redis.call('HSET', KEYS[3], 'task_id', ARGV[4], 'status', 'Success', 'result', ARGV[5],
-           'finished_at', ARGV[6], 'duration_ms', ARGV[7], 'error', '')
-if ARGV[8] ~= '' then
-    redis.call('HSET', KEYS[3], 'result_dropped', ARGV[8])
-else
-    redis.call('HDEL', KEYS[3], 'result_dropped')
-end
-redis.call('EXPIRE', KEYS[3], tonumber(ARGV[9]))
-pytaskq_keep(KEYS[6], ARGV[4], ARGV[6], tonumber(ARGV[10]), ARGV[11])
-redis.call('INCR', KEYS[5])
-redis.call('HINCRBY', KEYS[4], 'processed', 1)
-redis.call('PUBLISH', '__PYTASKQ__events:global', 'update')
-return 1
-"""
-
-# A job failed: schedule its retry or dead-letter it, and take it off the processing list.
-# KEYS: processing list, fence, task hash, dlq or delayed set, worker hash, failed counter, finished-jobs set
-# ARGV: payload, my fence token, strict, "dead" | "retry", dlq entry or retry payload, retry due time,
-#       hash TTL ("" = keep until finished), dead-letter limit, task id, now, jobs kept, task-key prefix,
-#       then task hash fields (name, value, …)
-# Returns 1 recorded, 2 recorded and old dead letters trimmed, 0 stale attempt, -1 already done.
-FAIL_SCRIPT = queueing.KEEP_LUA + """
-local unpack = unpack or table.unpack
-local removed = redis.call('LREM', KEYS[1], 1, ARGV[1])
-if removed == 0 then
-    -- Already recorded by this very call (a re-sent script after a lost reply, break test E4):
-    -- never a second dead letter or a second retry.
-    local st = redis.call('HGET', KEYS[3], 'status')
-    if ARGV[3] == '1' or st == 'RetryScheduled' or st == 'DeadLetter' then return -1 end
-end
-local current = redis.call('GET', KEYS[2])
-if current and current ~= ARGV[2] then
-    redis.call('PUBLISH', '__PYTASKQ__events:global', 'update')
-    return 0
-end
-redis.call('INCR', KEYS[6])
-redis.call('HINCRBY', KEYS[5], 'failed', 1)
-local trimmed = 0
-if ARGV[4] == 'dead' then
-    redis.call('LPUSH', KEYS[4], ARGV[5])
-    local limit = tonumber(ARGV[8])
-    if limit > 0 and redis.call('LLEN', KEYS[4]) > limit then
-        redis.call('LTRIM', KEYS[4], 0, limit - 1)
-        trimmed = 1
-    end
-else
-    redis.call('ZADD', KEYS[4], ARGV[6], ARGV[5])
-end
-redis.call('HSET', KEYS[3], unpack(ARGV, 13))
-if ARGV[7] == '' then
-    redis.call('PERSIST', KEYS[3])
-else
-    redis.call('EXPIRE', KEYS[3], tonumber(ARGV[7]))
-    pytaskq_keep(KEYS[7], ARGV[9], ARGV[10], tonumber(ARGV[11]), ARGV[12])
-end
-redis.call('PUBLISH', '__PYTASKQ__events:global', 'update')
-return 1 + trimmed
-"""
-
-# Put a job from a processing list back on its queue (crashed or stopped worker,
-# or a job this worker can't run right now). Only if it's still in that list,
-# so a job that just finished is never queued again.
-# KEYS: processing list, fence, target list, task hash, queue-name set, the queue's wake list
-# ARGV: payload as listed, new payload, fence value read before ("" = none), new fence, note, "front" | "back",
-#       queue name
-# Returns 1 put back, 2 was already finished (entry dropped), 0 not in the list, -2 fence changed (read again).
-PUT_BACK_SCRIPT = queueing.WAKE_LUA + """
-local current = redis.call('GET', KEYS[2])
-if (current or '') ~= ARGV[3] then return -2 end
-if redis.call('LREM', KEYS[1], 1, ARGV[1]) == 0 then return 0 end
-local status = redis.call('HGET', KEYS[4], 'status')
-if status == 'Success' or status == 'DeadLetter' or status == 'Cancelled' or status == 'Failed' then
-    return 2
-end
-redis.call('SET', KEYS[2], ARGV[4], 'EX', 86400)
-if ARGV[6] == 'front' then
-    redis.call('RPUSH', KEYS[3], ARGV[2])
-else
-    redis.call('LPUSH', KEYS[3], ARGV[2])
-end
-redis.call('SADD', KEYS[5], ARGV[7])
-pytaskq_wake(KEYS[6], 100)
-if status then
-    redis.call('HSET', KEYS[4], 'status', 'Queued', 'payload', ARGV[2], 'note', ARGV[5])
-    redis.call('HDEL', KEYS[4], 'started_at', 'worker_id')
-    redis.call('PERSIST', KEYS[4])
-end
-redis.call('PUBLISH', '__PYTASKQ__events:global', 'update')
-return 1
-"""
-
-# This worker lacks the job's task: send it back through the delayed set.
-# KEYS: processing list, delayed set, task hash
-# ARGV: payload as listed, new payload, due, note [, the field to write it to (default "note")]
-HAND_BACK_SCRIPT = """
-if redis.call('LREM', KEYS[1], 1, ARGV[1]) == 0 then return 0 end
-redis.call('ZADD', KEYS[2], ARGV[3], ARGV[2])
-redis.call('HSET', KEYS[3], 'status', 'Queued', 'payload', ARGV[2], ARGV[5] or 'note', ARGV[4])
-redis.call('PERSIST', KEYS[3])
-return 1
-"""
-
-# A cancelled job stopped while running. KEYS: processing list, fence, task hash, finished set, cancel request
-# ARGV: payload as listed, fence token, retrying after a lost reply, task id, now, ttl, keep limit, task key
-# prefix, note, duration (ms)
-CANCELLED_RUN_SCRIPT = queueing.KEEP_LUA + """
-local removed = redis.call('LREM', KEYS[1], 1, ARGV[1])
-if removed == 0 and (ARGV[3] == '1' or redis.call('HGET', KEYS[3], 'status') == 'Cancelled') then return -1 end
-local current = redis.call('GET', KEYS[2])
-if current and current ~= ARGV[2] then return 0 end
-local by = redis.call('GET', KEYS[5])
-redis.call('HSET', KEYS[3], 'status', 'Cancelled', 'finished_at', ARGV[5], 'note', ARGV[9], 'error', '',
-           'duration_ms', ARGV[10])
-if by then redis.call('HSET', KEYS[3], 'cancelled_by', by) end
-redis.call('EXPIRE', KEYS[3], tonumber(ARGV[6]))
-pytaskq_keep(KEYS[4], ARGV[4], ARGV[5], tonumber(ARGV[7]), ARGV[8])
-redis.call('DEL', KEYS[5])
-redis.call('PUBLISH', '__PYTASKQ__events:global', 'update')
-return 1
-"""
-
-# A running job's latest progress, only while it's still this worker's and running.
-# KEYS: task hash   ARGV: worker id, percent ("" = unchanged), message ("" = unchanged), when
-PROGRESS_SCRIPT = """
-if redis.call('HGET', KEYS[1], 'status') ~= 'Processing' or redis.call('HGET', KEYS[1], 'worker_id') ~= ARGV[1] then
-  return 0
-end
-if ARGV[2] ~= '' then redis.call('HSET', KEYS[1], 'progress', ARGV[2]) end
-if ARGV[3] ~= '' then redis.call('HSET', KEYS[1], 'progress_message', ARGV[3]) end
-redis.call('HSET', KEYS[1], 'progress_at', ARGV[4])
-return 1
-"""
-
-# max_concurrency: a fleet-wide count of running jobs per task, as leases that run out if a worker
-# dies (its heartbeat renews them while the job runs). Each attempt has its own lease, so a retry
-# can't reuse the lease of an attempt that's still running (break test D3).
-# KEYS: the task's lease set, its waiting list   ARGV: lease id, now, lease expiry, limit, key ttl (ms),
-# this job's entry in the waiting list ("" = none), "<task id>@promoted".   Returns 1 (go) or 0 (full).
-LEASE_SCRIPT = """
-redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', ARGV[2])
--- A finishing job kept its place for this job (the one that waited longest): take it over.
-local promoted = redis.call('ZREM', KEYS[1], ARGV[7]) == 1
-if not promoted and not redis.call('ZSCORE', KEYS[1], ARGV[1]) and redis.call('ZCARD', KEYS[1]) >= tonumber(ARGV[4]) then
-  return 0
-end
-redis.call('ZADD', KEYS[1], ARGV[3], ARGV[1])
-redis.call('PEXPIRE', KEYS[1], ARGV[5])
-if ARGV[6] ~= '' then redis.call('ZREM', KEYS[2], ARGV[6]) end
-return 1
-"""
-
-# A max_concurrency job that has to wait: back to the delayed set as a fallback, and into the task's
-# waiting list (oldest first), from which a finishing job promotes the next one at once (break test D6).
-# KEYS: processing list, delayed set, task hash, waiting list
-# ARGV: payload as listed, new payload, fallback due time, why it waits, waiting-list entry, waiting since
-WAIT_FOR_LEASE_SCRIPT = """
-if redis.call('LREM', KEYS[1], 1, ARGV[1]) == 0 then return 0 end
-redis.call('ZADD', KEYS[2], ARGV[3], ARGV[2])
-redis.call('ZADD', KEYS[4], ARGV[6], ARGV[5])
-redis.call('PEXPIRE', KEYS[4], 604800000)
-redis.call('HSET', KEYS[3], 'status', 'Queued', 'payload', ARGV[2], 'waiting_for', ARGV[4])
-redis.call('PERSIST', KEYS[3])
-return 1
-"""
-
-# A max_concurrency lease is given back: free the place and move the job that has waited longest
-# from the delayed set onto its queue now, keeping the place for it (so a newer job can't take it
-# first). Waiting-list entries are "queue list\nwake list\ntask id\npayload"; an entry whose job
-# already left the delayed set (its fallback time came, or it was cancelled) is skipped.
-# KEYS: lease set, waiting list, delayed set   ARGV: lease id, now, seconds the place is kept
-RELEASE_SCRIPT = queueing.WAKE_LUA + """
-redis.call('ZREM', KEYS[1], ARGV[1])
-for i = 1, 20 do
-    local first = redis.call('ZRANGE', KEYS[2], 0, 0)[1]
-    if not first then return 0 end
-    redis.call('ZREM', KEYS[2], first)
-    local a = string.find(first, '\\n', 1, true)
-    local b = a and string.find(first, '\\n', a + 1, true)
-    local c = b and string.find(first, '\\n', b + 1, true)
-    if c then
-        local payload = string.sub(first, c + 1)
-        if redis.call('ZREM', KEYS[3], payload) == 1 then
-            redis.call('ZADD', KEYS[1], tonumber(ARGV[2]) + tonumber(ARGV[3]),
-                       string.sub(first, b + 1, c - 1) .. '@promoted')
-            redis.call('RPUSH', string.sub(first, 1, a - 1), payload)
-            pytaskq_wake(string.sub(first, a + 1, b - 1), 100)
-            return 1
-        end
-    end
-end
-return 0
-"""
-
-# rate_limit: starts are spread evenly, at least one gap apart, across the fleet.
-# A job reserves a start time ("turn") one gap after the latest turn handed out, waits in the delayed
-# set until then (once, no polling), and when it's about to start, checks that its turn is really
-# due and that the previous start was at least one gap ago; otherwise it gets a new turn. So turns
-# that passed while a queue was paused, a worker was busy or a job sat in the DLQ can't make jobs
-# start all at once (break test D4). Turns are kept per job in a sorted set, so a cancelled job gives
-# its turn back (D8).
-# KEYS: the task's turns, its last start   ARGV: now, seconds between starts, task id, this job's turn ("")
-# Returns "go" (start now; recorded as the latest start) or the time of its (new) turn.
-RATE_SCRIPT = """
-local now, gap = tonumber(ARGV[1]), tonumber(ARGV[2])
-redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', now - 2 * gap - 1)
-local last_start = tonumber(redis.call('GET', KEYS[2]) or '0')
-local mine = tonumber(ARGV[4] ~= '' and ARGV[4] or redis.call('ZSCORE', KEYS[1], ARGV[3]) or '')
-local ttl = math.ceil(3 * gap * 1000) + 60000
-if mine and mine > now + 0.05 then
-    if redis.call('ZSCORE', KEYS[1], ARGV[3]) then return string.format('%.6f', mine) end   -- not yet
-    mine = nil                                              -- its turn is gone: a new one below
-end
-local function start()
-    redis.call('SET', KEYS[2], string.format('%.6f', now), 'PX', ttl)
-    redis.call('ZADD', KEYS[1], now, ARGV[3])
-    redis.call('PEXPIRE', KEYS[1], ttl)
-    return 'go'
-end
-if mine and now >= last_start + gap * 0.999 then return start() end
-redis.call('ZREM', KEYS[1], ARGV[3])
-local slot = math.max(now, last_start + gap)
-local latest = redis.call('ZREVRANGE', KEYS[1], 0, 0, 'WITHSCORES')
-if latest[2] then slot = math.max(slot, tonumber(latest[2]) + gap) end
-if slot <= now + 0.05 then return start() end
-redis.call('ZADD', KEYS[1], slot, ARGV[3])
-redis.call('PEXPIRE', KEYS[1], math.ceil((slot - now) * 1000) + ttl)
-return string.format('%.6f', slot)
-"""
-
-# Move a batch of due jobs from the delayed set onto their queues, only while a
-# queue has room (QUEUE_CAPACITY), so a big backlog can't flood one queue.
-# KEYS: delayed set, queue-name set, each queue's 3 lists, each queue's wake list, then per job: target list,
-#       task hash
-# ARGV: capacity (0 = none), number of queues, the queue names, then per job: payload, queue index (1-based)
-# Returns {moved, skipped because the queue was full}
-PROMOTE_SCRIPT = queueing.WAKE_LUA + """
-local cap = tonumber(ARGV[1])
-local nq = tonumber(ARGV[2])
-local counts = {}
-local used = {}
-local moved, full = 0, 0
-local base = 2 + nq * 4
-local first = 2 + nq
-local n = (#ARGV - first) / 2
-for i = 1, n do
-    local raw = ARGV[first - 1 + 2 * i]
-    local qi = tonumber(ARGV[first + 2 * i])
-    local room = true
-    if cap > 0 then
-        if counts[qi] == nil then
-            local k = 2 + (qi - 1) * 3
-            counts[qi] = redis.call('LLEN', KEYS[k + 1]) + redis.call('LLEN', KEYS[k + 2])
-                         + redis.call('LLEN', KEYS[k + 3])
-        end
-        room = counts[qi] < cap
-    end
-    if not room then
-        full = full + 1
-    elseif redis.call('ZREM', KEYS[1], raw) == 1 then
-        redis.call('LPUSH', KEYS[base + 2 * i - 1], raw)
-        if cap > 0 then counts[qi] = counts[qi] + 1 end
-        local hash = KEYS[base + 2 * i]
-        local status = redis.call('HGET', hash, 'status')
-        if status == 'Scheduled' or status == 'RetryScheduled' then
-            redis.call('HSET', hash, 'status', 'Queued')
-        end
-        used[qi] = true
-        moved = moved + 1
-    end
-end
-for qi, _ in pairs(used) do
-    redis.call('SADD', KEYS[2], ARGV[2 + qi])
-    pytaskq_wake(KEYS[2 + nq * 3 + qi], 100)
-end
-if moved > 0 then redis.call('PUBLISH', '__PYTASKQ__events:global', 'update') end
-return {moved, full}
-"""
-
-# Something that isn't a valid job reached a queue or the delayed set: keep it
-# as a dead letter (so it can be looked at) instead of dropping it.
-# KEYS: source (list or delayed set), dlq, task hash, history, failed counter, finished-jobs set
-# ARGV: raw text, "list" | "zset", dead-letter entry, task id, error, time, result TTL, history limit, dlq limit,
-#       jobs kept, task-key prefix
-INVALID_SCRIPT = queueing.KEEP_LUA + """
-local removed
-if ARGV[2] == 'zset' then
-    removed = redis.call('ZREM', KEYS[1], ARGV[1])
-else
-    removed = redis.call('LREM', KEYS[1], 1, ARGV[1])
-end
-if removed == 0 then return 0 end
-redis.call('LPUSH', KEYS[2], ARGV[3])
-local limit = tonumber(ARGV[9])
-if limit > 0 and redis.call('LLEN', KEYS[2]) > limit then redis.call('LTRIM', KEYS[2], 0, limit - 1) end
-redis.call('HSET', KEYS[3], 'task_id', ARGV[4], 'task_name', '(invalid job)', 'status', 'DeadLetter',
-           'queue', 'default', 'error', ARGV[5], 'created_at', ARGV[6], 'finished_at', ARGV[6])
-redis.call('EXPIRE', KEYS[3], tonumber(ARGV[7]))
-pytaskq_keep(KEYS[6], ARGV[4], ARGV[6], tonumber(ARGV[10]), ARGV[11])
-redis.call('LPUSH', KEYS[4], ARGV[4])
-redis.call('LTRIM', KEYS[4], 0, tonumber(ARGV[8]) - 1)
-redis.call('INCR', KEYS[5])
-redis.call('PUBLISH', '__PYTASKQ__events:global', 'update')
-return 1
-"""
-
-# A job really starts: record it. (PERSIST first, so this works when Redis is full.)
-# KEYS: task hash   ARGV: field, value, …
-STARTED_SCRIPT = """
-local unpack = unpack or table.unpack
--- Cancelled while it waited, was put back or was handed over: don't start it (break test D5).
-if KEYS[2] and redis.call('EXISTS', KEYS[2]) == 1 then return 0 end
-redis.call('PERSIST', KEYS[1])
-redis.call('HDEL', KEYS[1], 'progress', 'progress_message', 'progress_at', 'waiting_for')   -- a retry starts from zero
-redis.call('HSET', KEYS[1], unpack(ARGV))
-redis.call('PUBLISH', '__PYTASKQ__events:global', 'update')
-return 1
-"""
-
-# "This worker is alive" (works when Redis is full).
-# KEYS: active_workers, worker hash, workers set, queue-name set
-# ARGV: worker id, alive until, hash TTL, number of queue names, queue names…, hash fields…
-HEARTBEAT_SCRIPT = OOM_PROBE + """
-local unpack = unpack or table.unpack
-redis.call('ZADD', KEYS[1], ARGV[2], ARGV[1])
-redis.call('SADD', KEYS[3], ARGV[1])
-local nq = tonumber(ARGV[4])
-if nq > 0 then redis.call('SADD', KEYS[4], unpack(ARGV, 5, 4 + nq)) end
-if #ARGV > 4 + nq then redis.call('HSET', KEYS[2], unpack(ARGV, 5 + nq)) end
-redis.call('EXPIRE', KEYS[2], tonumber(ARGV[3]))
-return 1
-"""
-
-# Forget a dead worker, unless it sent a heartbeat meanwhile.
-# KEYS: active_workers, worker hash, workers set   ARGV: worker id, now
-FORGET_WORKER_SCRIPT = """
-local score = redis.call('ZSCORE', KEYS[1], ARGV[1])
-if score and tonumber(score) > tonumber(ARGV[2]) then return 0 end
-redis.call('ZREM', KEYS[1], ARGV[1])
-redis.call('DEL', KEYS[2])
-redis.call('SREM', KEYS[3], ARGV[1])
-return 1
-"""
+from pytaskq.worker_scripts import (  # noqa: F401  (re-exported: worker.X_SCRIPT)
+    FENCE_SCRIPT, TIMEOUT_FENCE_SCRIPT, PRIORITY_POP_SCRIPT, LEADER_SCRIPT, COMPLETE_SCRIPT, FAIL_SCRIPT,
+    PUT_BACK_SCRIPT, HAND_BACK_SCRIPT, CANCELLED_RUN_SCRIPT, PROGRESS_SCRIPT, LEASE_SCRIPT,
+    WAIT_FOR_LEASE_SCRIPT, RELEASE_SCRIPT, RATE_SCRIPT, PROMOTE_SCRIPT, INVALID_SCRIPT, STARTED_SCRIPT,
+    HEARTBEAT_SCRIPT, FORGET_WORKER_SCRIPT,
+)
 
 
 def _processing_key(worker_id: Optional[str] = None) -> str:
@@ -671,11 +247,8 @@ def _as_int(value, default: int = 0) -> int:
 
 async def _with_retries(op, what: str, task_id: str = ""):
     """
-    Run `op(attempt)` until Redis answers.
-
-    Used for the writes that record what happened to a job. The outcome is
-    already in memory, so waiting for Redis to come back loses nothing, while
-    giving up would leave the job listed as "Processing" forever.
+    Run `op(attempt)` until Redis answers. Used for writes that record a job's outcome:
+    giving up would leave the job "Processing" forever.
     """
     attempt, delay = 0, 0.5
     while True:
@@ -721,8 +294,8 @@ async def cron_scheduler():
 
 CRON_LOCK_TTL = 3 * 3600
 CRON_STATE_KEY = rkey("pytaskq:cron")          # HASH task → the latest tick handled (Unix time)
-CRON_MISSED_KEY = rkey("pytaskq:cron:missed")
-CRON_SKIPPED_KEY = rkey("pytaskq:cron:skipped")      # ticks skipped because their queue was paused  # HASH task → missed ticks; "task:at" → when last noticed
+CRON_MISSED_KEY = rkey("pytaskq:cron:missed")       # HASH task → missed ticks; "task:at" → when last noticed
+CRON_SKIPPED_KEY = rkey("pytaskq:cron:skipped")      # HASH task → ticks skipped because their queue was paused
 MISSED_COUNT_LIMIT = 10_000
 
 
@@ -738,20 +311,13 @@ def _missed_ticks(cron_expr: str, zone, after: float, until: datetime) -> int:
     return count
 
 
-async def run_due_cron_jobs(now: float = None) -> int:
+async def run_due_cron_jobs(now: Optional[float] = None) -> int:
     """Queue every cron task whose latest tick is due (once per tick, fleet-wide).
 
-    Schedules are read in the task's `tz` (else CRON_TIMEZONE, UTC by default),
-    so "0 9 * * *" means 09:00 in that zone on every machine, whatever the
-    machine's own clock is set to, and every worker computes the same tick.
-    The tick lock, the job record and the push are one atomic step: a fast
-    worker can't finish the job before its record exists.
-
-    A tick is normally queued within a minute of its time. If no worker was
-    leading then (an outage, a long deploy), the ticks are missed: that's
-    logged and counted (Settings → Performance), and with catch_up (the
-    default) the latest missed tick runs once now. Before 0.5, missed ticks
-    were skipped without a word.
+    Schedules are read in the task's `tz` (else CRON_TIMEZONE), so every worker
+    computes the same tick. The tick lock, the record and the push are one
+    atomic step. Ticks missed while no worker led are logged and counted; with
+    catch_up the latest one runs once now.
     """
     r = redis_client.r
     now = clock.now() if now is None else now
@@ -777,13 +343,13 @@ async def run_due_cron_jobs(now: float = None) -> int:
             if late >= 60:
                 if last_at is None:
                     # First time this task is seen: no record of what ran before, so nothing to call missed.
-                    await r.hset(CRON_STATE_KEY, task_name, tick_at)
+                    await r.hset(CRON_STATE_KEY, task_name, repr(tick_at))
                     continue
                 missed = _missed_ticks(cron_expr, zone, last_at, prev_tick)
                 catch_up = task_info.get("catch_up")
                 catch_up = settings.CRON_CATCH_UP if catch_up is None else catch_up
                 await r.hincrby(CRON_MISSED_KEY, task_name, missed)
-                await r.hset(CRON_MISSED_KEY, f"{task_name}:at", now)
+                await r.hset(CRON_MISSED_KEY, f"{task_name}:at", repr(now))
                 logger.warning(
                     f"[Cron] {task_name} missed {missed} run(s) between "
                     f"{datetime.fromtimestamp(last_at, zone).isoformat()} and {prev_tick.isoformat()}: no worker "
@@ -791,57 +357,73 @@ async def run_due_cron_jobs(now: float = None) -> int:
                     + ("Running the latest one now (catch_up)." if catch_up else "Not catching up (catch_up=False).")
                 )
                 if not catch_up:
-                    await r.hset(CRON_STATE_KEY, task_name, tick_at)
+                    await r.hset(CRON_STATE_KEY, task_name, repr(tick_at))
                     continue
                 note = f"Late run for the {prev_tick.isoformat()} tick, which was missed (catch_up)."
-            # One run per LOCAL clock time: when clocks go back, 01:30 happens twice,
-            # and the second one finds the first one's lock (standard cron runs once too).
+            # One run per local clock time: when clocks go back, the repeated time finds the first lock.
             lock = rkey(f"cron_lock:{task_name}:{zone_name}:{prev_tick.strftime('%Y-%m-%dT%H:%M')}")
             queue = task_info.get("queue") or queueing.DEFAULT_QUEUE
             if queue in paused:
-                # A paused queue doesn't collect a run per tick to release all at once on resume
-                # (break test D10): the tick is skipped, counted and logged.
+                # Skip (and count) the tick, so a paused queue doesn't pile up runs for its resume.
                 if await r.set(lock, "skipped", nx=True, ex=CRON_LOCK_TTL):
                     await r.hincrby(CRON_SKIPPED_KEY, task_name, 1)
                     logger.info(f"[Cron] Skipped {task_name} for {prev_tick.isoformat()}: queue '{queue}' is paused.")
-                await r.hset(CRON_STATE_KEY, task_name, tick_at)
+                await r.hset(CRON_STATE_KEY, task_name, repr(tick_at))
                 continue
             payload = queueing.new_payload(task_name, priority=task_info.get("priority") or "default", queue=queue)
-            # The lock only has to outlive the tick (and clocks going back an hour): 3 hours, not 30 days
-            # (an every-minute task used to leave 43,200 lock keys behind).
+            # The lock only has to outlive the tick and a clock going back an hour.
             if await queueing.enqueue(redis_client.r, payload, lock=lock, lock_ttl=CRON_LOCK_TTL,
                                       max_bytes=0, note=note or None) is not None:
                 queued += 1
                 logger.info(f"[Cron] Queued {task_name} for {prev_tick.isoformat()}" + (" (late)" if note else ""))
-            await r.hset(CRON_STATE_KEY, task_name, tick_at)
+            await r.hset(CRON_STATE_KEY, task_name, repr(tick_at))
         except Exception as e:
             logger.error(f"[Cron] Could not schedule {task_name}: {e}")
     return queued
 
 
+PROMOTE_IDLE = 1.0          # longest the leader waits between two looks at the delayed set (seconds)
+PROMOTE_MIN = 0.005         # shortest wait, so a stream of due jobs can't make it spin
+
+
 async def retry_scheduler():
+    """Leader: move delayed jobs and retries onto their queues, waking when the next one is due."""
+    leader_until = 0.0
     while True:
-        if not await is_leader():
-            await asyncio.sleep(5)
-            continue
+        if time.monotonic() >= leader_until:
+            if not await is_leader():
+                await asyncio.sleep(5)
+                continue
+            leader_until = time.monotonic() + 1.0   # the lock lasts 20 s
         try:
-            await _promote_due_tasks()
+            moved = await _promote_due_tasks()
+            wait = await _next_promotion_in(redis_client.r, moved)
         except Exception as e:
             logger.error(f"[Retry Scheduler] Redis error: {e}")
-        await asyncio.sleep(1)
+            wait = PROMOTE_IDLE
+        await asyncio.sleep(wait)
+
+
+async def _next_promotion_in(r, moved: int) -> float:
+    """Seconds until the next delayed job is due (PROMOTE_MIN … PROMOTE_IDLE)."""
+    first = await r.zrange(rkey("delayed_tasks"), 0, 0, withscores=True)
+    if not first:
+        return PROMOTE_IDLE
+    wait = float(first[0][1]) - clock.now()
+    if wait <= 0:
+        # Due already: just became due (look again now), or its queue is full (try again in a second).
+        return PROMOTE_MIN if moved else PROMOTE_IDLE
+    return min(PROMOTE_IDLE, max(PROMOTE_MIN, wait))
 
 
 PROMOTE_BATCH = 500
 PROMOTE_MAX_BATCHES = 20       # at most 10,000 jobs per second, so the leader's other loops keep running
 
 
-async def _promote_due_tasks(now: float = None) -> int:
+async def _promote_due_tasks(now: Optional[float] = None) -> int:
     """
-    Move delayed jobs and retries whose time has come onto their queues.
-
-    Works in batches of 500 (one Lua call each) and only while a queue has room
-    below QUEUE_CAPACITY: a backlog of 50,000 due jobs used to land on one queue
-    at once (and lock the API out with 429s); now it drains as workers keep up.
+    Move due delayed jobs and retries onto their queues, in batches of 500 and only
+    while a queue is below QUEUE_CAPACITY, so a big backlog drains as workers keep up.
     """
     r = redis_client.r
     now = clock.now() if now is None else now
@@ -892,7 +474,7 @@ async def zombie_sweeper():
         try:
             await _sweep_dead_workers()
             from pytaskq import workflows
-            await workflows.sweep(redis_client.r)  # stages whose steps were never queued
+            await workflows.sweep(redis_client.r)  # stuck workflow stages
             if rounds % 30 == 0:                   # every ~5 minutes
                 dropped = await queueing.prune_queues(redis_client.r)
                 if dropped:
@@ -925,7 +507,7 @@ async def _sweep_dead_workers() -> int:
     alive = set(listed) - set(expired)
     gone = list(dict.fromkeys(list(expired) + [w for w in known if w not in alive]))
     if not _scanned_legacy:
-        # Once per leader: processing lists left by workers older than 0.4.1 (not in WORKERS_KEY).
+        # Once per leader: processing lists of workers missing from WORKERS_KEY (older versions).
         _scanned_legacy = True
         async for key in r.scan_iter(match=rkey("processing_queue:*"), count=500):
             worker_id = strip_prefix(key).split(":", 1)[1]
@@ -969,6 +551,64 @@ async def _put_back(r, worker_id: str, raw: str, note: str, side: str = "front")
         if result != -2:
             return int(result)
     return -2
+
+
+# ── This worker's own processing list ─────────────────────────────────────────
+# If Redis moves a job into this list but its reply is lost (restart, failover, dropped connection),
+# the worker never receives the job, and the sweeper only recovers dead workers' lists. So the worker
+# tracks the entries it holds and puts back any entry it doesn't hold at two checks in a row.
+_held: dict[str, int] = {}             # raw job (as listed) → how many copies this worker holds
+_suspects: set = set()                 # listed but not held at the previous check
+RECONCILE_EVERY = 30.0                 # seconds between two checks of this worker's own list
+
+
+def _hold(raw: str) -> None:
+    _held[raw] = _held.get(raw, 0) + 1
+
+
+def _unhold(raw: str) -> None:
+    n = _held.get(raw, 0)
+    if n <= 1:
+        _held.pop(raw, None)
+    else:
+        _held[raw] = n - 1
+
+
+async def _reconcile_own_list() -> int:
+    """Put back jobs listed under this worker that it doesn't hold (lost pop replies). Returns how many."""
+    global _suspects
+    r = redis_client.r
+    listed = await r.lrange(_processing_key(), 0, -1)
+    seen: dict[str, int] = {}
+    unheld = set()
+    for raw in listed:
+        seen[raw] = seen.get(raw, 0) + 1
+        if seen[raw] > _held.get(raw, 0):
+            unheld.add(raw)
+    orphans = unheld & _suspects
+    _suspects = unheld - orphans
+    put_back = 0
+    for raw in orphans:
+        if raw in _held:                  # taken after the check started: it's ours now
+            continue
+        result = await _put_back(r, WORKER_ID, raw,
+                                 f"Put back by worker {WORKER_ID}: it was listed under this worker but never "
+                                 f"reached it (Redis's reply to taking it was lost).", side="front")
+        if result == 1:
+            put_back += 1
+    if put_back:
+        logger.warning(f"[Reconcile] Put back {put_back} job(s) listed under this worker that it never received "
+                       f"(a lost reply from Redis while taking them). They run again on any worker.")
+    return put_back
+
+
+async def _reconciler():
+    while True:
+        await asyncio.sleep(RECONCILE_EVERY)
+        try:
+            await _reconcile_own_list()
+        except Exception as e:
+            logger.debug(f"[Reconcile] Couldn't check this worker's own list ({e})")
 
 
 async def _recover_worker(worker_id: str, note: str) -> int:
@@ -1024,13 +664,9 @@ def _health() -> dict:
 
 class _Heartbeat(threading.Thread):
     """
-    Tells Redis "this worker is alive" every HEARTBEAT_TTL/3 seconds.
-
-    It runs in its own thread with its own Redis connection: before 0.4.1 it was
-    a coroutine, and a task blocking the event loop (time.sleep inside an
-    `async def`) stopped it, so the leader thought the worker was dead and ran
-    its job a second time elsewhere. It also notices a blocked event loop and
-    says which task is responsible.
+    Tells Redis "this worker is alive" every HEARTBEAT_TTL/3 seconds, from its own thread and
+    connection, so a blocked event loop doesn't make the worker look dead. Also warns when the
+    event loop is blocked, naming the task.
     """
 
     def __init__(self):
@@ -1062,10 +698,8 @@ class _Heartbeat(threading.Thread):
 
     def _redis_watchdog(self) -> bool:
         """
-        False when the event loop hasn't heard from Redis for a long time although the
-        loop runs and this thread reaches Redis: its connections hang. First reopen
-        them; if that doesn't help, stop heartbeating (so other workers take over this
-        worker's jobs) and stop the worker with exit code 1 (so it's restarted).
+        False when the event loop's Redis connections hang while this thread reaches Redis.
+        First reopen them; if that fails, stop heartbeating and stop the worker (exit code 1).
         """
         stalled = time.monotonic() - _redis_ok_at
         if stalled < REDIS_STALL or time.monotonic() - _loop_tick > LOOP_BLOCKED_WARN or _event_loop is None:
@@ -1122,11 +756,9 @@ class _Heartbeat(threading.Thread):
         self.stop_event.set()
 
 
-# ── Is the event loop's Redis connection alive? (break test D2) ───────────────
-# The heartbeat thread has its own connection. If the event loop's connections hang (a
-# connection dropped silently and an old redis-py without timeouts), the heartbeat kept saying
-# "alive" while the worker did nothing. The loop marks every Redis answer here; the heartbeat
-# thread checks it.
+# ── Is the event loop's Redis connection alive? ───────────────────────────────
+# The event loop marks every Redis answer here; the heartbeat thread checks it, so hung loop
+# connections aren't hidden by a healthy heartbeat.
 _redis_ok_at = time.monotonic()
 REDIS_STALL = 60.0          # seconds without any Redis answer on the event loop → reopen connections
 _event_loop = None
@@ -1235,13 +867,9 @@ def _validation_summary(e: Exception) -> str:
 
 async def _record_failure(r, tasks, task_json, task_id, error, max_retries) -> str:
     """
-    Schedule a retry or dead-letter a failed attempt — unless the attempt is stale.
-
-    An attempt is stale when the job was handed to another worker meanwhile (the
-    sweeper thought this worker was dead and bumped the job's fence token). The
-    newer attempt owns the job, so this one must not schedule a second copy or
-    dead-letter it. The fence check, the retry / dead letter and the removal
-    from the processing list are one Lua script.
+    Schedule a retry or dead-letter a failed attempt, unless it's stale (its fence token was
+    bumped because the job went to another worker). One Lua script does the fence check,
+    the retry or dead letter, and the removal from the processing list.
     """
     finished_at = clock.now()
     dead = tasks.retry_count >= max_retries
@@ -1269,9 +897,9 @@ async def _record_failure(r, tasks, task_json, task_id, error, max_retries) -> s
 
     async def save(attempt):
         return int(await r.eval(
-            FAIL_SCRIPT, 7,
+            FAIL_SCRIPT, 8,
             _processing_key(), rkey(f"fence:{task_id}"), queueing.task_key(task_id), target,
-            rkey(f"worker:{WORKER_ID}"), rkey("stats:failed"), queueing.FINISHED_KEY,
+            rkey(f"worker:{WORKER_ID}"), rkey("stats:failed"), queueing.FINISHED_KEY, cancel_key(task_id),
             task_json, str(tasks.fence_token), "1" if attempt else "0", "dead" if dead else "retry",
             entry, due, ttl, max(0, settings.DLQ_LIMIT), task_id, repr(finished_at), *queueing.keep_args(),
             *flat,
@@ -1302,9 +930,7 @@ async def _record_failure(r, tasks, task_json, task_id, error, max_retries) -> s
 def _storable_result(result) -> tuple[str, str]:
     """(what to store as the result, why it was dropped or "").
 
-    Results over MAX_RESULT_BYTES aren't stored: a 50 MB return value would sit
-    in Redis for RESULT_TTL. The job still counts as a success (its work is done;
-    running it again would repeat that work), and the reason is recorded.
+    Results over MAX_RESULT_BYTES aren't stored; the job still succeeds and the reason is recorded.
     """
     encoded, notes = queueing.encode_result_noted(result)
     if notes:
@@ -1323,12 +949,9 @@ def _storable_result(result) -> tuple[str, str]:
 
 async def _hand_back(r, tasks, task_json, task_id) -> bool:
     """
-    This worker doesn't have the job's task, but another live worker advertises it
-    (two apps sharing one queue). Put the job back on its queue for that worker,
-    without counting a retry. Whichever worker pops first gets the job, so it may
-    take several hand-backs; this keeps going for HAND_BACK_FOR seconds, then the
-    job fails normally (retries, then dead letters) so it can't loop forever.
-    Settings → Performance says to give each app its own queue.
+    This worker lacks the job's task but another live worker advertises it: put the job back
+    for that worker without counting a retry. After HAND_BACK_FOR seconds the job fails
+    normally, so it can't loop forever.
     """
     now = clock.now()
     since = tasks.handed_back_since or now
@@ -1352,6 +975,8 @@ async def _hand_back(r, tasks, task_json, task_id) -> bool:
     return True
 
 
+RATE_HOLD = 0.5                    # a rate_limit turn closer than this is waited for in place (seconds)
+RATE_HOLD_TRIES = 2                # …at most this many times per pop, then the job waits in the delayed set
 LEASE_TTL = HEARTBEAT_TTL * 2      # seconds a max_concurrency lease lasts; the heartbeat renews it while the job runs
 WAIT_MAX = 30.0                    # longest fallback wait of a max_concurrency job (normally a finishing job wakes it)
 _leases: dict[str, str] = {}       # lease id → lease set key, for leases this worker holds (renewed by the heartbeat)
@@ -1394,13 +1019,10 @@ async def _wait_in_delayed_set(r, tasks, task_json, due: float, changes: dict, n
 
 async def _within_limits(r, tasks, task_json, entry: dict) -> bool:
     """
-    The task's rate_limit and max_concurrency, which hold across every worker.
+    The task's fleet-wide rate_limit and max_concurrency.
 
-    True: the job may start now (holding a max_concurrency lease if the task has
-    one). False: it went back to the delayed set to wait for its turn. Waiting
-    never uses up a retry. A rate-limited job reserves its start time once and
-    waits until then; a job over max_concurrency checks again after a short,
-    growing wait (up to WAIT_MAX seconds).
+    True: the job may start now (holding a lease if the task has max_concurrency).
+    False: it went back to the delayed set to wait, without using a retry.
     """
     gap, cap = entry.get("rate_interval"), entry.get("max_concurrency")
     if not gap and not cap:
@@ -1409,11 +1031,19 @@ async def _within_limits(r, tasks, task_json, entry: dict) -> bool:
     now = clock.now()
     slot = tasks.rate_slot
     if gap:
-        answer = await _with_retries(
-            lambda _: r.eval(RATE_SCRIPT, 2, limit_key("turns", name), limit_key("started", name), repr(now),
-                             repr(float(gap)), task_id, "" if slot is None else repr(float(slot))),
-            "check a rate limit", task_id)
-        slot = now if answer == "go" else float(answer)
+        for attempt in range(RATE_HOLD_TRIES + 1):
+            answer = await _with_retries(
+                lambda _: r.eval(RATE_SCRIPT, 2, limit_key("turns", name), limit_key("started", name), "",
+                                 repr(float(gap)), task_id, "" if slot is None else repr(float(slot))),
+                "check a rate limit", task_id)
+            slot = now if answer == "go" else float(answer)
+            wait = slot - now
+            if (answer == "go" or attempt >= RATE_HOLD_TRIES or wait >= RATE_HOLD
+                    or tasks.queue in _paused):
+                break
+            # The turn is moments away: wait here rather than via the delayed set.
+            await asyncio.sleep(max(0.0, wait))
+            now = clock.now()
         if answer != "go":
             when = datetime.fromtimestamp(slot, timezone.utc).strftime("%H:%M:%S UTC")
             await _wait_in_delayed_set(r, tasks, task_json, slot, {"rate_slot": slot},
@@ -1437,8 +1067,7 @@ async def _within_limits(r, tasks, task_json, entry: dict) -> bool:
             payload.update(waits=waits, rate_slot=slot)
             payload.setdefault("waiting_since", now)
             raw = json.dumps(payload)
-            # The finishing job wakes the one that waited longest; this time is only the fallback,
-            # for when that worker died before giving its place back.
+            # Fallback only: normally a finishing job wakes the one that waited longest.
             due = now + min(WAIT_MAX, 5 * 1.5 ** min(waits, 10)) * random.uniform(0.9, 1.1)
             await _with_retries(
                 lambda _: r.eval(WAIT_FOR_LEASE_SCRIPT, 4, _processing_key(), rkey("delayed_tasks"),
@@ -1453,10 +1082,8 @@ async def _within_limits(r, tasks, task_json, entry: dict) -> bool:
 
 async def _release_lease(r, task_id: str, ctx: Optional[context.Job] = None) -> None:
     """
-    Give a max_concurrency place back and start the job that waited longest. An IO
-    job's thread that's still running (it timed out or was cancelled, and Python
-    can't stop a thread) keeps its place until it really returns (break test D3);
-    the heartbeat renews it meanwhile.
+    Give a max_concurrency place back and start the job that waited longest. An IO thread
+    still running after a timeout or cancel keeps its place until it returns.
     """
     lease = _lease_of.pop(task_id, None)
     if not lease:
@@ -1484,7 +1111,7 @@ async def _give_back(lease: str) -> None:
         await redis_client.r.eval(RELEASE_SCRIPT, 3, key, limit_key("waiting", name), rkey("delayed_tasks"), lease,
                                   repr(clock.now()), PROMOTED_HOLD)
     except Exception as e:
-        logger.debug(f"[Limits] Couldn't give a max_concurrency place back ({e}); it runs out by itself.")                           # the lease runs out by itself within LEASE_TTL seconds
+        logger.debug(f"[Limits] Couldn't give a max_concurrency place back ({e}); it runs out by itself.")
 
 
 def _renew_leases(c, now: float) -> None:
@@ -1504,16 +1131,14 @@ CANCEL_CHECK = 1.0                     # seconds between two checks for cancel r
 
 
 def cancel_key(task_id: str) -> str:
-    """Set by the API when someone cancels a job that a worker is running (expires after an hour)."""
+    """A request to stop a job: checked by its worker while it runs and before it starts."""
     return rkey(f"cancel:{task_id}")
 
 
 async def _stoppable(execute, ctx: context.Job):
     """
-    Run a job's coroutine so that a cancel request can stop it: an async task
-    is cancelled, a CPU task's process is stopped and replaced, an IO task's
-    thread is left to finish on its own (Python can't stop a thread; its
-    `cancelled()` returns True from now on) and its result ignored.
+    Run a job so a cancel request can stop it: an async task is cancelled, a CPU process is
+    replaced, an IO thread is left to finish (its `cancelled()` returns True) and its result ignored.
     """
     job = asyncio.ensure_future(execute)
     ctx.stop = job.cancel
@@ -1686,8 +1311,7 @@ async def _run_async(func, args, kwargs, timeout, task_id, task_name, started, c
                 raise TaskTimeoutError(f"Task exceeded {timeout:g}s limit. Execution was cancelled.")
             took = time.monotonic() - began
             if took > timeout + 1:
-                # It finished, so it counts as done (running it again would repeat its work), but say why
-                # the limit didn't apply: blocking code in an async task stops the clock from firing.
+                # It finished, so it counts; blocking code stopped the timeout from firing.
                 logger.warning(f"Task {task_id} ({task_name}) finished after {took:.0f}s, over its {timeout:g}s "
                                f"timeout: it blocked the event loop, so the timeout couldn't fire.")
             return job.result()
@@ -1726,9 +1350,8 @@ async def handle_task(task_json, sem, loop, process_pool, thread_pool):
         raise
     except (Exception, SystemExit, KeyboardInterrupt) as e:
         if tasks is not None and not isinstance(e, redis_errors.RedisError):
-            # Not Redis being away: something about this job made its outcome impossible to save.
-            # Putting it back would run it again on every restart, forever (break test E2), so it
-            # becomes a dead letter that says why.
+            # The outcome can't be saved (not a Redis outage): dead-letter it with the reason rather than
+            # put it back, which would rerun it on every restart.
             reason = (f"PyTaskQ couldn't save this job's outcome ({queueing.error_text(e)}). "
                       f"It was moved to dead letters instead of being run again.")
             try:
@@ -1737,11 +1360,11 @@ async def handle_task(task_json, sem, loop, process_pool, thread_pool):
                 return
             except Exception:
                 pass
-        # Redis stayed down until the very end of a shutdown, or a bug. The job stays in the
-        # processing list; it's put back when this worker stops.
+        # Redis stayed down through shutdown, or a bug: the job stays listed and is put back later.
         logger.error(f"Could not finish handling a job ({queueing.error_text(e)}). It stays listed under "
-                     f"this worker and is put back on its queue when the worker stops.")
+                     f"this worker and is put back on its queue within a minute, or when the worker stops.")
     finally:
+        _unhold(task_json)
         sem.release()
 
 
@@ -1767,8 +1390,7 @@ async def _run(r, tasks, task_json, process_pool, thread_pool) -> None:
         started_at = None
 
         async def started():
-            # Called when the job really starts (it has a process/thread), not when it was popped:
-            # time spent waiting for a free slot doesn't count against its timeout.
+            # Called when the job gets a process/thread, so waiting for a slot doesn't count toward its timeout.
             nonlocal started_at
             started_at = clock.now()
 
@@ -1799,8 +1421,7 @@ async def _run(r, tasks, task_json, process_pool, thread_pool) -> None:
             task_type = entry.get("type", "cpu")
             args, kwargs = tasks.args, tasks.kwargs
             if tasks.workflow and tasks.workflow.get("input"):
-                # A workflow step gets the previous stage's result first. It's read now, from the
-                # workflow, instead of being copied into every step's job when the stage was queued.
+                # A workflow step gets the previous stage's result first, read from the workflow now.
                 from pytaskq import workflows
                 previous = await workflows.stage_input(r, tasks.workflow["id"], int(tasks.workflow.get("stage", 0)))
                 args = [previous, *args]
@@ -1835,8 +1456,7 @@ async def _run(r, tasks, task_json, process_pool, thread_pool) -> None:
             return
         except Exception as e:
             if isinstance(e, TaskTimeoutError):
-                # Invalidate this attempt; the retry carries the new token so
-                # ITS result is accepted while any late write from this one is not.
+                # Invalidate this attempt: only the retry's result (new token) is accepted.
                 new_token = int(await _with_retries(
                     lambda _: r.eval(TIMEOUT_FENCE_SCRIPT, 1, rkey(f"fence:{task_id}"), str(tasks.fence_token)),
                     "record a timeout", task_id))
@@ -1853,8 +1473,8 @@ async def _run(r, tasks, task_json, process_pool, thread_pool) -> None:
 
         encoded, dropped = _storable_result(result)
         if tasks.workflow:
-            # Kept with the job, so the leader can still pass it on if this worker stops between
-            # saving the job and telling its workflow (break test #5, W7).
+            # Kept with the job, so the leader's sweep can pass it on if this worker stops before
+            # telling the workflow.
             from pytaskq import workflows
             wf_result = workflows.result_json(result)
             if not settings.MAX_RESULT_BYTES or len(wf_result) <= settings.MAX_RESULT_BYTES:
@@ -1865,9 +1485,9 @@ async def _run(r, tasks, task_json, process_pool, thread_pool) -> None:
 
         async def save(attempt):
             return int(await r.eval(
-                COMPLETE_SCRIPT, 6,
+                COMPLETE_SCRIPT, 7,
                 _processing_key(), rkey(f"fence:{task_id}"), queueing.task_key(task_id),
-                rkey(f"worker:{WORKER_ID}"), rkey("stats:completed"), queueing.FINISHED_KEY,
+                rkey(f"worker:{WORKER_ID}"), rkey("stats:completed"), queueing.FINISHED_KEY, cancel_key(task_id),
                 task_json, str(tasks.fence_token), "1" if attempt else "0", task_id, encoded,
                 repr(finished_at), repr(duration_ms), dropped, int(settings.RESULT_TTL), *queueing.keep_args(),
             ))
@@ -1890,9 +1510,7 @@ async def _run(r, tasks, task_json, process_pool, thread_pool) -> None:
             await _workflow_step(r, tasks, "ok", result)
         if dropped:
             logger.warning(f"Task {task_id} succeeded but its result wasn't stored: {dropped}")
-        # ── Webhook delivery ──────────────────────────────────────────────
-        # Travels through the queue like any other task, so network blips
-        # are retried automatically.
+        # Webhook delivery is a queued job, so it gets retries.
         if tasks.on_success_url:
             webhook = queueing.new_payload(
                 "_deliver_webhook",
@@ -1923,7 +1541,7 @@ def _pid_alive(pid: int) -> Optional[bool]:
     """Whether a process exists on this machine (None = can't tell)."""
     if pid <= 0:
         return False
-    if os.name == "nt":
+    if sys.platform == "win32":
         try:
             import ctypes
             kernel32 = ctypes.windll.kernel32
@@ -1971,11 +1589,8 @@ def _swap_boot_file() -> str:
 
 async def _claim_name(r) -> None:
     """
-    With a fixed WORKER_NAME, make sure no other live worker uses the same name.
-
-    A restart of the same worker (same machine, its old process gone) continues
-    at once and puts back the jobs it was running. Otherwise it waits for the
-    old heartbeat to run out, and refuses to start if that worker is still alive.
+    With a fixed WORKER_NAME, make sure no other live worker uses it. A restart of the same
+    worker continues at once; otherwise wait for the old heartbeat to run out, or refuse to start.
     """
     previous_boot = _swap_boot_file()
     score = await r.zscore(rkey("active_workers"), WORKER_ID)
@@ -1984,10 +1599,8 @@ async def _claim_name(r) -> None:
     info = await r.hgetall(rkey(f"worker:{WORKER_ID}"))
     pid = _as_int(info.get("pid"))
     if info.get("hostname") == HOSTNAME:
-        # Proof that the live-looking record is this worker's own previous run: the boot id this
-        # machine wrote last time matches it. Same hostname and pid alone aren't proof: in containers
-        # every worker is pid 1, and `network_mode: host` or a fixed `hostname:` gives two containers
-        # the same name, so a second container took the first one's running job (break test E6).
+        # The record is our own previous run only if its boot id matches the one this machine wrote:
+        # hostname and pid alone aren't proof (containers share pid 1 and can share a hostname).
         mine_before = bool(previous_boot) and info.get("boot_id") == previous_boot
         if pid != os.getpid() and _pid_alive(pid) is False:
             return                              # same machine, that process is gone
@@ -2019,12 +1632,8 @@ async def _startup(named: str) -> bool:
     """
     Connect, recover, announce. Returns False if the worker must not start.
 
-    Only the steps that need Redis to answer at all are retried here. The
-    worker's bookkeeping (its details, its queues, its task list) is
-    best-effort: when Redis is full it can't be written, and refusing to start
-    then meant no worker ever took a job, so memory never freed up again.
-    Configuration errors (a wrong password) stop the worker with exit code 1:
-    retrying won't fix them.
+    Bookkeeping writes are best-effort, so a worker still starts when Redis is full (taking
+    jobs frees memory). Configuration errors (a wrong password) stop it with exit code 1.
     """
     global EXIT_CODE, _started_at
     r = redis_client.r
@@ -2104,7 +1713,10 @@ def _cpu_modules() -> tuple:
 
 async def consumer_task():
     global QUEUES, WORKER_ID, EXIT_CODE, THREADS_LEFT_RUNNING, _started_at, _loop_tick, _pause_changed, _paused
+    global _suspects
     EXIT_CODE = THREADS_LEFT_RUNNING = 0
+    _held.clear()
+    _suspects = set()
     _pause_changed, _paused = asyncio.Event(), set()
     _hard_stop.clear()
     concurrency = CPU_WORKERS + IO_WORKERS
@@ -2189,6 +1801,7 @@ async def consumer_task():
         asyncio.create_task(_progress_writer()),
         asyncio.create_task(_cancel_watcher()),
         asyncio.create_task(_pause_watcher()),
+        asyncio.create_task(_reconciler()),
     ]
     if cpu_pool is not None:
         background.append(asyncio.create_task(_watch_cpu_pool(cpu_pool)))
@@ -2219,6 +1832,8 @@ async def consumer_task():
             call = pop_call(serving, turn)
             turn += 1
             task_json = await redis_client.r.eval(PRIORITY_POP_SCRIPT, *call)
+            if task_json:
+                _hold(task_json)            # before any other await: the reconciler must see it as ours
             _mark_redis_ok()
 
             if not task_json:
@@ -2241,18 +1856,15 @@ async def consumer_task():
     await _shutdown(background, heart, cpu_pool, io_pool)
 
 
-# Seconds an idle worker blocks before checking its queues anyway. New jobs wake it at once (wake-up
-# tokens); this only catches jobs queued by PyTaskQ versions before 0.5, which don't send tokens.
-IDLE_WAIT = redis_client.idle_wait()    # always below the connection's read timeout (break test D1)
+# Seconds an idle worker blocks before checking its queues anyway; catches jobs from versions that
+# don't send wake-up tokens. Always below the connection's read timeout.
+IDLE_WAIT = redis_client.idle_wait()
 
 
 async def _wait_for_work(queues: list[str]) -> None:
-    """
-    Idle: block until a wake-up token arrives on one of our queues (a job was
-    queued), IDLE_WAIT passes, or the worker is stopping. Replaces polling with
-    a growing delay, which took up to a second to notice a new job.
-    """
+    """Idle: block until a wake-up token arrives on one of our queues, IDLE_WAIT passes, or the worker stops."""
     keys = [queueing.wake_key(q) for q in queues]
+    waiting: asyncio.Future[Any]
     if keys:
         waiting = asyncio.ensure_future(redis_client.r.blpop(keys, timeout=IDLE_WAIT))
     else:
@@ -2272,8 +1884,7 @@ async def _wait_for_work(queues: list[str]) -> None:
         try:
             waiting.result()                   # a Redis error: the main loop backs off
         except RedisTimeoutError:
-            # The wait itself ran out (a slow network, or an older redis-py default): that's
-            # "no work yet", not a failure. The connection is reopened for the next command.
+            # The wait itself timed out: no work yet, not a failure.
             pass
         _mark_redis_ok()
 

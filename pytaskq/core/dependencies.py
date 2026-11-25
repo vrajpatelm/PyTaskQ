@@ -6,10 +6,9 @@ from pytaskq.core.keys import k as rkey
 def get_client_ip(req: Request) -> str:
     """The caller's IP address (used to throttle sign-in attempts).
 
-    Deliberately NOT read from X-Forwarded-For: anyone can send that header, so
-    trusting it let a client dodge the per-IP limit, or lock out someone else's
-    IP. Behind a reverse proxy, uvicorn already puts the real visitor IP here
-    for proxies listed in FORWARDED_ALLOW_IPS (deploy/ sets this for Caddy).
+    Not read from X-Forwarded-For: anyone can send that header to dodge the per-IP limit or lock
+    out someone else. Behind a reverse proxy, uvicorn sets the real IP for proxies listed in
+    FORWARDED_ALLOW_IPS.
     """
     return req.client.host if req.client else "unknown"
 

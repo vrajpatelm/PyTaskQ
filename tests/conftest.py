@@ -56,6 +56,8 @@ async def reset_worker_globals():
     worker._pause_changed = asyncio.Event()
     worker._paused = set()
     worker.active_tasks.clear()
+    worker._held.clear()
+    worker._suspects = set()
     pressure._pending.clear()
     yield
     pressure._pending.clear()
