@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="https://raw.githubusercontent.com/vrajpatelm/PyTaskQ/main/pytaskq/static/favicon.svg" width="72" alt="PyTaskQ logo" />
+<img src="https://raw.githubusercontent.com/vrajpatelm/PyTaskQ/main/frontend/public/favicon.svg" width="72" alt="PyTaskQ logo" />
 
 # PyTaskQ
 
@@ -252,9 +252,9 @@ pre-commit install           # ruff, mypy and file checks before each commit
 python -m pytest             # in-memory via fakeredis; tests needing a real redis-server skip without one
 mypy                         # type check
 
-cd frontend && npm install
+cd frontend && npm ci
+npm run build                # builds the dashboard into pytaskq/static/ (not committed; needed once)
 npm run dev                  # dashboard with hot reload; talks to `pytaskq dashboard` on :8000
-npm run build                # writes the bundle into pytaskq/static/
 ```
 
 Platforms: Linux in production (CI and the Docker images are Linux, amd64 and arm64); Windows for development. macOS is checked in CI but not yet supported.

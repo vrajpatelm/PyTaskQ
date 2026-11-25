@@ -70,3 +70,6 @@ docs/RELEASING.md
 # Local change log (not published)
 changes.md
 BREAK_TEST*.md
+
+# The dashboard bundle is built (npm run build), not committed
+pytaskq/static/

@@ -5,5 +5,7 @@
 !LICENSE
 !pytaskq/
 !example_app.py
+!frontend/
+frontend/node_modules
 **/__pycache__
 **/*.pyc

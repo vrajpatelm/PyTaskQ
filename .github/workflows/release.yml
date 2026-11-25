@@ -47,6 +47,16 @@ jobs:
             exit 1
           fi
 
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Build the dashboard into the package
+        working-directory: frontend
+        run: npm ci && npm run build
+      - run: test -f pytaskq/static/index.html
+
       - run: pip install build twine
       - run: python -m build
       - run: twine check --strict dist/*

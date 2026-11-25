@@ -17,6 +17,7 @@ All notable changes to PyTaskQ. Versions follow [semantic versioning](https://se
 - Changing a user's role while the user was being deleted returned nothing instead of a 404.
 
 ### Changed
+- The built dashboard (`pytaskq/static/`) is no longer committed. CI, the release workflow and the Dockerfile build it from `frontend/`, so the wheel on PyPI and the Docker image still include it. From a source checkout, run `cd frontend && npm ci && npm run build` once; without it the API works and `/` explains how to build the dashboard. Dependency updates for the dashboard no longer need a rebuilt bundle in the same pull request.
 - The package is typed (`py.typed`) and checked with mypy in CI. Coverage is measured in CI and must stay at 84% or more. CI also runs the suite on Windows (required) and macOS (experimental).
 - Classifiers say Linux and Windows instead of "OS Independent".
 - The worker's Lua scripts moved to `pytaskq/worker_scripts.py` (still importable from `pytaskq.worker`).

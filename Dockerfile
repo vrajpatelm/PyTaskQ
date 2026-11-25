@@ -4,6 +4,14 @@
 #   Worker for your own tasks:   FROM ghcr.io/vrajpatelm/pytaskq:0.3
 #                                COPY tasks.py .
 #                                CMD ["pytaskq", "worker", "--app", "tasks:queue"]
+# The dashboard is plain JS/CSS: build it once, on the build machine's own architecture.
+FROM --platform=$BUILDPLATFORM node:22-slim AS dashboard
+WORKDIR /build/frontend
+COPY frontend/package.json frontend/package-lock.json ./
+RUN npm ci --no-audit --no-fund
+COPY frontend/ ./
+RUN npm run build                     # writes /build/pytaskq/static
+
 FROM python:3.12-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
@@ -15,7 +23,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 WORKDIR /src
 COPY pyproject.toml README.md LICENSE ./
 COPY pytaskq ./pytaskq
-RUN pip install ".[tracing]" && rm -rf /src
+COPY --from=dashboard /build/pytaskq/static ./pytaskq/static
+RUN test -f pytaskq/static/index.html && pip install ".[tracing]" && rm -rf /src
 
 # 2. /app is where task code lives; the bundled example works out of the box:
 #    pytaskq worker --app example_app:queue
