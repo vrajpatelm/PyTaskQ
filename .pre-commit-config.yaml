@@ -1,0 +1,31 @@
+# pre-commit install   — runs these checks on every commit
+# pre-commit run --all-files
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+        exclude: ^pytaskq/static/
+      - id: end-of-file-fixer
+        exclude: ^pytaskq/static/
+      - id: check-yaml
+      - id: check-toml
+      - id: check-merge-conflict
+      - id: check-added-large-files
+        args: [--maxkb=1024]
+      - id: detect-private-key
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.8.0
+    hooks:
+      - id: ruff
+        args: [--select, "E9,F63,F7,F82"]      # the same bug-only rules as CI
+
+  - repo: local
+    hooks:
+      - id: mypy
+        name: mypy
+        entry: mypy
+        language: system                      # uses the project's environment (pip install -e ".[dev]")
+        types: [python]
+        pass_filenames: false
