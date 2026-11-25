@@ -2,7 +2,7 @@
 
 All notable changes to PyTaskQ. Versions follow [semantic versioning](https://semver.org/).
 
-## Unreleased
+## 0.6.1 — 2026-11-25
 
 ### Fixed
 - A job could stay stuck in a worker's processing list, never running, until that worker stopped: when Redis moved a job to a worker but the reply was lost (Redis restart, failover, dropped connection), the worker never received it, and the sweeper only recovers dead workers' lists. Each worker now checks its own list every 30 s and puts back jobs it never received.
