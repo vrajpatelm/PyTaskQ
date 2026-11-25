@@ -1,5 +1,5 @@
 import logging
-from typing import Any, Dict, List, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional, cast
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Response
 from pydantic import BaseModel, Field
@@ -89,6 +89,7 @@ async def _submit(req: EnqueueRequest, delay_seconds: float, user: auth.User, ke
         raise HTTPException(status_code=413, detail=str(e)) from None
     except ValueError as e:   # NaN in the arguments, a bad or reused Idempotency-Key
         raise HTTPException(status_code=422, detail=str(e)) from None
+    result = cast(dict, result)                  # None only for a cron lock
     if not result.get("duplicate"):
         logger.info(f"Queued task {payload['task_id']} ({req.task_name}) priority={payload['priority']}"
                     + (f" in {delay_seconds:g}s" if delay_seconds else ""))

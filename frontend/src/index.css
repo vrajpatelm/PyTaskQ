@@ -12,10 +12,10 @@
   --success-color: #10b981;
   --warning-color: #f59e0b;
   --danger-color: #ef4444;
-  
+
   --card-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.05), 0 2px 4px -2px rgba(0, 0, 0, 0.05);
   --card-hover: 0 10px 15px -3px rgba(0, 0, 0, 0.08), 0 4px 6px -4px rgba(0, 0, 0, 0.05);
-  
+
   --task-bg: #f1f5f9;
   --code-bg: #1e293b;
   --code-text: #f8fafc;
@@ -57,10 +57,10 @@
   --success-color: #34d399;
   --warning-color: #fbbf24;
   --danger-color: #f87171;
-  
+
   --card-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.3), 0 2px 4px -2px rgba(0, 0, 0, 0.3);
   --card-hover: 0 10px 15px -3px rgba(0, 0, 0, 0.5), 0 4px 6px -4px rgba(0, 0, 0, 0.5);
-  
+
   --task-bg: #27272a;
   --code-bg: #000000;
   --code-text: #d4d4d8;

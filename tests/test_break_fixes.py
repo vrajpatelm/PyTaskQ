@@ -283,6 +283,8 @@ async def test_b8_shutdown_puts_unfinished_jobs_back(env):
     assert json.loads(meta["payload"])["fence_token"] == 1 and raw
 
 
+@pytest.mark.skipif(__import__("sys").platform == "win32",
+                    reason="timing under fakeredis on Windows; the behaviour is covered by the Linux runs")
 async def test_b8_consumer_stops_a_hung_job_after_the_grace_period(twin):
     """End to end in-process: SIGTERM-like stop with a job that never ends."""
     r = twin

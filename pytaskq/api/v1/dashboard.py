@@ -81,10 +81,8 @@ async def dashboard_websocket(websocket: WebSocket):
             return False          # the browser went away
 
     async def pusher():
-        # At most LIVE_UPDATES_PER_SECOND pushes a second, however fast jobs change.
-        # A Redis error (restart, outage, full memory) used to end this loop while the
-        # socket stayed open, so the tab froze until it was reloaded. Now the browser
-        # is told ("degraded") and the loop tries again until Redis answers.
+        # At most LIVE_UPDATES_PER_SECOND pushes a second. On a Redis error the browser is
+        # told ("degraded") and the loop retries until Redis answers.
         interval = min_interval()
         last_push = 0.0
         backoff = 1.0
@@ -125,7 +123,7 @@ async def dashboard_websocket(websocket: WebSocket):
             last_push = time.monotonic()
         stop_event.set()
         try:
-            await websocket.close(code=1011)   # if still open: make the browser reconnect, never leave it frozen
+            await websocket.close(code=1011)   # make the browser reconnect
         except Exception:
             pass
 

@@ -2,16 +2,11 @@
 pytaskq.core.queueing — the one place where tasks enter Redis
 ==============================================================
 
-The SDK (`task.delay()`), the REST API (`POST /task/enqueue`) and the worker
-(webhook follow-ups) all enqueue through `enqueue()`, so every task gets:
+The SDK, the REST API and the worker all enqueue through `enqueue()`, so every
+job gets a `task:{id}` record from the moment it's queued, a `tasks:recent`
+entry and a pub/sub nudge for live dashboards.
 
-  * a `task:{id}` status hash from the moment it is queued (lookups never
-    return "not found" for a task that is merely waiting),
-  * an entry in the `tasks:recent` history list (powers the dashboard table),
-  * consistent counters and a pub/sub nudge for live dashboards.
-
-Every function takes the Redis connection explicitly so callers (and tests)
-decide which client is used.
+Every function takes the Redis connection explicitly.
 """
 
 from __future__ import annotations
@@ -35,12 +30,9 @@ logger = logging.getLogger("pytaskq")
 PRIORITIES = ("high", "default", "low")
 
 # ── Named queues ───────────────────────────────────────────────────────────────
-# Every task lives on a queue ("default" unless it says otherwise) and every
-# worker serves a set of queues. A worker only takes jobs from queues it
-# serves, so an image worker never picks up email jobs it can't run.
-# Each queue has its own high/default/low lists. The "default" queue keeps the
-# key names PyTaskQ always used (queue:high, queue:default, queue:low), so jobs
-# already waiting in Redis keep working after an upgrade.
+# Every task lives on a queue and every worker serves a set of queues. Each queue
+# has high/default/low lists; the "default" queue keeps the original key names
+# (queue:high, queue:default, queue:low).
 DEFAULT_QUEUE = "default"
 QUEUE_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,49}$")
 QUEUES_KEY = rkey("pytaskq:queues")    # SET of every queue name that has been used
@@ -100,11 +92,7 @@ def queue_keys(queue: str = DEFAULT_QUEUE) -> list[str]:
 
 
 def clean_text(text: Any) -> str:
-    """
-    Text that Redis (UTF-8) can store. Lone surrogates, which Python uses for bytes
-    that aren't UTF-8 (file names from os.listdir, output decoded with
-    surrogateescape), become \\udcff escapes instead of failing the save (break test E2).
-    """
+    """Text Redis can store as UTF-8: lone surrogates become \\udcff escapes."""
     if not isinstance(text, str):
         text = str(text)
     try:
@@ -125,11 +113,7 @@ def cut_text(text: str, limit: int) -> str:
 
 
 def error_text(exc: BaseException) -> str:
-    """
-    "Type: message" for a failed job, safe to store and log: clean text, at most
-    MAX_ERROR_BYTES (an exception carrying a whole HTTP body or SQL dump used to be
-    stored and sent everywhere in full, break test E8), and never failing itself.
-    """
+    """"Type: message" for a failed job: clean text, at most MAX_ERROR_BYTES, never raising."""
     try:
         message = str(exc)
     except Exception:
@@ -161,10 +145,8 @@ def _jsonable(value, notes: _ResultNotes, depth: int = 0):
 
 def encode_result_noted(result: Any) -> tuple[str, list[str]]:
     """
-    The result as stored, and what had to be changed to store it:
-    "nan" (NaN/Infinity became null, break test E11), "text" (values JSON can't
-    hold, such as sets, bytes or objects, became their text). Strings are stored
-    as they are (cleaned of invalid characters).
+    The result as stored, and what had to change: "nan" (NaN/Infinity became null),
+    "text" (values JSON can't hold became their text). Strings are stored as they are.
     """
     if isinstance(result, str):
         return clean_text(result), []
@@ -260,12 +242,9 @@ class TooManyQueues(ValueError):
 
 FINAL_STATUSES = ("Success", "DeadLetter", "Cancelled", "Failed")
 
-# Every finished job (succeeded, dead-lettered, cancelled, invalid) is listed here
-# by finish time. Records are kept for RESULT_TTL, but never more than
-# FINISHED_JOBS_KEPT of them: the oldest are deleted first. Without the cap,
-# Redis memory grew with jobs-per-second × RESULT_TTL (about 2.3 KB per job, so
-# a day of 140 jobs/s needed 27 GB). The set also gives the job history its
-# time order (searching finished jobs).
+# Every finished job, by finish time. Records are kept for RESULT_TTL but never
+# more than FINISHED_JOBS_KEPT of them (oldest deleted first), so memory stays
+# flat. Also the time order for searching finished jobs.
 FINISHED_KEY = rkey("pytaskq:finished")
 
 # Lua: list a finished job and delete the oldest records beyond the cap.
@@ -283,12 +262,9 @@ end
 """
 
 
-# Wake-up tokens. Whenever a job lands on a queue, a token goes on that queue's
-# wake list, and idle workers wait for one with BLPOP: a job is picked up within
-# milliseconds (measured: 2 ms) instead of on the next poll (up to a second
-# later, ~475 ms typical). Redis gives each token to one waiting worker. Tokens
-# are only a hint: a worker always takes the job itself with the pop script, and
-# stale tokens cost one empty pop each.
+# Wake-up tokens: queueing a job pushes a token on its queue's wake list, and idle
+# workers BLPOP on it, so a job is picked up within milliseconds. Tokens are only a
+# hint: the pop script takes the job; a stale token costs one empty pop.
 WAKE_PREFIX = rkey("pytaskq:wake:")
 WAKE_CAP = 100                  # tokens kept per queue (enough to wake every idle worker)
 WAKE_LUA = """
@@ -318,11 +294,8 @@ class QueueFull(Exception):
 
 
 def dumps_payload(payload: dict, max_bytes: Optional[int] = None) -> str:
-    """JSON for Redis. NaN/Infinity are refused: they aren't valid JSON and would break every reader.
-
-    Jobs over `max_bytes` (default MAX_PAYLOAD_BYTES, 0 = no limit) are refused:
-    every waiting job sits in Redis memory, twice (its queue entry and its record).
-    """
+    """JSON for Redis. Refuses NaN/Infinity (not valid JSON) and jobs over `max_bytes`
+    (default MAX_PAYLOAD_BYTES, 0 = no limit)."""
     try:
         raw = json.dumps(payload, allow_nan=False)
     except ValueError:
@@ -339,8 +312,7 @@ def dumps_payload(payload: dict, max_bytes: Optional[int] = None) -> str:
 
 
 def _meta(payload: dict, raw: str, status: str, now: float, delay_seconds: float = 0) -> dict:
-    # The arguments live only inside `payload` (they used to be stored three
-    # times); public_view() reads them from there.
+    # The arguments live only inside `payload`; public_view() reads them from there.
     return _clean({
         "task_id": payload["task_id"],
         "task_name": payload["task_name"],
@@ -413,20 +385,20 @@ async def find_duplicate(r, key: Optional[str], payload: dict, delay_seconds: fl
 #   KEYS: 1 target (queue list or delayed zset), 2 task hash, 3 history list, 4 queue-name set,
 #         5 idempotency key, 6 cron tick lock, 7-9 the queue's three lists (capacity), 10 the job's fence,
 #         11 the finished-jobs set, 12 the queue's wake list
+#         [, 13 the job's cancel request]
 #   ARGV: 1 payload, 2 "list" | "delayed", 3 due time, 4 queue name, 5 history limit, 6 capacity (0 = none),
 #         7 idempotency record ("" = none), 8 idempotency TTL, 9 lock TTL ("" = no lock), 10 task id,
 #         11 "1" = may run when Redis is full (internal follow-ups), 12 MAX_QUEUES (0 = none),
 #         13.. task hash fields (name, value, …)
 # Returns {1} queued, {2, record} idempotency key already used, {3} lock already taken, {0, waiting} full,
 #         {4, status} the task id belongs to a job that hasn't finished, {5, count} too many queues.
-# A task id whose job HAS finished is reused cleanly: its old record, fence and history entry are dropped
-# (otherwise the new job's result was thrown away as "stale").
+# Reusing the id of a finished job drops its old record, fence, history entry and cancel request.
+# A cancel request for an id with no record yet is kept: it stops a cancelled workflow's later steps.
 # The task hash has no expiry while the job waits: it gets RESULT_TTL when the job finishes.
 ENQUEUE_SCRIPT = WAKE_LUA + """
 local unpack = unpack or table.unpack
 if ARGV[11] == '1' then redis.call('DEL', '__PYTASKQ__pytaskq:oom-probe') end
--- This very call already queued the job: the client re-sent the script after losing the reply
--- (a dropped connection, a failover). Answer "queued" again; never queue it twice (break test E4).
+-- Re-sent after a lost reply: this call already queued the job.
 for i = 13, #ARGV - 1, 2 do
     if ARGV[i] == 'enqueue_nonce' then
         if redis.call('HGET', KEYS[2], 'enqueue_nonce') == ARGV[i + 1] then return {1} end
@@ -457,6 +429,7 @@ if cap > 0 then
 end
 if previous then
     redis.call('DEL', KEYS[2], KEYS[10])
+    if KEYS[13] then redis.call('DEL', KEYS[13]) end
     redis.call('LREM', KEYS[3], 0, ARGV[10])
     redis.call('ZREM', KEYS[11], ARGV[10])
 end
@@ -484,24 +457,16 @@ async def enqueue(r, payload: dict, delay_seconds: float = 0, created_by: Option
                   lock: Optional[str] = None, lock_ttl: int = 2592000,
                   max_bytes: Optional[int] = None, oom_ok: bool = False,
                   note: Optional[str] = None) -> Optional[dict]:
-    """Push a task payload onto its priority queue (or the delayed set), atomically.
+    """Push a job onto its priority queue (or the delayed set), atomically.
 
-    With an idempotency key, the first call queues the job and remembers the key
-    for IDEMPOTENCY_TTL seconds; repeating the call with the same key and the
-    same job returns the original response (plus "duplicate": true) and queues
-    nothing. Racing retries still produce one job.
-
-    capacity  refuse with QueueFull when the job's queue already holds this
-              many jobs (the API uses QUEUE_CAPACITY; 0 = no check). The check
-              and the push are one step, so the limit is exact under load.
-    lock      queue only if this key isn't set yet (cron: one run per tick);
-              returns None when it is.
+    idempotency_key  a repeat with the same key and job returns the original response
+                     ("duplicate": true) for IDEMPOTENCY_TTL seconds and queues nothing.
+    capacity  raise QueueFull when the queue already holds this many jobs (0 = no check).
+    lock      queue only if this key isn't set yet (cron: one run per tick); else None.
     max_bytes size limit for the job (default MAX_PAYLOAD_BYTES; 0 = none).
-    oom_ok    queue even when Redis is out of memory (follow-ups of a job that
-              just finished, such as webhooks; never for new work).
+    oom_ok    queue even when Redis is full (follow-ups of a finished job, never new work).
 
-    Raises TaskIdInUse when a job with the same task_id is still waiting or
-    running, and TooManyQueues when its queue would be one more than MAX_QUEUES.
+    Raises TaskIdInUse (the id belongs to an unfinished job) and TooManyQueues.
     """
     delay_seconds = float(delay_seconds or 0)
     if not math.isfinite(delay_seconds) or not 0 <= delay_seconds <= MAX_DELAY_SECONDS:
@@ -528,10 +493,10 @@ async def enqueue(r, payload: dict, delay_seconds: float = 0, created_by: Option
         record = json.dumps({"fingerprint": fingerprint, "response": result}) if idem else ""
         fields = [str(x) for kv in meta.items() for x in kv]
         args = (
-            ENQUEUE_SCRIPT, 12,
+            ENQUEUE_SCRIPT, 13,
             rkey("delayed_tasks") if delay_seconds > 0 else queue_key(priority, queue),
             task_key(task_id), RECENT_KEY, QUEUES_KEY, idem or _NO_KEY, lock or _NO_KEY,
-            *queue_keys(queue), rkey(f"fence:{task_id}"), FINISHED_KEY, wake_key(queue),
+            *queue_keys(queue), rkey(f"fence:{task_id}"), FINISHED_KEY, wake_key(queue), rkey(f"cancel:{task_id}"),
             raw, "delayed" if delay_seconds > 0 else "list", repr(now + delay_seconds), queue,
             max(1, settings.HISTORY_LIMIT), int(capacity or 0), record, max(1, settings.IDEMPOTENCY_TTL),
             str(int(lock_ttl)) if lock else "", task_id, "1" if oom_ok else "0", max(0, settings.MAX_QUEUES),
@@ -577,12 +542,10 @@ def _warn_unreplicated(task_id: str, acked: int, wanted: int) -> None:
                    f"it could be lost. Check the replicas (INFO replication).")
 
 
-# Atomically pull a waiting task out of its queue or the delayed set.
-# All three priority lists of the job's queue are checked: a job's recorded
-# priority can differ from the list it waits in (crash recovery puts jobs on
-# "high"; a later retry goes back to the original priority).
-# KEYS: the queue's 3 lists, delayed zset, task hash
-# ARGV: exact payload JSON, cancelled timestamp, result TTL
+# Atomically pull a waiting job out of its queue or the delayed set. All three priority
+# lists are checked: the list it waits in can differ from its recorded priority.
+# KEYS: the queue's 3 lists, delayed zset, task hash, finished-jobs set [, rate_limit turns]
+# ARGV: exact payload JSON, now, result TTL, task id, jobs kept, task-key prefix
 CANCEL_SCRIPT = KEEP_LUA + """
 local removed = 0
 for i = 1, 3 do
@@ -593,7 +556,7 @@ if removed == 0 then
     removed = redis.call('ZREM', KEYS[4], ARGV[1])
 end
 if removed > 0 then
-    if KEYS[7] then redis.call('ZREM', KEYS[7], ARGV[4]) end   -- its rate_limit turn is free again (D8)
+    if KEYS[7] then redis.call('ZREM', KEYS[7], ARGV[4]) end   -- free its rate_limit turn
     redis.call('HSET', KEYS[5], 'status', 'Cancelled', 'finished_at', ARGV[2])
     redis.call('EXPIRE', KEYS[5], tonumber(ARGV[3]))
     pytaskq_keep(KEYS[6], ARGV[4], ARGV[2], tonumber(ARGV[5]), ARGV[6])
@@ -615,7 +578,7 @@ redis.call('HSET', KEYS[1], 'cancel_requested_at', ARGV[2], 'cancel_requested_by
 redis.call('PUBLISH', '__PYTASKQ__events:global', 'update')
 return 'Stopping'
 """
-CANCEL_REQUEST_TTL = 7 * 86400     # kept until the job is cancelled (the worker deletes it then)
+CANCEL_REQUEST_TTL = 7 * 86400     # deleted earlier when the job ends
 STOPPING = "Stopping"     # cancel() result: the job is running; its worker stops it within a second or two
 
 
@@ -673,7 +636,7 @@ def public_view(meta: dict) -> dict:
     """Task hash minus internal fields, with JSON fields decoded for clients."""
     out = {k: v for k, v in meta.items() if k not in ("payload", "enqueue_nonce", "wf_result")}
     if "args" not in out and meta.get("payload"):
-        # Since 0.4.1 the arguments are stored once, inside the payload.
+        # The arguments are stored inside the payload (very old records have their own fields).
         try:
             stored = json.loads(meta["payload"], parse_constant=_reject_constant)
         except (TypeError, ValueError):
@@ -705,12 +668,7 @@ def public_view(meta: dict) -> dict:
 
 async def recent_tasks(r, limit: int = 50, status: Optional[str] = None, task_name: Optional[str] = None,
                        queue: Optional[str] = None) -> list[dict]:
-    """Newest-first task history, optionally filtered by status / task name.
-
-    Reads the history in small batches and stops as soon as `limit` rows are
-    found, so the common unfiltered case touches only the newest few jobs
-    (it used to read all HISTORY_LIMIT ids on every call).
-    """
+    """Newest-first task history, optionally filtered; reads in batches until `limit` rows are found."""
     limit = max(1, min(limit, settings.HISTORY_LIMIT))
     history = max(1, settings.HISTORY_LIMIT)
     out: list[dict] = []
@@ -752,8 +710,7 @@ LIST_ARGS_MAX = 16_384          # job lists include arguments up to this size (e
 LIST_RESULT_MAX = 2_048         # job lists include results up to this size (else "result_size")
 LIST_ERROR_MAX = 1_000          # job lists show this much of an error (the job's page has it all)
 
-# The small fields a job list needs. Lists used to read whole records, so a few jobs with
-# megabyte-sized arguments, results or errors made every list request megabytes (break tests D7, E8).
+# The small fields a job list needs; lists never read whole records (arguments/results can be large).
 SUMMARY_FIELDS = ("task_id", "task_name", "status", "queue", "priority", "created_at", "scheduled_for", "workflow_id",
                   "started_at", "finished_at", "duration_ms", "retry_count", "error", "note", "worker_id",
                   "cancelled_by", "cancel_requested_at", "cancel_requested_by", "progress", "progress_message",
@@ -778,7 +735,8 @@ async def read_summaries(r, task_ids: list[str], text_search: bool = False) -> l
         raw = await pipe.execute()
     args_max = TEXT_FIELD_MAX if text_search else LIST_ARGS_MAX
     result_max = TEXT_FIELD_MAX if text_search else LIST_RESULT_MAX
-    metas, wanted = [], []
+    metas: list[Optional[dict]] = []
+    wanted: list = []
     for i, tid in enumerate(task_ids):
         values, payload_len, result_len = raw[3 * i], int(raw[3 * i + 1] or 0), int(raw[3 * i + 2] or 0)
         meta = {k: v for k, v in zip(SUMMARY_FIELDS, values) if v is not None}
@@ -819,7 +777,7 @@ def list_view(meta: dict) -> dict:
 
 
 def dead_letter_view(raw: str) -> Optional[dict]:
-    """A dead-letter entry for lists: its error cut short and big arguments left out (break test E9)."""
+    """A dead-letter entry for lists: its error cut short and big arguments left out."""
     try:
         item = json.loads(raw, parse_constant=_reject_constant)
     except ValueError:
@@ -848,17 +806,16 @@ async def search_finished(r, *, status: Optional[str] = None, task_name: Optiona
     """
     Search finished jobs (the FINISHED_JOBS_KEPT newest ones), newest first.
 
-    Filters: status, task name, queue, finished between `since` and `until`
-    (Unix seconds), and `text` found in the id, task name, arguments, result,
-    error or note (case-insensitive). One request looks at up to
-    SEARCH_SCAN_MAX jobs; `next` is the cursor for the following page (None at
-    the end). Jobs that finished before 0.5.0 aren't in this index.
+    Filters: status, task name, queue, finish time between `since` and `until` (Unix
+    seconds), and `text` in the id, name, arguments, result, error or note. One request
+    looks at up to SEARCH_SCAN_MAX jobs; `next` is the cursor for the following page.
+    Jobs that finished before 0.5.0 aren't in this index.
     """
     limit = max(1, min(int(limit), 500))
     text = (text or "").strip().lower()[:200]
     for name, value in (("since", since), ("until", until)):
         if value is not None and not math.isfinite(float(value)):
-            raise ValueError(f"{name} must be a time in Unix seconds, got {value!r}")      # D9
+            raise ValueError(f"{name} must be a time in Unix seconds, got {value!r}")
     top = float("inf") if until is None else float(until)
     bottom = "-inf" if since is None else repr(float(since))
     skip = 0
@@ -884,8 +841,7 @@ async def search_finished(r, *, status: Optional[str] = None, task_name: Optiona
         if not chunk:
             at_end = True
             break
-        # Small fields only (and arguments/results up to TEXT_FIELD_MAX for a text search): a search used
-        # to read every whole record, ~10 GB in the worst case (break test D7).
+        # Small fields only (and arguments/results up to TEXT_FIELD_MAX for a text search).
         rows = await read_summaries(r, [tid for tid, _ in chunk], text_search=bool(text))
         for (tid, score), meta in zip(chunk, rows):
             position += 1
@@ -917,11 +873,7 @@ async def search_finished(r, *, status: Optional[str] = None, task_name: Optiona
 
 async def registered_tasks(r) -> list[dict]:
     """Tasks advertised in the last REGISTRY_TTL seconds by any worker (or the dashboard's --app).
-
-    Each worker adds its tasks every minute, so workers running different apps
-    are all listed. A task nobody advertises any more (renamed, removed, its
-    workers stopped) drops out after REGISTRY_TTL and is cleaned up.
-    """
+    Stale entries are cleaned up."""
     cutoff = clock.now() - REGISTRY_TTL
     async with r.pipeline(transaction=False) as pipe:
         pipe.hgetall(REGISTRY_KEY)
@@ -999,9 +951,8 @@ return redis.call('SREM', KEYS[1], ARGV[1])
 
 
 # ── Pausing queues ───────────────────────────────────────────────────────────
-# HASH queue name → JSON {"by", "at"}. The workers' pop script skips paused queues (so a pause
-# takes effect at once); workers also keep a copy, refreshed every PAUSE_CHECK seconds, so they
-# wait quietly instead of asking again and again. Running jobs finish; new jobs still queue up.
+# HASH queue name → JSON {"by", "at"}. The pop script skips paused queues; workers also cache the
+# set (refreshed every PAUSE_CHECK seconds) to stay idle. Running jobs finish; new jobs still queue.
 PAUSED_KEY = rkey("pytaskq:paused")
 PAUSE_CHECK = 2.0
 
@@ -1041,9 +992,6 @@ async def prune_queues(r) -> list[str]:
     """
     Forget queue names nothing uses any more: no waiting jobs, no live worker
     serving them, no advertised task living on them, no scheduled job for them.
-
-    Names were only ever added, so typos and one-off names piled up, and every
-    dashboard refresh counted all of them (5,000 names: 10 ms → 480 ms).
     """
     names = await r.smembers(QUEUES_KEY)
     if len(names) <= 1:
@@ -1076,12 +1024,8 @@ async def prune_queues(r) -> list[str]:
 
 async def queue_overview(r) -> dict:
     """
-    How many jobs are where, counted from Redis itself (two round trips).
-
-    These used to be separate counters that every step incremented and
-    decremented by hand; they drifted (crashes, recoveries, cancellations) and
-    could even go negative. Counting the lists themselves is always right.
-    Each queue also reports how many live workers serve it.
+    How many jobs are where, counted from the lists themselves (two round trips), so the
+    numbers can't drift. Each queue also reports how many live workers serve it.
     """
     async with r.pipeline(transaction=False) as pipe:
         pipe.smembers(QUEUES_KEY)

@@ -2,21 +2,12 @@
 pytaskq.core.keys — every Redis key name goes through here
 ==========================================================
 
-`REDIS_KEY_PREFIX` puts all of PyTaskQ's keys (and its pub/sub channel) under
-one prefix, so several PyTaskQ installations, or PyTaskQ and another app, can
-share one Redis database without seeing each other's queues, jobs or accounts.
+`REDIS_KEY_PREFIX` puts all keys (and the pub/sub channel) under one prefix, so several
+installations can share one Redis. It's wrapped in braces (`{shop}:queue:high`), a Redis
+Cluster hash tag: every key lands in one slot, as the multi-key Lua scripts require.
 
-The prefix is wrapped in braces — `REDIS_KEY_PREFIX=shop` gives `{shop}:queue:high`,
-`{shop}:task:…` — which makes it a Redis Cluster "hash tag": every key lands in
-the same cluster slot, as the multi-key Lua scripts require. (PyTaskQ's client
-doesn't talk to Redis Cluster yet, but the key layout no longer prevents it.)
-
-Without a prefix (the default) the key names are exactly the ones earlier
-versions used, so upgrading moves nothing. Changing the prefix of an existing
-installation starts from an empty one: the old keys are left where they are.
-
-The prefix is read once at startup; every process of one installation (API,
-workers, your app) must use the same value.
+Without a prefix the key names are unchanged. Changing the prefix starts from an empty
+installation. Every process of one installation must use the same value.
 """
 
 from __future__ import annotations

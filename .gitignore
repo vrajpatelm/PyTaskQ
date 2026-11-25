@@ -42,6 +42,10 @@ install.cmd
 docs/INTERVIEW_PREP.md
 docs/PYTASKQ_ARCHITECTURE_ANALYSIS.md
 Claude outputs/
+CLAUDE.md
+CLAUDE.local.md
+TEST.md
+.claude/
 
 # Python packaging output
 dist/

@@ -2,18 +2,11 @@
 pytaskq.core.clock — one clock for the whole fleet
 ===================================================
 
-Heartbeats, retry times and scheduled jobs are compared across machines: a
-worker writes "I'm alive until T", and the leader on another machine checks T
-against *its* clock. If the two clocks disagree by more than the heartbeat
-timeout, a healthy worker looks dead and its jobs are taken away from it.
-
-So every timestamp that another machine compares against uses Redis's clock
-(the `TIME` command). Asking Redis on every call would cost a round trip, so
-each process measures how far its own clock is from Redis's and adds that
-difference: `now()` is cheap, and accurate to a few milliseconds.
-
-Workers re-measure on every heartbeat (every 10 seconds); the API and the SDK
-re-measure at most once a minute, only when they need a time.
+Timestamps that another machine compares against (heartbeats, retry and schedule
+times) use Redis's clock (`TIME`), so machines whose clocks disagree still agree on
+who is alive and what is due. Each process measures its offset from Redis's clock
+and adds it: `now()` is cheap and accurate to a few milliseconds. Workers re-measure
+on every heartbeat; the API and SDK at most once a minute.
 """
 
 from __future__ import annotations

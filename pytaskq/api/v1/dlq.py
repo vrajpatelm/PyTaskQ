@@ -19,17 +19,16 @@ _NOT_REPLAYABLE = ("This entry isn't a valid job: it was found in a queue and ke
                    "sent (its text is in 'raw'). It can't run; delete it.")
 
 
-# Take one entry out of the dead-letter list and queue it again, atomically.
-# If someone else already took it (a second click, another admin, "Replay all"
-# at the same moment), LREM removes nothing and the job is NOT queued twice.
+# Take one entry out of the dead-letter list and queue it again, atomically. If someone else already
+# took it, LREM removes nothing and the job isn't queued twice.
 # KEYS: dlq, target queue list, task hash, finished set, wake list, fence
+#       [, the job's cancel request: deleted so it can't cancel the replay]
 # ARGV: dead-letter entry, new payload, task_id, task_name, priority, note, (unused), queue name,
 #       fence read before ("" = none), new fence
 # Returns 1 replayed, 0 already taken by someone else, -1 the id is in use, -2 the fence moved (retry).
 # The record has no expiry while the job waits again (it gets RESULT_TTL when it finishes).
 REPLAY_SCRIPT = queueing.WAKE_LUA + """
--- A job with this id is waiting or running now (the id was reused): replaying would run a second
--- copy at the same time (break test E7).
+-- A job with this id is waiting or running (the id was reused): replaying would run a second copy.
 local status = redis.call('HGET', KEYS[3], 'status')
 if status and status ~= 'Success' and status ~= 'DeadLetter' and status ~= 'Cancelled' and status ~= 'Failed' then
     return -1
@@ -41,6 +40,7 @@ if redis.call('LREM', KEYS[1], 1, ARGV[1]) == 0 then
 end
 -- A new fence: any attempt of an earlier run that still finishes late is ignored.
 redis.call('SET', KEYS[6], ARGV[10], 'EX', 86400)
+if KEYS[7] then redis.call('DEL', KEYS[7]) end
 redis.call('RPUSH', KEYS[2], ARGV[2])
 pytaskq_wake(KEYS[5], 100)
 if ARGV[3] ~= '' then
@@ -73,7 +73,6 @@ async def get_dlq(offset: int = Query(0, ge=0), limit: int = Query(100, ge=1, le
     """
     Dead letters, newest first, a page at a time (`offset`, `limit` up to 500; `total` is how many there
     are). Errors are cut to 1,000 characters and big arguments left out; `GET /task/{id}` has them all.
-    It used to send the whole list with full arguments: 22 MB for 10,000 dead letters (break test E9).
     """
     async with redis_client.r.pipeline(transaction=False) as pipe:
         pipe.lrange(DLQ_KEY, offset, offset + limit - 1)
@@ -95,8 +94,8 @@ async def _find(task_id: str):
 async def _fresh_payload(item: dict) -> tuple[dict, str]:
     """
     Reset a dead-lettered task so it runs again as a new attempt: retries, waits and its
-    rate-limit turn start over (a turn reserved long ago let replays burst, break test D4),
-    and it gets a new fence token. Returns (payload, the fence it was built from).
+    rate-limit turn start over (an old turn would let replays burst), and it gets a new fence
+    token. Returns (payload, the fence it was built from).
     """
     task = {k: v for k, v in item.items() if k not in _DLQ_ONLY_FIELDS}
     task["retry_count"] = 0
@@ -128,9 +127,9 @@ async def _replay(raw: str, item: dict) -> Optional[dict]:
         note = f"Replayed from dead letters at {time.strftime('%Y-%m-%d %H:%M:%S')}"
         queue = queueing.payload_queue(task)
         done = int(await redis_client.r.eval(
-            REPLAY_SCRIPT, 6,
+            REPLAY_SCRIPT, 7,
             DLQ_KEY, queueing.queue_key(priority, queue), queueing.task_key(task_id), queueing.FINISHED_KEY,
-            queueing.wake_key(queue), rkey(f"fence:{task_id}"),
+            queueing.wake_key(queue), rkey(f"fence:{task_id}"), rkey(f"cancel:{task_id}"),
             raw, json.dumps(task), task_id, task.get("task_name", ""), priority, note, int(settings.RESULT_TTL),
             queue, seen, str(task["fence_token"]),
         ))

@@ -6,7 +6,7 @@ These example tasks power the default dashboard demo and the Docker worker
 (`pytaskq worker --app pytaskq.task_registery:queue`). Your own project should
 create its own `PyTaskQ()` instance — see example_app.py.
 
-Kept importable for backwards compatibility:
+Also re-exports, for compatibility:
     PyTaskQ, queue, TASKS, UnsafeURL, _assert_safe_url, _SafeRedirectHandler, _SAFE_OPENER
 """
 
@@ -27,9 +27,8 @@ from pytaskq.net import (  # noqa: F401  (re-exported for backwards compatibilit
     _SAFE_OPENER,
 )
 
-# Global demo SDK instance
 queue = PyTaskQ("demo")
-# Alias for backward compatibility with older worker code
+# Kept for older worker code
 TASKS = queue.TASKS
 
 
@@ -42,8 +41,7 @@ def matrix_multiply(size: int):
     A = np.random.rand(size, size)
     B = np.random.rand(size, size)
     result = np.dot(A, B)
-    # Return shape info only — returning a 1000x1000 float array as JSON
-    # would produce a ~8MB response and crash Redis serialization.
+    # Return a summary: the matrix itself would be megabytes of JSON.
     return f"Matrix multiplication complete: {size}x{size} result computed."
 
 
@@ -52,38 +50,33 @@ def generate_csv_report(rows: int):
     """Generate an in-memory CSV report with fake transactions."""
     try:
         start_time = time.time()
-        
-        # 1. Create an in-memory string buffer
+
         output = io.StringIO()
-        
-        # 2. Create a CSV writer attached to the buffer
+
         writer = csv.writer(output)
-        
-        # 3. Write the header row
+
         writer.writerow(["transaction_id", "user_id", "amount", "status"])
-        
-        # 4. Generate the fake data
+
         for _ in range(rows):
             transaction_id = str(uuid.uuid4())
             user_id = random.randint(1, 500)
             amount = round(random.uniform(10.0, 1000.0), 2)
             status = random.choice(["Success", "Failed", "Pending"])
-            
+
             writer.writerow([transaction_id, user_id, amount, status])
-            
-        # 5. Get the full CSV string from the buffer
+
         csv_string = output.getvalue()
         output.close()
-        
+
         end_time = time.time()
-        
+
         return {
             "status": "success",
             "rows_generated": rows,
             "bytes_size": len(csv_string),
             "time_taken_ms": round((end_time - start_time) * 1000)
         }
-        
+
     except Exception as e:
         return {"status": "error", "error": str(e)}
 
@@ -95,27 +88,23 @@ def resize_image(image_url: str, width: int, height: int):
     from PIL import Image
     try:
         start_time = time.time()
-        
-        # 1. SSRF guard: reject URLs that resolve to private/internal addresses
+
+        # SSRF guard: reject private/internal addresses
         assert_safe_url(image_url)
-        
-        # 2. Download the image into memory (capped) instead of straight to disk
+
         request = urllib.request.Request(image_url, headers={"User-Agent": "PyTaskQ-Worker/1.0"})
         with SAFE_OPENER.open(request, timeout=10) as resp:
             image_bytes = resp.read(10 * 1024 * 1024)  # hard cap: 10 MB
-        
-        # 3. Open, resize, and encode the image using Pillow
+
         with Image.open(io.BytesIO(image_bytes)) as img:
-            # Convert to RGB in case it's a PNG with transparency
-            if img.mode in ("RGBA", "P"):
-                img = img.convert("RGB")
-            
-            resized = img.resize((width, height))
+            # JPEG has no transparency
+            rgb = img.convert("RGB") if img.mode in ("RGBA", "P") else img
+            resized = rgb.resize((width, height))
             buffer = io.BytesIO()
             resized.save(buffer, format="JPEG", quality=85)
-        
+
         end_time = time.time()
-        
+
         return {
             "status": "success",
             "bytes_processed": len(image_bytes),
@@ -123,16 +112,16 @@ def resize_image(image_url: str, width: int, height: int):
             "dimensions": f"{width}x{height}",
             "time_taken_ms": round((end_time - start_time) * 1000)
         }
-        
+
     except Exception as e:
         return {"status": "error", "error": str(e)}
-    
-    
+
+
 @queue.task(type="io")
 def url_health_check(url: str):
     """Check that a public URL responds and measure its latency."""
     try:
-        # SSRF guard: reject URLs that resolve to private/internal addresses
+        # SSRF guard: reject private/internal addresses
         assert_safe_url(url)
         time1=time.time()
         resp = SAFE_OPENER.open(url, timeout=10)

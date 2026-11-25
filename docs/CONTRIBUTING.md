@@ -18,6 +18,12 @@ Thank you for your interest in contributing to this project! Please review the g
     cp .env.example .env
     ```
 4.  **Local Services**: Ensure a local Redis server is active on `localhost:6379`.
+5.  **Checks on every commit**:
+    ```powershell
+    pre-commit install          # ruff, mypy, whitespace and YAML/TOML checks before each commit
+    ```
+
+Platforms: Linux is the production target (CI, Docker images). Windows works for development; tests that need a real `redis-server` skip there, so run them in WSL or Linux before a PR that touches the worker.
 
 ---
 
@@ -41,7 +47,7 @@ Thank you for your interest in contributing to this project! Please review the g
 *   When you change code behavior, update the matching doc in the same PR:
     *   API changes → `API.md`
     *   Queue/worker/retry behavior → `ARCHITECTURE.md`
-    *   Config variables (add/remove/rename) → `.env.example` + `ARCHITECTURE.md` §5
+    *   Config variables (add/remove/rename) → `pytaskq/core/config.py` + `.env.example` (and `SHARED` in `pytaskq/core/fleet.py` if every process must use the same value)
     *   Bug fixes / features → `CHANGELOG.md` (under the next version)
 
 ---
@@ -57,6 +63,11 @@ Any bug fix or new feature must include corresponding tests inside the `tests/` 
 *   Write isolated tests using `fakeredis` where possible.
 *   If introducing connection error resilience or crash recovery, write mock failure-injection tests in the pattern of the existing `test_crash_recovery.py` and `test_graceful_shutdown.py`.
 *   New URL-fetching behavior needs a case in `tests/test_ssrf_guard.py`.
+*   Coverage must stay at or above the floor CI enforces (84%, branch coverage, on Linux with a real Redis):
+    ```powershell
+    python -m pytest --cov --cov-report=term
+    ```
+*   Types: `mypy` must pass (configured in `pyproject.toml`; CI runs it).
 
 ---
 
@@ -64,5 +75,5 @@ Any bug fix or new feature must include corresponding tests inside the `tests/` 
 
 1.  Create a branch for your work (e.g. `feature/matrix-optimization` or `bugfix/redis-backoff`).
 2.  Commit changes with clear and descriptive commit messages.
-3.  Run full test suite locally and update the affected docs (see Documentation Rules).
+3.  Run the full test suite and `pre-commit run --all-files`, and update the affected docs (see Documentation Rules).
 4.  Submit a Pull Request targeting the `main` branch. Describe the changes, why they are needed, and how you verified them.

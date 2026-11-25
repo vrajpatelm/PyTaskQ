@@ -15,11 +15,8 @@ Inside a task:
             save(row)
             progress(100 * (i + 1) / len(rows), f"{i + 1} of {len(rows)} rows")
 
-`progress()` is cheap: the worker keeps only the latest value and writes it to
-Redis about once a second, so calling it for every row is fine. It works in
-every task type (CPU tasks send it from their process). Outside a job (calling
-the function directly, in a test) these helpers do nothing: progress() returns
-False, cancelled() returns False, current_task_id() returns None.
+`progress()` is cheap (only the latest value is written, about once a second) and
+works in every task type. Outside a job these helpers return False / False / None.
 """
 
 from __future__ import annotations
@@ -53,7 +50,7 @@ def _check(percent, message) -> tuple[Optional[float], Optional[str]]:
             raise ValueError(f"progress() takes a percentage from 0 to 100, got {percent!r}")
         try:
             percent = float(percent)
-        except OverflowError:            # an int too big for a float (break test D11)
+        except OverflowError:            # an int too big for a float
             percent = 100.0 if percent > 0 else 0.0
         percent = round(min(100.0, max(0.0, percent)), 1)
     if message is not None:
@@ -140,8 +137,7 @@ async def _collect_async(gen) -> list:
 def _finish_value(value):
     """What a sync call returned, made real: run a coroutine it returned, read out a generator."""
     if inspect.isawaitable(value):
-        # A decorator without async support around an `async def`: the call only created the
-        # coroutine. Run it here (in this thread or process) instead of storing "<coroutine …>".
+        # An `async def` behind a sync decorator: the call only created the coroutine. Run it here.
         async def wait():
             return await value
         value = asyncio.run(wait())
@@ -154,9 +150,8 @@ def _finish_value(value):
 
 def call_task(job: Optional[Job], func, args, kwargs):
     """
-    Run a task's code in a thread or a CPU process. Whatever the code does, the
-    worker survives: sys.exit() and KeyboardInterrupt become TaskExited (break test
-    E1), and a returned coroutine or generator is run or read (E3).
+    Run a task's code in a thread or a CPU process. sys.exit() and KeyboardInterrupt become
+    TaskExited (the worker survives); a returned coroutine or generator is run or read.
     """
     token = _current.set(job)
     try:
@@ -186,11 +181,7 @@ async def acall_task(job: Optional[Job], func, args, kwargs):
 
 
 class Latest:
-    """
-    The latest progress of each running job, written by tasks (any thread) and
-    taken by the worker's flusher about once a second. Only the newest value
-    per job is kept, so a task can report as often as it likes.
-    """
+    """The newest progress of each running job (any thread), taken by the worker's flusher."""
 
     def __init__(self):
         self._lock = threading.Lock()

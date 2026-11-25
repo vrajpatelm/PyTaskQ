@@ -2,19 +2,13 @@
 pytaskq.core.pressure — counts the requests PyTaskQ had to turn away
 =====================================================================
 
-Two kinds of "no" matter for tuning:
-
   * 429 queue_full      the queue reached QUEUE_CAPACITY (workers are behind)
   * 503 redis_busy      no free Redis connection within REDIS_POOL_TIMEOUT
   * 503 redis_down      Redis could not be reached at all
+  * handed_back         a worker popped a job whose task it doesn't have (not a refusal)
 
-and one thing that isn't a refusal but wastes work:
-
-  * handed_back         a worker popped a job whose task it doesn't have
-
-Counting happens in memory (it must work exactly when Redis is struggling) and
-a background task adds the counts to Redis every few seconds, so the
-Settings → Performance page sees the total across every API process.
+Counted in memory (it must work while Redis is struggling) and flushed to Redis every
+few seconds, so Settings → Performance sees the total across processes.
 
 Redis keys: stats:pressure:{minute}  HASH  reason → count   (kept for 1 hour)
 """

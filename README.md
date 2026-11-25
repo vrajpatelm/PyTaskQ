@@ -248,12 +248,16 @@ Upgrading from 0.3.1 (the previous release on PyPI)? Read [docs/UPGRADING.md](ht
 
 ```bash
 pip install -e ".[dev,demo]"
-python -m pytest             # in-memory via fakeredis, no Redis needed
+pre-commit install           # ruff, mypy and file checks before each commit
+python -m pytest             # in-memory via fakeredis; tests needing a real redis-server skip without one
+mypy                         # type check
 
 cd frontend && npm install
 npm run dev                  # dashboard with hot reload; talks to `pytaskq dashboard` on :8000
 npm run build                # writes the bundle into pytaskq/static/
 ```
+
+Platforms: Linux in production (CI and the Docker images are Linux, amd64 and arm64); Windows for development. macOS is checked in CI but not yet supported.
 
 See [TASKS](https://github.com/vrajpatelm/PyTaskQ/blob/main/docs/TASKS.md), [WORKFLOWS](https://github.com/vrajpatelm/PyTaskQ/blob/main/docs/WORKFLOWS.md), [GUARANTEES](https://github.com/vrajpatelm/PyTaskQ/blob/main/docs/GUARANTEES.md), [QUEUES](https://github.com/vrajpatelm/PyTaskQ/blob/main/docs/QUEUES.md), [WORKERS](https://github.com/vrajpatelm/PyTaskQ/blob/main/docs/WORKERS.md), [REDIS](https://github.com/vrajpatelm/PyTaskQ/blob/main/docs/REDIS.md), [UPGRADING](https://github.com/vrajpatelm/PyTaskQ/blob/main/docs/UPGRADING.md), [CONTRIBUTING](https://github.com/vrajpatelm/PyTaskQ/blob/main/docs/CONTRIBUTING.md), [ARCHITECTURE](https://github.com/vrajpatelm/PyTaskQ/blob/main/docs/ARCHITECTURE.md) and the [CHANGELOG](https://github.com/vrajpatelm/PyTaskQ/blob/main/CHANGELOG.md).
 

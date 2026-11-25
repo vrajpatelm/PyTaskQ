@@ -9,7 +9,7 @@ Admin:    GET /auth/users, PATCH|DELETE /auth/users/{username},
           GET|POST /auth/invites, DELETE /auth/invites/{id}
 """
 
-from typing import Literal, Optional
+from typing import Any, Literal, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from pydantic import BaseModel, Field
@@ -65,7 +65,7 @@ class SetupRequest(Credentials):
 async def status(request: Request):
     """What the dashboard should show: setup screen, sign-in screen, or the app."""
     r = redis_client.r
-    out = {"auth_enabled": settings.auth_enabled, "setup_required": await auth.setup_required(r), "user": None}
+    out: dict[str, Any] = {"auth_enabled": settings.auth_enabled, "setup_required": await auth.setup_required(r), "user": None}
     try:
         out["user"] = (await current_user(request)).public()
     except HTTPException:

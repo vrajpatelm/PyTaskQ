@@ -2,17 +2,10 @@
 pytaskq.core.fleet — do all processes agree?
 ============================================
 
-The dashboard/API, every worker and your app each read their own environment.
-Several settings only work when they're the same everywhere: a worker with a
-shorter RESULT_TTL deletes results the dashboard promised to keep, a different
-WEBHOOK_SECRET makes webhook signatures fail, a different FINISHED_JOBS_KEPT
-trims history at different points. And during a rolling upgrade, old and new
-workers run side by side.
-
-Each worker advertises its version and these settings in its worker record;
-the dashboard compares them with its own and says what differs (Settings →
-Performance, and its log). Per-worker settings (how many processes and
-threads, which queues, its name) are expected to differ and aren't compared.
+Some settings must be the same in every process (e.g. RESULT_TTL, WEBHOOK_SECRET).
+Each worker advertises its version and these settings; the dashboard compares them
+with its own and reports differences. Per-worker settings (pools, queues, name)
+aren't compared.
 """
 
 from __future__ import annotations

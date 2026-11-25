@@ -2,14 +2,9 @@
 pytaskq.services.live — live dashboard updates, shared by every open browser tab
 ================================================================================
 
-Workers and the API publish "update" on the `events:global` channel whenever a
-job changes. Before, every open dashboard tab held its own Redis subscription
-and re-read every number on every single event, so 150 jobs a second meant 150
-refreshes a second per tab: lots of CPU and Redis work nobody could see.
-
-Now each API process keeps ONE subscription, and dashboards refresh at most
-LIVE_UPDATES_PER_SECOND times a second (default 2). Tabs in the same process
-also share one snapshot of the numbers until something changes again.
+Workers and the API publish "update" on `events:global` whenever a job changes. Each API
+process keeps one subscription; dashboards refresh at most LIVE_UPDATES_PER_SECOND times a
+second, and tabs in the same process share one snapshot until something changes.
 """
 
 from __future__ import annotations

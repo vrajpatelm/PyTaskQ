@@ -18,7 +18,7 @@ But a job **can run more than once**:
 
 What PyTaskQ does guarantee is that **only one attempt's outcome counts**. Each job carries a fence token; a stale attempt's result or failure is ignored, so a job never ends up both succeeded and dead-lettered, or retried twice.
 
-A **lost reply** doesn't make duplicates either. If the connection drops after Redis has done something but before the answer arrives (a network blip, a failover), the client sends the command again; PyTaskQ recognises the repeat: a job is queued once (the caller gets "queued", not an error), a failure is one dead letter, a success counts once.
+A **lost reply** doesn't make duplicates either. If the connection drops after Redis has done something but before the answer arrives (a network blip, a failover), the client sends the command again; PyTaskQ recognises the repeat: a job is queued once (the caller gets "queued", not an error), a failure is one dead letter, a success counts once. A job a worker took but never received goes back on its queue within about a minute.
 
 **Task code can't stop the worker.** `sys.exit()`, `KeyboardInterrupt`, a coroutine or generator returned by a decorator, text that isn't valid UTF-8, a 20 MB error message: each becomes a normal outcome for that one job (failed, or stored cleanly). Before 0.6 some of these could stop the worker or leave a job stuck in *Processing*.
 
@@ -81,13 +81,13 @@ All times that machines compare (heartbeats, when a scheduled job is due, cron t
 `max_concurrency` and `rate_limit` hold across every worker, because they're kept in Redis.
 
 - A `max_concurrency` place is a lease per attempt that the worker renews while the job runs, and an IO job that timed out keeps it until its thread really returns. If a worker is cut off from Redis for more than about a minute, its leases run out and another job may start, so for a short time one more job than the limit can be running.
-- `rate_limit` starts are never closer than the limit allows: a turn that passed while the job couldn't start (a pause, a busy worker, a replay) is replaced by a new one.
+- `rate_limit` starts are never closer than the limit allows: a turn that passed while the job couldn't start (a pause, a busy worker, a replay) is replaced by a new one. Rates above one start a second hold too (`"10/s"` gives about 10 starts a second). Starts are decided on Redis's clock, so workers whose clocks differ can't start jobs closer together. Your task's code begins a little after its start (the job is handed to a process or thread), so on a busy machine two tasks' code can begin a few tens of milliseconds closer than the limit; their starts never are.
 
 ## Cancelling and pausing
 
 - Cancelling a **waiting** job is immediate and certain: it won't run.
 - Cancelling a **running** job stops it within about a second. An IO task's code keeps running until it returns (Python can't stop a thread), but its result is ignored and it isn't retried. A job that was just finishing as you pressed cancel may still succeed.
-- A job that was cancelled while a worker had it (or whose worker died) **never starts again**: the request is checked right before every start, and kept (up to a week) until the job is cancelled.
+- A job that was cancelled while a worker had it (or whose worker died) **never starts again**: the request is checked right before every start, and kept (up to a week) until the job is cancelled. A request that comes too late to stop a run ends with that run: replaying the job, or queueing a new job with the same id, runs normally.
 - **Pausing a queue** takes effect at once for new jobs; running jobs finish. Cron runs of its tasks are skipped while it's paused.
 
 ## Workflows

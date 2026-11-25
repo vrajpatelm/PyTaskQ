@@ -17,7 +17,8 @@ classifiers = [
     "Framework :: AsyncIO",
     "Framework :: FastAPI",
     "Intended Audience :: Developers",
-    "Operating System :: OS Independent",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: Microsoft :: Windows",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3 :: Only",
     "Programming Language :: Python :: 3.10",
@@ -26,6 +27,7 @@ classifiers = [
     "Programming Language :: Python :: 3.13",
     "Topic :: System :: Distributed Computing",
     "Topic :: Software Development :: Libraries :: Python Modules",
+    "Typing :: Typed",
 ]
 
 # Everything needed to run workers, the API and the dashboard.
@@ -49,7 +51,11 @@ dev = [
     "pytest-asyncio>=0.23.0",
     "fakeredis[lua]>=2.20.0",
     "httpx>=0.26.0",
+    "pytest-cov>=5.0",
     "ruff",
+    "mypy>=1.11",
+    "types-croniter",
+    "pre-commit",
     "build",
     "twine",
 ]
@@ -73,4 +79,21 @@ include = ["pytaskq", "pytaskq.*"]
 
 [tool.setuptools.package-data]
 # The built dashboard ships inside the package so `pytaskq dashboard` works after pip install
-pytaskq = ["static/*", "static/assets/*"]
+pytaskq = ["static/*", "static/assets/*", "py.typed"]
+
+[tool.mypy]
+python_version = "3.10"
+packages = ["pytaskq"]
+ignore_missing_imports = true
+check_untyped_defs = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+
+[tool.coverage.run]
+source = ["pytaskq"]
+branch = true
+
+[tool.coverage.report]
+show_missing = false
+skip_covered = true
+exclude_also = ["if __name__ == .__main__.:", "if TYPE_CHECKING:"]

@@ -2,6 +2,7 @@ import logging
 import os
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Any
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -146,11 +147,9 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# Cross-origin access. The dashboard itself is same-origin and needs none of this.
-# With the default ALLOWED_ORIGINS="*", other sites may call the API with an API
-# token but never with a visitor's session cookie: allowing credentials for "*"
-# made Starlette echo back any Origin, so any site the visitor opened could read
-# API responses as them. List exact origins to allow cookies from them.
+# Cross-origin access (the dashboard itself is same-origin). With ALLOWED_ORIGINS="*", other sites
+# may call the API with a token but never with a visitor's cookie: credentials for "*" would let
+# any site read responses as the visitor. List exact origins to allow cookies from them.
 _origins = settings.allowed_origins_list
 _any_origin = "*" in _origins
 app.add_middleware(
@@ -168,7 +167,7 @@ if STATIC_DIR.is_dir():
 
 for _redis_error in (RedisConnectionError, RedisTimeoutError, RedisOutOfMemoryError, RedisReadOnlyError):
     app.add_exception_handler(_redis_error, redis_connection_error_handler)
-app.add_exception_handler(RequestValidationError, validation_error_handler)
+app.add_exception_handler(RequestValidationError, validation_error_handler)  # type: ignore[arg-type]  # Starlette's handler type is too narrow
 
 app.include_router(api_router)
 
@@ -178,10 +177,8 @@ async def health_check():
     """
     Used by Docker health checks, load balancers and monitoring.
 
-    503 only when Redis can't be reached (this API can't serve anything then).
-    Otherwise 200, with "status": "degraded" and a list of warnings when Redis
-    is nearly full, set to delete keys, or has lost its data: the API still
-    serves the dashboard then, but someone should look.
+    503 only when Redis can't be reached. Otherwise 200, with "status": "degraded" and
+    warnings when Redis is nearly full, set to delete keys, or has lost its data.
     """
     import time as _time
     from pytaskq.core import redis_client, redis_health
@@ -197,7 +194,7 @@ async def health_check():
         lost_at = None
     if lost_at and _time.time() - lost_at < 7 * 86400:
         warnings.append(f"Redis lost its data {(_time.time() - lost_at) / 3600:.0f} hours ago")
-    body = {"status": "degraded" if warnings else "ok", "redis": "connected", "version": __version__}
+    body: dict[str, Any] = {"status": "degraded" if warnings else "ok", "redis": "connected", "version": __version__}
     if mem:
         body["redis_memory"] = {k: mem[k] for k in ("used_bytes", "max_bytes", "percent", "policy")}
     if warnings:

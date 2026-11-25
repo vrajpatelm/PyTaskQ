@@ -16,12 +16,8 @@ def _is_pool_exhausted(exc: Exception) -> bool:
 
 
 async def redis_connection_error_handler(request: Request, exc: Exception):
-    """503 + Retry-After for every "Redis can't answer right now" error.
-
-    Connection errors, timeouts (a frozen or overloaded Redis), a full Redis
-    (maxmemory reached) and a read-only replica during a failover all used to
-    surface as 500 Internal Server Error, except plain connection errors.
-    """
+    """503 + Retry-After for every "Redis can't answer right now" error: connection errors, timeouts,
+    a full Redis (maxmemory) and a read-only replica during a failover."""
     from redis import exceptions as redis_errors
     if isinstance(exc, redis_errors.OutOfMemoryError) or "OOM command not allowed" in str(exc):
         pressure.record("redis_full", f"{request.method} {request.url.path}")

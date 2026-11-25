@@ -18,6 +18,7 @@ import importlib
 import logging
 import os
 import sys
+from typing import Any
 
 from dotenv import load_dotenv
 from pytaskq.core.keys import k as rkey
@@ -143,7 +144,7 @@ def cmd_ping(args):
     from pytaskq.core.config import settings
 
     async def go():
-        client = make_client()
+        client: Any = make_client()
         try:
             await client.ping()
             seconds, micros = await client.time()      # Redis's clock: heartbeats are written with it

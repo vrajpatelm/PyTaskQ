@@ -262,7 +262,8 @@ def test_e1_real_worker_survives_a_task_that_exits(redis_url, tmp_path):
     import sys as _sys
     runlog = tmp_path / "runs.log"
     env_vars = {**os.environ, "REDIS_URL": redis_url.replace("/0", "/3"), "PYTASKQ_AUTH": "off",
-                "PYTHONPATH": os.getcwd(), "RUNLOG": str(runlog), "WORKER_IO_WORKERS": "2",
+                "PYTHONPATH": os.pathsep.join(filter(None, [os.getcwd(), os.environ.get("PYTHONPATH")])),
+                "RUNLOG": str(runlog), "WORKER_IO_WORKERS": "2",
                 "WORKER_CPU_WORKERS": "1", "PYTHONUNBUFFERED": "1"}
     import redis as redis_sync
     rs = redis_sync.Redis.from_url(env_vars["REDIS_URL"], decode_responses=True)
@@ -640,7 +641,8 @@ class RealWorker:
     def __init__(self, url, tmp_path, name=None, io=4):
         import sys as _sys
         self.url, self.runlog = url, tmp_path / "runs.log"
-        self.env = {**os.environ, "REDIS_URL": url, "PYTASKQ_AUTH": "off", "PYTHONPATH": os.getcwd(),
+        self.env = {**os.environ, "REDIS_URL": url, "PYTASKQ_AUTH": "off",
+                    "PYTHONPATH": os.pathsep.join(filter(None, [os.getcwd(), os.environ.get("PYTHONPATH")])),
                     "RUNLOG": str(self.runlog), "WORKER_IO_WORKERS": str(io), "WORKER_CPU_WORKERS": "1",
                     "PYTHONUNBUFFERED": "1"}
         args = [_sys.executable, "-m", "pytaskq", "worker", "--app", "tests.v060_tasks:queue"]
