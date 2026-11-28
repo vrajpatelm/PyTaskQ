@@ -5,6 +5,23 @@ from pytaskq.core.keys import fill_scripts
 from pytaskq.core.redis_health import OOM_PROBE
 
 
+# A job's record is gone while it ran (Redis was flushed or lost its data): write its basic fields back
+# from the job itself, so its outcome isn't stored as a nameless half-record.
+REBUILD_LUA = """
+local function pytaskq_rebuild(hash, payload, now)
+    if redis.call('EXISTS', hash) == 1 then return end
+    local ok, job = pcall(cjson.decode, payload)
+    if not ok or type(job) ~= 'table' then return end
+    local function text(v, default)
+        if type(v) == 'string' or type(v) == 'number' then return tostring(v) end
+        return default
+    end
+    redis.call('HSET', hash, 'task_name', text(job['task_name'], '(unknown)'), 'queue', text(job['queue'], 'default'),
+               'priority', text(job['priority'], 'default'), 'payload', payload, 'created_at', now,
+               'note', 'Its record was missing when it finished (Redis lost its data); rebuilt from the job.')
+end
+"""
+
 # Unused; kept for importers. KEYS: fence, task hash
 FENCE_SCRIPT = """
 local current = redis.call('get', KEYS[1])
@@ -62,6 +79,48 @@ end
 return bad
 """
 
+# Take up to N jobs in one round trip (a worker with several free slots far from Redis isn't held to one
+# job per round trip). Same order and skipping as PRIORITY_POP_SCRIPT; starts with OOM_PROBE.
+# KEYS: processing list, the queue lists in order [, paused-queues hash]
+# ARGV: how many, then (optional) the queue name of each list
+# Returns {n, job 1 … job n, then any list keys that hold another type (skipped)}.
+PRIORITY_POP_MANY_SCRIPT = OOM_PROBE + """
+local dest = KEYS[1]
+local want = tonumber(ARGV[1])
+local last, paused, skip = #KEYS, nil, {}
+if #ARGV > 1 then
+    paused, last = KEYS[#KEYS], #KEYS - 1
+end
+local got, bad = {}, {}
+for i = 2, last do
+    local name = ARGV[i]
+    if paused and skip[name] == nil then
+        skip[name] = redis.call('HEXISTS', paused, name) == 1
+    end
+    if not (paused and skip[name]) then
+        while #got < want do
+            local val = redis.pcall('RPOPLPUSH', KEYS[i], dest)
+            if type(val) == 'table' and val.err then
+                if string.find(tostring(val.err), 'WRONGTYPE', 1, true) then
+                    table.insert(bad, KEYS[i])
+                    break
+                end
+                return redis.error_reply(tostring(val.err))
+            elseif val then
+                table.insert(got, val)
+            else
+                break
+            end
+        end
+    end
+    if #got >= want then break end
+end
+local out = {#got}
+for _, v in ipairs(got) do table.insert(out, v) end
+for _, k in ipairs(bad) do table.insert(out, k) end
+return out
+"""
+
 # Give up the leader lock on a clean stop, so another worker leads at once.  KEYS: lock   ARGV: worker id
 LEADER_RELEASE_SCRIPT = """
 if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('DEL', KEYS[1]) end
@@ -85,7 +144,7 @@ return 0
 #       finished_at, duration_ms, result_dropped, result TTL, jobs kept, task-key prefix
 # Returns 1 saved, 0 stale attempt (a newer one owns the job), -1 nothing to do (already done);
 # a PYTASKQ_WRONGTYPE error (nothing written) when a key holds another type.
-COMPLETE_SCRIPT = queueing.KEEP_LUA + queueing.TYPE_LUA + """
+COMPLETE_SCRIPT = queueing.KEEP_LUA + queueing.TYPE_LUA + REBUILD_LUA + """
 local bad = pytaskq_need(KEYS[1], 'list') or pytaskq_need(KEYS[3], 'hash') or pytaskq_need(KEYS[6], 'zset')
 if bad then return bad end
 local removed = redis.call('LREM', KEYS[1], 1, ARGV[1])
@@ -96,6 +155,7 @@ if current and current ~= ARGV[2] then
     redis.call('PUBLISH', '__PYTASKQ__events:global', 'update')
     return 0
 end
+pytaskq_rebuild(KEYS[3], ARGV[1], ARGV[6])
 redis.call('HSET', KEYS[3], 'task_id', ARGV[4], 'status', 'Success', 'result', ARGV[5],
            'finished_at', ARGV[6], 'duration_ms', ARGV[7], 'error', '')
 if ARGV[8] ~= '' then
@@ -120,7 +180,7 @@ return 1
 #       then task hash fields (name, value, …)
 # Returns 1 recorded, 2 recorded and old dead letters trimmed, 0 stale attempt, -1 already done;
 # a PYTASKQ_WRONGTYPE error (nothing written) when a key holds another type.
-FAIL_SCRIPT = queueing.KEEP_LUA + queueing.TYPE_LUA + """
+FAIL_SCRIPT = queueing.KEEP_LUA + queueing.TYPE_LUA + REBUILD_LUA + """
 local unpack = unpack or table.unpack
 local bad = pytaskq_need(KEYS[1], 'list') or pytaskq_need(KEYS[3], 'hash')
     or pytaskq_need(KEYS[4], ARGV[4] == 'dead' and 'list' or 'zset') or pytaskq_need(KEYS[7], 'zset')
@@ -136,6 +196,7 @@ if current and current ~= ARGV[2] then
     redis.call('PUBLISH', '__PYTASKQ__events:global', 'update')
     return 0
 end
+pytaskq_rebuild(KEYS[3], ARGV[1], ARGV[10])
 redis.pcall('INCR', KEYS[6])                       -- counters only: a broken one never loses a job
 redis.pcall('HINCRBY', KEYS[5], 'failed', 1)
 local trimmed = 0

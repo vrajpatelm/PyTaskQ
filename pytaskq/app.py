@@ -402,6 +402,13 @@ class PyTaskQ:
         `poll_interval`), so a quick job's result comes back quickly without a
         long wait hammering Redis.
         """
+        inside = context.current_task_id()
+        if inside is not None and inside not in _warned_waits:
+            _warned_waits.add(inside)
+            logger.warning(f"Job {inside} is waiting for job {task_id} from inside a job. That holds a worker slot "
+                           f"while the other job needs one: when every slot holds a waiting job, nothing moves "
+                           f"(they time out, or wait forever). Use a workflow (chain/group) to run jobs one after "
+                           f"another, or put the waited-for job on a queue served by other workers.")
         deadline = time.monotonic() + timeout
         delay = min(0.02, poll_interval)
         while True:
@@ -578,6 +585,7 @@ class _SyncBridge:
 
 
 _bridge = _SyncBridge()
+_warned_waits: set = set()          # jobs that already got the "waiting inside a job" warning
 
 
 def _run_sync(coro_factory):

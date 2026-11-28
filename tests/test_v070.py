@@ -780,3 +780,84 @@ def test_cpu_process_crashes_dont_leak_pipes():
     before, after = aio.run(go())
     if before:
         assert after - before <= 6, (before, after)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Redis set up wrong while running, records after a flush, waiting inside a job, batched pops
+# ═════════════════════════════════════════════════════════════════════════════
+
+async def test_eviction_switched_on_or_keys_evicted_while_running_is_logged(caplog):
+    from unittest.mock import AsyncMock
+    with patch.object(redis_health, "_evicted_seen", None), patch.object(redis_health, "_policy_seen", None):
+        r = AsyncMock()
+        r.info.side_effect = [{"maxmemory_policy": "noeviction"}, {"evicted_keys": 0},
+                              {"maxmemory_policy": "allkeys-lru"}, {"evicted_keys": 0},
+                              {"maxmemory_policy": "allkeys-lru"}, {"evicted_keys": 4576}]
+        assert await redis_health.check_eviction(r) is None
+        assert "now 'allkeys-lru'" in await redis_health.check_eviction(r)
+        assert "evicted 4,576 key(s)" in await redis_health.check_eviction(r)
+    assert "jobs" in caplog.text
+
+
+async def test_data_under_another_key_prefix_is_noticed(r):
+    from pytaskq.core import keys
+    await r.hset("pytaskq:install", "created_at", 1)
+    await r.rpush("queue:default", "a", "b")
+    with patch.object(keys, "PREFIX", "{myapp}:"), patch.object(keys.settings, "REDIS_KEY_PREFIX", "myapp"):
+        text = await redis_health.other_prefix_data(r)
+    assert "no key prefix (2 job(s) waiting" in text and "'myapp'" in text
+    await r.flushall()
+    await r.hset("{shop}:pytaskq:install", "created_at", 1)
+    with patch.object(keys, "PREFIX", ""):
+        assert "REDIS_KEY_PREFIX='shop'" in await redis_health.other_prefix_data(r)
+
+
+async def test_a_job_whose_record_vanished_is_saved_with_its_name_and_queue(env):
+    r = env
+    tasks = {"ok": {"handler": lambda: 5, "type": "io", "max_retries": 0}}
+    await queueing.enqueue(r, queueing.new_payload("ok", task_id="f1", queue="emails"))
+    raw = await pop(r, ["emails"])
+
+    async def flushed_mid_run(*a, **k):
+        await r.delete("task:f1")                     # FLUSHDB while it ran
+    sem = asyncio.Semaphore(1)
+    await sem.acquire()
+    with patch.object(worker, "TASKS", tasks), patch.object(worker, "_flush_progress_of", flushed_mid_run):
+        await worker.handle_task(raw, sem, asyncio.get_running_loop(), None,
+                                 __import__("concurrent.futures").futures.ThreadPoolExecutor(1))
+    record = await r.hgetall("task:f1")
+    assert record["status"] == "Success" and record["task_name"] == "ok" and record["queue"] == "emails"
+    assert "rebuilt" in record["note"] and await r.ttl("task:f1") > 0
+
+
+async def test_waiting_for_a_job_inside_a_job_warns_once(env, caplog):
+    from pytaskq import PyTaskQ, context as ctx
+    r = env
+    q = PyTaskQ()
+    await queueing.enqueue(r, queueing.new_payload("x", task_id="child"))
+    await r.hset("task:child", "status", "Success")
+    token = ctx._current.set(ctx.Job("parent", lambda *a: None))
+    try:
+        with patch("pytaskq.app._redis", lambda: r):
+            await q.wait("child", timeout=1)
+            await q.wait("child", timeout=1)
+    finally:
+        ctx._current.reset(token)
+    assert caplog.text.count("from inside a job") == 1 and "workflow" in caplog.text
+
+
+async def test_a_worker_takes_several_jobs_in_one_round_trip(env):
+    r = env
+    for i in range(5):
+        await queueing.enqueue(r, queueing.new_payload("ok", task_id=f"b{i}", priority="high" if i < 2 else "default"))
+    await queueing.enqueue(r, queueing.new_payload("ok", task_id="paused-q", queue="held"))
+    await queueing.pause_queue(r, "held")
+    reply = await r.eval(worker.PRIORITY_POP_MANY_SCRIPT, *worker.pop_many_call(["default", "held"], 0, 4))
+    got = [json.loads(x)["task_id"] for x in reply[1:1 + int(reply[0])]]
+    assert got == ["b0", "b1", "b2", "b3"], "high first, then default, in order"
+    assert await r.llen(worker._processing_key()) == 4
+    reply = await r.eval(worker.PRIORITY_POP_MANY_SCRIPT, *worker.pop_many_call(["default", "held"], 1, 4))
+    assert [json.loads(x)["task_id"] for x in reply[1:1 + int(reply[0])]] == ["b4"], "the paused queue is skipped"
+    await r.set("queue:low", "x")
+    reply = await r.eval(worker.PRIORITY_POP_MANY_SCRIPT, *worker.pop_many_call(["default"], 2, 4))
+    assert reply == [0, "queue:low"]

@@ -218,6 +218,19 @@ def pop_call(queues: list[str], turn: int = 0) -> list:
     return [len(keys) + 2, _processing_key(), *keys, queueing.PAUSED_KEY, *names]
 
 
+POP_BATCH = 8                   # at most this many jobs taken in one round trip (when that many slots are free)
+
+
+def pop_many_call(queues: list[str], turn: int, count: int) -> list:
+    """Arguments for PRIORITY_POP_MANY_SCRIPT: numkeys, keys…, count, names…."""
+    keys = pop_keys(queues, turn)
+    if not keys:
+        return [1, _processing_key(), count]
+    _, rotated = _rotation(queues, turn)
+    names = rotated * (len(keys) // len(rotated))
+    return [len(keys) + 2, _processing_key(), *keys, queueing.PAUSED_KEY, count, *names]
+
+
 def cron_zone(name: Optional[str]):
     """A tzinfo for a cron time zone name ("UTC" works even without a time zone database)."""
     if not name or name.strip().upper() == "UTC":
@@ -253,7 +266,7 @@ from pytaskq.worker_scripts import (  # noqa: F401  (re-exported: worker.X_SCRIP
     FENCE_SCRIPT, TIMEOUT_FENCE_SCRIPT, PRIORITY_POP_SCRIPT, LEADER_SCRIPT, COMPLETE_SCRIPT, FAIL_SCRIPT,
     PUT_BACK_SCRIPT, HAND_BACK_SCRIPT, CANCELLED_RUN_SCRIPT, PROGRESS_SCRIPT, LEASE_SCRIPT,
     WAIT_FOR_LEASE_SCRIPT, RELEASE_SCRIPT, RATE_SCRIPT, PROMOTE_SCRIPT, INVALID_SCRIPT, STARTED_SCRIPT,
-    HEARTBEAT_SCRIPT, FORGET_WORKER_SCRIPT, LEADER_RELEASE_SCRIPT,
+    HEARTBEAT_SCRIPT, FORGET_WORKER_SCRIPT, LEADER_RELEASE_SCRIPT, PRIORITY_POP_MANY_SCRIPT,
 )
 
 
@@ -883,8 +896,8 @@ class _Heartbeat(threading.Thread):
         if stalled < REDIS_STALL * 3:
             if time.monotonic() - self._last_stall_warning > 30:
                 self._last_stall_warning = time.monotonic()
-                logger.error(f"[Watchdog] No answer from Redis on this worker's connections for {stalled:.0f}s, "
-                             f"although Redis is reachable. Reopening them.")
+                logger.error(f"[Watchdog] No answer from Redis on the event loop's connections for {stalled:.0f}s, "
+                             f"while the heartbeat's own connection works. Reopening them.")
                 _event_loop.call_soon_threadsafe(_reopen_connections)
             return True
         if not self.gave_up:
@@ -957,7 +970,8 @@ class _Heartbeat(threading.Thread):
                 next_beat = time.monotonic() + min(5.0, interval)
                 if time.monotonic() - self._last_error > 30:
                     self._last_error = time.monotonic()
-                    logger.warning(f"[Heartbeat] Redis unreachable: {e}. Retrying every {min(5.0, interval):g}s")
+                    logger.warning(f"[Heartbeat] Couldn't send a heartbeat ({redis_health.explain(e)}). "
+                                   f"Retrying every {min(5.0, interval):g}s")
         try:
             if self._client is not None:
                 self._client.close()
@@ -1023,10 +1037,26 @@ async def _publish_registry():
 
 
 async def _periodic():
-    """Advertise this worker's tasks every minute and flush its counters every 10 s."""
+    """
+    Advertise this worker's tasks every minute and flush its counters every 10 s. The leader
+    also checks once a minute that Redis hasn't started evicting keys and that no data sits under
+    another REDIS_KEY_PREFIX.
+    """
     from pytaskq.core import pressure
     last_registry = time.monotonic()
+    last_health = float("-inf")
     while True:
+        if time.monotonic() - last_health >= 60:
+            last_health = time.monotonic()
+            try:
+                if await is_leader():
+                    await redis_health.check_eviction(redis_client.r, "Worker")
+                    other = await redis_health.other_prefix_data(redis_client.r)
+                    if other:
+                        logger.warning(f"[Redis] {other}. The web app and every worker must use the same "
+                                       f"REDIS_KEY_PREFIX, or they don't see each other's jobs (docs/REDIS.md).")
+            except Exception:
+                pass
         try:
             await redis_health.check_data(redis_client.r, "Worker")
         except Exception:
@@ -2044,10 +2074,15 @@ async def _check_fleet(r) -> None:
 
 
 async def _check_redis_setup(r) -> None:
-    """Warn loudly when Redis is set up to delete keys, or nearly full."""
+    """Warn loudly when Redis is set up to delete keys, or nearly full, or holds data under another prefix."""
     for problem in redis_health.problems(await redis_health.memory(r)):
         log = logger.error if problem["level"] == "critical" else logger.warning
         log(f"[Redis] {problem['title']}. {problem['detail']}")
+    await redis_health.check_eviction(r, "Worker")       # the baseline later checks compare with
+    other = await redis_health.other_prefix_data(r)
+    if other:
+        logger.warning(f"[Redis] {other}. The web app and every worker must use the same REDIS_KEY_PREFIX, or "
+                       f"they don't see each other's jobs (docs/REDIS.md).")
 
 
 def _cpu_modules() -> tuple:
@@ -2183,8 +2218,10 @@ async def consumer_task():
     _last_loop_error_type: Optional[type] = None
 
     while not shutdown_event.is_set():
+        slots = 0
         try:
             await sem.acquire()
+            slots = 1
             if shutdown_event.is_set():     # stopping: don't start another job
                 sem.release()
                 break
@@ -2201,22 +2238,27 @@ async def consumer_task():
                 sem.release()
                 await _wait_for_work([])
                 continue
-            call = pop_call(serving, turn)
+            while slots < POP_BATCH and not sem.locked():
+                await sem.acquire()         # free slots: take them without waiting
+                slots += 1
+            reply = await redis_client.r.eval(PRIORITY_POP_MANY_SCRIPT, *pop_many_call(serving, turn, slots))
             turn += 1
-            task_json = await redis_client.r.eval(PRIORITY_POP_SCRIPT, *call)
-            if isinstance(task_json, list):
-                _report_bad_lists(task_json[1:])
-                task_json = None
-            if task_json:
-                _hold(task_json)            # before any other await: the reconciler must see it as ours
+            got = int(reply[0])
+            jobs, bad = reply[1:1 + got], reply[1 + got:]
+            for raw in jobs:
+                _hold(raw)                  # before any other await: the reconciler must see them as ours
             _mark_redis_ok()
-
-            if not task_json:
+            if bad and not jobs:
+                _report_bad_lists(bad)
+            for _ in range(slots - got):
                 sem.release()
+            slots = got
+            if not jobs:
                 await _wait_for_work(serving)
                 continue
         except Exception as e:
-            sem.release()
+            for _ in range(slots):
+                sem.release()
             now_m = time.monotonic()
             quick = isinstance(e, redis_errors.ConnectionError) and now_m - _last_quick_retry > 5
             if quick:
@@ -2230,9 +2272,10 @@ async def consumer_task():
             await asyncio.sleep(5)
             continue
 
-        task = asyncio.create_task(handle_task(task_json, sem, loop, cpu_pool, io_pool))
-        active_tasks.add(task)
-        task.add_done_callback(active_tasks.discard)
+        for task_json in jobs:
+            task = asyncio.create_task(handle_task(task_json, sem, loop, cpu_pool, io_pool))
+            active_tasks.add(task)
+            task.add_done_callback(active_tasks.discard)
 
     await _shutdown(background, heart, cpu_pool, io_pool)
 

@@ -175,6 +175,67 @@ async def check_data(r, who: str = "PyTaskQ") -> Optional[float]:
         return None
 
 
+_evicted_seen: Optional[int] = None
+_policy_seen: Optional[str] = None
+
+
+async def check_eviction(r, who: str = "PyTaskQ") -> Optional[str]:
+    """
+    Notice eviction switched on, or keys evicted, while PyTaskQ runs (a plan change applied live, a
+    failover to a differently configured replica, a CONFIG SET). Logs an error; returns its text.
+    """
+    global _evicted_seen, _policy_seen
+    try:
+        mem = await r.info("memory")
+        stats = await r.info("stats")
+    except Exception:
+        return None                                  # a restricted user without INFO: nothing to compare
+    policy = str(mem.get("maxmemory_policy") or "")
+    evicted = int(stats.get("evicted_keys") or 0)
+    text = None
+    if _evicted_seen is not None and evicted > _evicted_seen:
+        text = (f"Redis evicted {evicted - _evicted_seen:,} key(s) since the last check (maxmemory-policy is "
+                f"'{policy}'): jobs, queues and records may have been deleted. Set maxmemory-policy noeviction.")
+    elif policy and policy != "noeviction" and policy != _policy_seen:
+        text = (f"Redis's maxmemory-policy is now '{policy}': when it fills up it deletes keys, jobs included. "
+                f"Set maxmemory-policy noeviction.")
+    _evicted_seen, _policy_seen = evicted, policy
+    if text:
+        logger.error(f"[{who}] {text}")
+    return text
+
+
+async def other_prefix_data(r) -> Optional[str]:
+    """
+    PyTaskQ data under another REDIS_KEY_PREFIX than this process uses (workers and the web app
+    must use the same one, or they don't see each other's jobs). A short text, or None.
+    """
+    from pytaskq.core import keys
+    mine = keys.PREFIX
+    try:
+        bare = keys.layout("")
+        if mine:
+            if await r.exists(bare["install"]):
+                waiting = sum([await r.llen(k) for k in bare["queues"]])
+                return (f"Found PyTaskQ data with no key prefix ({waiting} job(s) waiting in its 'default' queue), "
+                        f"but this process uses REDIS_KEY_PREFIX={keys.settings.REDIS_KEY_PREFIX!r}")
+            return None
+        found = []
+        cursor, rounds = 0, 0
+        while rounds < 20:
+            cursor, batch = await r.scan(cursor, match=bare["install_pattern"], count=1000)
+            found += batch
+            rounds += 1
+            if not cursor or found:
+                break
+        if found:
+            name = str(found[0]).split("}", 1)[0].lstrip("{")
+            return f"Found PyTaskQ data under REDIS_KEY_PREFIX={name!r}, but this process uses no prefix"
+    except Exception:
+        return None
+    return None
+
+
 def reset_marker_state() -> None:
     """For tests."""
     global _seen_marker

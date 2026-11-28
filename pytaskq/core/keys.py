@@ -52,3 +52,11 @@ def fill_scripts(namespace: dict) -> None:
     for name, value in list(namespace.items()):
         if isinstance(value, str) and PLACEHOLDER in value:
             namespace[name] = lua(value)
+
+
+def layout(raw_prefix: str = "") -> dict:
+    """A few key names as another installation would write them (REDIS_KEY_PREFIX=raw_prefix, "" = none):
+    to notice data written under a different prefix."""
+    p = _compute(raw_prefix)
+    return {"install": p + "pytaskq:install", "queues": [p + "queue:high", p + "queue:default", p + "queue:low"],
+            "install_pattern": "{*}:pytaskq:install"}
