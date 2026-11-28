@@ -56,6 +56,14 @@ RECENT_KEY = rkey("tasks:recent")
 REGISTRY_KEY = rkey("pytaskq:registry")              # HASH task name → spec (JSON)
 REGISTRY_SEEN_KEY = rkey("pytaskq:registry:seen")    # ZSET task name → last time something advertised it
 REGISTRY_TTL = 300                             # a task disappears 5 min after nothing advertises it
+WORKER_TASKS_KEY = rkey("pytaskq:registry:workers")  # ZSET task name → last time a WORKER (not the dashboard) had it
+WORKER_TASKS_TTL = 120                         # a worker re-advertises every minute
+
+
+async def worker_has_task(r, task_name: str) -> bool:
+    """Whether a running worker (not the dashboard's --app) advertised `task_name` in the last two minutes."""
+    seen = await r.zscore(WORKER_TASKS_KEY, task_name)
+    return seen is not None and float(seen) >= clock.now() - WORKER_TASKS_TTL
 EVENTS_CHANNEL = rkey("events:global")
 
 
@@ -950,14 +958,20 @@ async def registry_lookup(r, task_name: str) -> tuple[Optional[dict], int]:
     return parse_registry_lookup(raw, seen, count, cutoff)
 
 
-async def publish_registry(r, specs: dict[str, dict]) -> None:
-    """Advertise `specs` (name → JSON-able spec), alongside tasks other workers advertise."""
+async def publish_registry(r, specs: dict[str, dict], worker: bool = False) -> None:
+    """
+    Advertise `specs` (name → JSON-able spec), alongside tasks other workers advertise.
+    worker: a worker that runs these tasks (the dashboard's --app only describes them).
+    """
     if not specs:
         return
     now = clock.now()
     async with r.pipeline(transaction=True) as pipe:
         pipe.hset(REGISTRY_KEY, mapping={k: json.dumps(v, default=str) for k, v in specs.items()})
         pipe.zadd(REGISTRY_SEEN_KEY, {k: now for k in specs})
+        if worker:
+            pipe.zadd(WORKER_TASKS_KEY, {k: now for k in specs})
+            pipe.zremrangebyscore(WORKER_TASKS_KEY, "-inf", now - 7 * 86400)
         pipe.publish(EVENTS_CHANNEL, "update")
         await pipe.execute()
 

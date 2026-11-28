@@ -136,7 +136,8 @@ async def test_handle_task_unknown_name_stores_failed(r):
     await sem.acquire()
 
     with patch.object(worker, "redis_client") as mock_rc, \
-         patch.object(worker, "TASKS", {}):  # empty registry
+         patch.object(worker, "TASKS", {}), \
+         patch.object(worker, "HAND_BACK_FOR", 0):  # empty registry; don't wait for a deploy
         mock_rc.r = r
         await worker.handle_task(task_json, sem, loop, None, thread_pool)
 

@@ -293,7 +293,7 @@ async def test_job_is_handed_back_when_another_worker_has_the_task(env):
     def their_task():
         pass
 
-    await other.publish()                    # another worker advertises it
+    await queueing.publish_registry(r, {"their_task": {}}, worker=True)   # another worker advertises it
     p = queueing.new_payload("their_task", task_id="h1")
     await queueing.enqueue(r, p)
     raw = await pop(r, ["default"])
@@ -339,7 +339,8 @@ async def test_unknown_everywhere_fails_without_hand_back(env):
     r = env
     p = queueing.new_payload("nobody_has_this", task_id="h3")
     await r.lpush("processing_queue:test-worker", json.dumps(p))
-    await run(r, {}, json.dumps(p))
+    with patch.object(worker, "HAND_BACK_FOR", 0):          # UNKNOWN_TASK_WAIT=0: don't wait for a deploy
+        await run(r, {}, json.dumps(p))
     assert await r.hget("task:h3", "status") == "RetryScheduled"
     retry = json.loads((await r.zrange("delayed_tasks", 0, -1))[0])
     assert retry["bounces"] == 0 and retry["retry_count"] == 1

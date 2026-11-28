@@ -428,3 +428,137 @@ async def test_sighup_stops_a_worker_cleanly_and_a_second_signal_skips_the_grace
     assert "Second stop signal: stopping now" in w.log()
     assert await r.hget("task:h1", "status") == "Queued"
     assert not await r.exists("pytaskq:leader_lock"), "the leader lock was handed over"
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Fair queues, rolling deploys, IO timeouts, cron overlap, the line for max_concurrency
+# ═════════════════════════════════════════════════════════════════════════════
+
+@pytest.mark.parametrize("queues", [["qa", "qb"], ["qa", "qb", "qc", "qd", "qe"], ["a", "b", "c", "d"]])
+def test_every_queue_gets_the_first_pick_of_every_priority_equally(queues):
+    from collections import Counter
+    with patch.object(worker, "_SCHEDULE", []):
+        counts = Counter(worker.pop_keys(queues, t)[0] for t in range(1000 * len(queues)))
+    for priority in queueing.PRIORITIES:
+        shares = {counts[queueing.queue_key(priority, q)] for q in queues}
+        assert len(shares) == 1 and shares != {0}, (priority, counts)
+
+
+async def test_a_job_for_a_task_no_worker_has_yet_waits_for_a_deploy(env):
+    r = env
+    p = queueing.new_payload("brand_new", task_id="d1")
+    await queueing.enqueue(r, p)
+    await queueing.publish_registry(r, {"brand_new": {}})          # the dashboard (--app) knows it; no worker does
+    with patch.object(worker, "HAND_BACK_FOR", 600):
+        await run_one(r, {})
+    record = await r.hgetall("task:d1")
+    assert record["status"] == "Queued" and "UNKNOWN_TASK_WAIT" in record["note"]
+    back = await r.zrange("delayed_tasks", 0, -1, withscores=True)
+    assert json.loads(back[0][0])["retry_count"] == 0 and back[0][1] > time.time() + 1.5, "checks back slowly"
+
+
+async def test_a_job_for_a_task_another_worker_has_comes_back_quickly(env):
+    r = env
+    await queueing.enqueue(r, queueing.new_payload("theirs", task_id="d2"))
+    await queueing.publish_registry(r, {"theirs": {}}, worker=True)
+    with patch.object(worker, "HAND_BACK_FOR", 600):
+        await run_one(r, {})
+    assert "Waiting for a worker that has task 'theirs'" in await r.hget("task:d2", "note")
+
+
+async def test_a_job_waiting_for_a_deploy_fails_after_unknown_task_wait(env):
+    r = env
+    p = queueing.new_payload("never", task_id="d3", max_retries=0)
+    p["handed_back_since"] = time.time() - 601
+    await queueing.enqueue(r, p)
+    with patch.object(worker, "HAND_BACK_FOR", 600):
+        await run_one(r, {})
+    assert await r.hget("task:d3", "status") == "DeadLetter"
+
+
+async def test_an_io_retry_waits_until_the_timed_out_attempt_returns(env):
+    r = env
+    starts, ends = [], []
+
+    def slow_call():
+        starts.append(time.monotonic())
+        time.sleep(1.2)
+        ends.append(time.monotonic())
+        return "ok"
+    tasks = {"call": {"handler": slow_call, "type": "io", "max_retries": 2, "timeout": 0.3}}
+    await queueing.enqueue(r, queueing.new_payload("call", task_id="io1", max_retries=2))
+    await run_one(r, tasks)
+    assert await r.hget("task:io1", "status") == "RetryScheduled"
+    assert await r.exists("running:io1"), "the abandoned attempt's thread is still running"
+    await worker._promote_due_tasks(now=time.time() + 60)
+    await run_one(r, tasks)                                         # the retry: must not start yet
+    assert len(starts) == 1 and "previous attempt" in await r.hget("task:io1", "waiting_for")
+    assert await _until(lambda: _gone(r, "running:io1"), timeout=5)
+    await worker._promote_due_tasks(now=time.time() + 60)
+    await run_one(r, tasks)
+    assert len(starts) == 2 and starts[1] >= ends[0], "the two attempts never overlapped"
+
+
+async def _gone(r, key):
+    return not await r.exists(key)
+
+
+def _cron_tasks(overlap):
+    return {"sync": {"handler": lambda: None, "type": "io", "cron": "* * * * *", "overlap": overlap}}
+
+
+async def test_cron_overlap_false_skips_a_tick_while_the_last_run_is_still_running(env, caplog):
+    r = env
+    caplog.set_level("INFO")
+    base = 1_800_000_000 - 1_800_000_000 % 60
+    with patch.object(worker, "TASKS", _cron_tasks(False)):
+        assert await worker.run_due_cron_jobs(now=base + 5) == 1
+        first = await r.hget("pytaskq:cron:last", "sync")
+        await r.hset(f"task:{first}", "status", "Processing")
+        assert await worker.run_due_cron_jobs(now=base + 65) == 0
+        assert "still processing (overlap=False)" in caplog.text
+        assert await r.hget("pytaskq:cron:skipped", "sync") == "1"
+        await r.hset(f"task:{first}", "status", "Success")
+        assert await worker.run_due_cron_jobs(now=base + 125) == 1
+
+
+async def test_cron_runs_that_overlap_are_warned_about(env, caplog):
+    r = env
+    base = 1_800_000_000 - 1_800_000_000 % 60
+    worker._overlap_warned.clear()
+    with patch.object(worker, "TASKS", _cron_tasks(None)):
+        await worker.run_due_cron_jobs(now=base + 5)
+        await r.hset(f"task:{await r.hget('pytaskq:cron:last', 'sync')}", "status", "Processing")
+        assert await worker.run_due_cron_jobs(now=base + 65) == 1
+    assert "runs overlap" in caplog.text
+
+
+def test_overlap_only_applies_to_cron_tasks():
+    from pytaskq import PyTaskQ
+    q = PyTaskQ()
+    with pytest.raises(ValueError, match="overlap"):
+        @q.task(overlap=False)
+        def f():
+            pass
+
+
+@pytest.mark.parametrize("name", ["x" * 201, "a\nb", "with space", "*", " ", "1abc"])
+def test_task_names_that_break_logs_and_keys_are_refused(name):
+    from pytaskq import PyTaskQ
+    q = PyTaskQ()
+    with pytest.raises(ValueError, match="isn't valid"):
+        q.task(name=name)(lambda: None)
+
+
+async def test_a_recovered_max_concurrency_job_keeps_its_place_in_line(env):
+    r = env
+    tasks = {"one": {"handler": lambda: "ok", "type": "io", "max_retries": 0, "max_concurrency": 1}}
+    await queueing.enqueue(r, queueing.new_payload("one", task_id="m0"))
+    await r.hset("task:m0", "created_at", time.time() - 100)          # queued first, ran, its worker died
+    await r.zadd("limit:running:one", {"someone@x": time.time() + 600})  # the place is taken now
+    for i in (1, 2):
+        await queueing.enqueue(r, queueing.new_payload("one", task_id=f"m{i}"))
+    for _ in range(3):
+        await run_one(r, tasks)
+    line = [e.split("\n")[2] for e in await r.zrange("limit:waiting:one", 0, -1)]
+    assert line[0] == "m0", line

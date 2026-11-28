@@ -188,7 +188,8 @@ async def test_unknown_task_error_lists_registered_tasks(env):
     def known():
         pass
 
-    meta = await run(env, q.TASKS, queueing.new_payload("ghost"))
+    with patch.object(worker, "HAND_BACK_FOR", 0):       # UNKNOWN_TASK_WAIT=0: fail at once
+        meta = await run(env, q.TASKS, queueing.new_payload("ghost"))
     assert meta["status"] == "RetryScheduled"
     assert "'ghost' is not registered" in meta["error"]
     assert "known" in meta["error"]

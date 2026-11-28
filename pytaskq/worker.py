@@ -59,7 +59,7 @@ APP_NAME = ""
 QUEUES: list[str] = []          # the queues this worker serves (set at startup)
 QUEUES_OVERRIDE = ""            # `pytaskq worker --queues a,b` (else WORKER_QUEUES, else its tasks' queues)
 NAME_OVERRIDE = ""              # `pytaskq worker --name x` (else WORKER_NAME, else a random id)
-HAND_BACK_FOR = 600             # seconds a job keeps being handed back for a worker that has its task
+HAND_BACK_FOR = float(settings.UNKNOWN_TASK_WAIT)   # seconds a job waits for a worker that has its task
 WORKERS_KEY = rkey("pytaskq:workers")  # SET of every worker id that may own a processing_queue
 EXIT_CODE = 0                   # non-zero when the worker stopped because it couldn't work any more
 THREADS_LEFT_RUNNING = 0        # IO threads still busy at exit (the CLI exits without waiting for them)
@@ -176,23 +176,35 @@ def priority_schedule(setting: Optional[str] = None) -> list[str]:
 _SCHEDULE: list[str] = []
 
 
+def _rotation(queues: list[str], turn: int) -> tuple[str, list[str]]:
+    """
+    The priority this pop prefers, and the queues in the order to try. Queues rotate separately
+    for each priority (counting the pops that preferred it), so every queue gets the first pick
+    of every priority in turn, whatever the number of queues.
+    """
+    global _SCHEDULE
+    if not _SCHEDULE:
+        _SCHEDULE = priority_schedule()
+    size = len(_SCHEDULE)
+    pos = turn % size
+    first = _SCHEDULE[pos]
+    times = (turn // size) * _SCHEDULE.count(first) + _SCHEDULE[:pos].count(first)
+    start = (times + queueing.PRIORITIES.index(first)) % len(queues)   # offset per priority: queues alternate
+    return first, queues[start:] + queues[:start]
+
+
 def pop_keys(queues: list[str], turn: int = 0) -> list[str]:
     """
     The lists to pop from, in order.
 
     The preferred priority comes from the PRIORITY_WEIGHTS cycle; after it, the
     others in the usual order (high, default, low). Within one priority the
-    starting queue rotates with `turn`, so a busy queue can't starve the others.
+    starting queue rotates, so a busy queue can't starve the others.
     """
-    global _SCHEDULE
     if not queues:
         return []
-    if not _SCHEDULE:
-        _SCHEDULE = priority_schedule()
-    first = _SCHEDULE[turn % len(_SCHEDULE)]
+    first, rotated = _rotation(queues, turn)
     order = [first] + [p for p in queueing.PRIORITIES if p != first]
-    start = turn % len(queues)
-    rotated = queues[start:] + queues[:start]
     return [queueing.queue_key(p, q) for p in order for q in rotated]
 
 
@@ -201,8 +213,7 @@ def pop_call(queues: list[str], turn: int = 0) -> list:
     keys = pop_keys(queues, turn)
     if not keys:
         return [1, _processing_key()]
-    start = turn % len(queues)
-    rotated = queues[start:] + queues[:start]
+    _, rotated = _rotation(queues, turn)
     names = rotated * (len(keys) // len(rotated))      # pop_keys lists each priority over `rotated`
     return [len(keys) + 2, _processing_key(), *keys, queueing.PAUSED_KEY, *names]
 
@@ -295,7 +306,7 @@ async def _with_retries(op, what: str, task_id: str = ""):
 # ─────────────────────────────────────────────────────────────────────────────
 
 LEADER_TTL = 10                 # seconds; the leader renews it every second while it leads
-_leader_error_at = 0.0
+_leader_error_at = float("-inf")
 
 
 async def is_leader() -> bool:
@@ -334,7 +345,9 @@ async def cron_scheduler():
 CRON_LOCK_TTL = 3 * 3600
 CRON_STATE_KEY = rkey("pytaskq:cron")          # HASH task → the latest tick handled (Unix time)
 CRON_MISSED_KEY = rkey("pytaskq:cron:missed")       # HASH task → missed ticks; "task:at" → when last noticed
-CRON_SKIPPED_KEY = rkey("pytaskq:cron:skipped")      # HASH task → ticks skipped because their queue was paused
+CRON_SKIPPED_KEY = rkey("pytaskq:cron:skipped")      # HASH task → ticks skipped (queue paused, or overlap=False)
+CRON_LAST_KEY = rkey("pytaskq:cron:last")            # HASH task → id of the job its latest tick queued
+_overlap_warned: dict[str, float] = {}
 MISSED_COUNT_LIMIT = 10_000
 
 
@@ -409,11 +422,27 @@ async def run_due_cron_jobs(now: Optional[float] = None) -> int:
                     logger.info(f"[Cron] Skipped {task_name} for {prev_tick.isoformat()}: queue '{queue}' is paused.")
                 await r.hset(CRON_STATE_KEY, task_name, repr(tick_at))
                 continue
+            previous = await r.hget(CRON_LAST_KEY, task_name)
+            still = (await r.hget(queueing.task_key(previous), "status")) if previous else None
+            busy = still in (queueing.QUEUED, queueing.PROCESSING, "Scheduled", "RetryScheduled")
+            if busy and task_info.get("overlap") is False:
+                if await r.set(lock, "skipped", nx=True, ex=CRON_LOCK_TTL):
+                    await r.hincrby(CRON_SKIPPED_KEY, task_name, 1)
+                    logger.info(f"[Cron] Skipped {task_name} for {prev_tick.isoformat()}: its previous run "
+                                f"({previous}) is still {str(still).lower()} (overlap=False).")
+                await r.hset(CRON_STATE_KEY, task_name, repr(tick_at))
+                continue
+            if busy and time.monotonic() - _overlap_warned.get(task_name, -3600.0) >= 3600:
+                _overlap_warned[task_name] = time.monotonic()
+                logger.warning(f"[Cron] {task_name}: queuing the {prev_tick.isoformat()} run while the previous one "
+                               f"({previous}) is still {str(still).lower()}, so runs overlap. Set overlap=False on the "
+                               f"task to skip a tick instead.")
             payload = queueing.new_payload(task_name, priority=task_info.get("priority") or "default", queue=queue)
             # The lock only has to outlive the tick and a clock going back an hour.
             if await queueing.enqueue(redis_client.r, payload, lock=lock, lock_ttl=CRON_LOCK_TTL,
                                       max_bytes=0, note=note or None) is not None:
                 queued += 1
+                await r.hset(CRON_LAST_KEY, task_name, payload["task_id"])
                 logger.info(f"[Cron] Queued {task_name} for {prev_tick.isoformat()}" + (" (late)" if note else ""))
             await r.hset(CRON_STATE_KEY, task_name, repr(tick_at))
         except Exception as e:
@@ -458,7 +487,7 @@ async def _next_promotion_in(r, moved: int) -> float:
 PROMOTE_BATCH = 500
 PROMOTE_BUDGET = 0.25          # seconds per pass, so the leader's other loops keep running
 _promote_from = 0              # where the last pass stopped (past jobs for full queues), or 0
-_held_back_logged = 0.0
+_held_back_logged = float("-inf")
 
 
 async def _promote_due_tasks(now: Optional[float] = None) -> int:
@@ -596,6 +625,34 @@ async def _sweep_dead_workers() -> int:
         if recovered:
             logger.info(f"[Sweeper] Recovered {recovered} task(s) from dead worker: {worker_id}")
     return total
+
+
+def _still_running_key(task_id: str) -> str:
+    return rkey(f"running:{task_id}")
+
+
+async def _mark_still_running(r, task_id: str, running, timeout: float) -> None:
+    """Note that a timed-out attempt's thread still runs (cleared when it returns, or after a cap)."""
+    key, cap = _still_running_key(task_id), int(max(60.0, 4 * float(timeout or 0)))
+    try:
+        await r.set(key, WORKER_ID, ex=cap)
+    except Exception:
+        return                                  # best effort: the retry then simply doesn't wait
+    loop = asyncio.get_running_loop()
+
+    def returned(_):
+        try:
+            loop.call_soon_threadsafe(lambda: asyncio.ensure_future(_forget(key)))
+        except RuntimeError:
+            pass                                # the worker stopped; the key runs out by itself
+    running.add_done_callback(returned)
+
+
+async def _forget(key: str) -> None:
+    try:
+        await redis_client.r.delete(key)
+    except Exception:
+        pass
 
 
 def _recovery_error(n: int) -> str:
@@ -774,9 +831,9 @@ class _Heartbeat(threading.Thread):
         super().__init__(name="pytaskq-heartbeat", daemon=True)
         self.stop_event = threading.Event()
         self._client = None
-        self._last_warning = 0.0
-        self._last_error = 0.0
-        self._last_stall_warning = 0.0
+        self._last_warning = float("-inf")
+        self._last_error = float("-inf")
+        self._last_stall_warning = float("-inf")
         self.gave_up = False
         self.blocked_for = 0.0
 
@@ -962,7 +1019,7 @@ async def _loop_ticker():
 async def _publish_registry():
     from pytaskq.app import describe_tasks
     if TASKS:
-        await queueing.publish_registry(redis_client.r, describe_tasks(TASKS))
+        await queueing.publish_registry(redis_client.r, describe_tasks(TASKS), worker=True)
 
 
 async def _periodic():
@@ -1117,24 +1174,31 @@ def _storable_result(result) -> tuple[str, str]:
 
 async def _hand_back(r, tasks, task_json, task_id) -> bool:
     """
-    This worker lacks the job's task but another live worker advertises it: put the job back
-    for that worker without counting a retry. After HAND_BACK_FOR seconds the job fails
-    normally, so it can't loop forever.
+    This worker lacks the job's task: put the job back (through the delayed set, without
+    counting a retry) for a worker that has it. When a live worker advertises the task it comes
+    back within seconds; when none does (a rolling deploy where the web app went first), it
+    checks again less and less often. After UNKNOWN_TASK_WAIT seconds it fails normally, so it
+    can't wait forever.
     """
     now = clock.now()
     since = tasks.handed_back_since or now
-    if now - since > HAND_BACK_FOR:
+    limit = float(HAND_BACK_FOR)
+    if now - since >= limit:
         return False
-    spec, _ = await queueing.registry_lookup(r, tasks.task_name)
-    if spec is None:
-        return False
+    somewhere = await queueing.worker_has_task(r, tasks.task_name)
     payload = json.loads(task_json)
     payload["bounces"] = tasks.bounces + 1
     payload["handed_back_since"] = since
     raw = json.dumps(payload)
-    due = now + random.uniform(0.5, 2.0)   # via the delayed set, so it doesn't bounce straight back here
-    note = (f"Waiting for a worker that has task '{tasks.task_name}' (worker {WORKER_ID} doesn't). "
-            f"Give each app its own queue to avoid this.")
+    if somewhere:
+        due = now + random.uniform(0.5, 2.0)    # via the delayed set, so it doesn't bounce straight back here
+        note = (f"Waiting for a worker that has task '{tasks.task_name}' (worker {WORKER_ID} serves queue "
+                f"'{tasks.queue}' but doesn't have it: a deploy in progress, or two apps sharing a queue).")
+    else:
+        due = now + min(30.0, 2.0 * (tasks.bounces + 1))
+        left = max(0, round(since + limit - now))
+        note = (f"No running worker has task '{tasks.task_name}' yet (a deploy in progress? deploy workers first "
+                f"when adding a task). It waits up to {left}s more (UNKNOWN_TASK_WAIT), then fails.")
     await _with_retries(lambda _: r.eval(HAND_BACK_SCRIPT, 3, _processing_key(), rkey("delayed_tasks"),
                                          queueing.task_key(task_id), task_json, raw, repr(due), note),
                         "hand a job back", task_id)
@@ -1233,7 +1297,14 @@ async def _within_limits(r, tasks, task_json, entry: dict) -> bool:
             waits = tasks.waits + 1
             payload = json.loads(task_json)
             payload.update(waits=waits, rate_slot=slot)
-            payload.setdefault("waiting_since", now)
+            if "waiting_since" not in payload:
+                # Its place in line is when it was queued, so a job put back after its worker died
+                # (it held a place and never waited) keeps its turn ahead of later ones.
+                created = await r.hget(queueing.task_key(task_id), "created_at")
+                try:
+                    payload["waiting_since"] = min(now, float(created)) if created else now
+                except ValueError:
+                    payload["waiting_since"] = now
             raw = json.dumps(payload)
             # Fallback only: normally a finishing job wakes the one that waited longest.
             due = now + min(WAIT_MAX, 5 * 1.5 ** min(waits, 10)) * random.uniform(0.9, 1.1)
@@ -1419,7 +1490,7 @@ async def _progress_writer():
         await _flush_progress()
 
 
-_last_stuck_warning = 0.0
+_last_stuck_warning = float("-inf")
 
 
 async def _leave_for_other_workers(r, tasks, task_json) -> None:
@@ -1615,6 +1686,13 @@ async def _run(r, tasks, task_json, process_pool, thread_pool) -> None:
                     f"Task '{tasks.task_name}' is not registered on worker {WORKER_ID}. "
                     f"Registered tasks: {known}"
                 )
+            if tasks.after_timeout and await r.exists(_still_running_key(task_id)):
+                await _wait_in_delayed_set(
+                    r, tasks, task_json, clock.now() + 2.0, {},
+                    "Waiting for its previous attempt to finish: that attempt timed out, but Python can't stop a "
+                    "running thread, so its code is still running. This retry starts once it returns.")
+                span.set_attribute("task.status", "Waiting")
+                return
             if not await _within_limits(r, tasks, task_json, entry):
                 span.set_attribute("task.status", "Waiting")
                 return
@@ -1663,6 +1741,12 @@ async def _run(r, tasks, task_json, process_pool, thread_pool) -> None:
                     "record a timeout", task_id))
                 if new_token >= 0:
                     tasks.fence_token = new_token
+                running = getattr(_jobs.get(task_id), "left_running", None)
+                if running is not None and not running.done():
+                    # The thread can't be stopped: its retry waits until it returns, so two copies of the
+                    # job never run at the same time.
+                    await _mark_still_running(r, task_id, running, timeout)
+                    tasks.after_timeout = True
             error = queueing.error_text(e)
             span.set_status(trace.StatusCode.ERROR, error[:1000])
             span.record_exception(e)
@@ -2077,7 +2161,7 @@ async def consumer_task():
     logger.info(f"Worker {WORKER_ID} started and ready to process tasks.")
 
     turn = 0
-    _last_quick_retry = _last_loop_error = 0.0
+    _last_quick_retry = _last_loop_error = float("-inf")
     _last_loop_error_type: Optional[type] = None
 
     while not shutdown_event.is_set():
@@ -2135,7 +2219,7 @@ async def consumer_task():
     await _shutdown(background, heart, cpu_pool, io_pool)
 
 
-_bad_lists_logged = 0.0
+_bad_lists_logged = float("-inf")
 
 
 def _report_bad_lists(keys: list) -> None:

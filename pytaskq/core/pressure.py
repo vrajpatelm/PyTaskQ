@@ -55,7 +55,8 @@ MESSAGES = {
     "redis_busy": "503 every Redis connection was busy (raise REDIS_MAX_CONNECTIONS or REDIS_POOL_TIMEOUT)",
     "redis_down": "503 Redis could not be reached",
     "handed_back": "a worker took a job whose task it doesn't have and handed it back "
-                   "(two apps share a queue: give each app its own queue)",
+                   "(a deploy in progress, or two apps sharing a queue: deploy workers first when adding a task, and give "
+                   "each app its own queue)",
 }
 
 

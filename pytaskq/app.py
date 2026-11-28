@@ -58,6 +58,7 @@ from pytaskq.net import SAFE_OPENER, assert_safe_url
 logger = logging.getLogger("pytaskq")
 
 TASK_TYPES = ("cpu", "io", "async")
+TASK_NAME_RE = re.compile(r"^[^\W\d][\w.:-]{0,199}$")
 
 # Option names `delay()` treats as queue options rather than task kwargs —
 # unless the task function itself declares a parameter with that name.
@@ -194,6 +195,7 @@ class PyTaskQ:
         queue: Optional[str] = None,
         tz: Optional[str] = None,
         catch_up: Optional[bool] = None,
+        overlap: Optional[bool] = None,
         max_retries: Optional[int] = None,
         timeout: Optional[float] = None,
         max_concurrency: Optional[int] = None,
@@ -211,6 +213,9 @@ class PyTaskQ:
         catch_up    For cron tasks: after an outage (no worker running when a tick was
                     due), run the latest missed tick once when workers are back
                     (default: the CRON_CATCH_UP setting, True). Missed runs are always logged.
+        overlap     For cron tasks: False skips a tick while the previous run is still
+                    waiting or running (for syncs and reports that sometimes run long).
+                    Default True: every tick runs, and a warning says when runs overlap.
         priority    "high", "default" or "low" within its queue.
         queue       Named queue (default "default", or the app's default_queue). Only
                     workers serving this queue run the task: use it to give a kind of
@@ -255,6 +260,8 @@ class PyTaskQ:
                 _check_time_zone(tz)
             if catch_up is not None and cron is None:
                 raise ValueError(f"{fn.__name__}: catch_up= only applies to cron tasks")
+            if overlap is not None and cron is None:
+                raise ValueError(f"{fn.__name__}: overlap= only applies to cron tasks")
             task_queue = queueing.check_queue_name(self.default_queue if queue is None else queue)
             if max_retries is not None and max_retries < 0:
                 raise ValueError("max_retries must be >= 0")
@@ -264,6 +271,9 @@ class PyTaskQ:
             rate_interval = parse_rate_limit(rate_limit) if rate_limit is not None else None
 
             task_name = name or fn.__name__
+            if not isinstance(task_name, str) or not TASK_NAME_RE.match(task_name):
+                raise ValueError(f"Task name {task_name!r} isn't valid: use 1–200 letters, digits, '_', '.', ':' or "
+                                 f"'-', starting with a letter or '_' (it appears in logs, URLs and Redis keys)")
             if task_name in self.TASKS and self.TASKS[task_name]["handler"] is not fn:
                 raise ValueError(f"A task named {task_name!r} is already registered")
 
@@ -275,6 +285,7 @@ class PyTaskQ:
                 "cron": cron,
                 "tz": tz,
                 "catch_up": catch_up,
+                "overlap": overlap,
                 "priority": prio,
                 "queue": task_queue,
                 "max_retries": retries,
