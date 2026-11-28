@@ -553,13 +553,14 @@ def test_task_names_that_break_logs_and_keys_are_refused(name):
 async def test_a_recovered_max_concurrency_job_keeps_its_place_in_line(env):
     r = env
     tasks = {"one": {"handler": lambda: "ok", "type": "io", "max_retries": 0, "max_concurrency": 1}}
-    await queueing.enqueue(r, queueing.new_payload("one", task_id="m0"))
-    await r.hset("task:m0", "created_at", time.time() - 100)          # queued first, ran, its worker died
-    await r.zadd("limit:running:one", {"someone@x": time.time() + 600})  # the place is taken now
-    for i in (1, 2):
+    await r.zadd("limit:running:one", {"someone@x": time.time() + 600})  # the place is taken
+    for i in (1, 2):                                                    # these start waiting first…
         await queueing.enqueue(r, queueing.new_payload("one", task_id=f"m{i}"))
-    for _ in range(3):
         await run_one(r, tasks)
+    # …then m0 comes back: it was queued before them, held the place, and its worker died.
+    await queueing.enqueue(r, queueing.new_payload("one", task_id="m0"))
+    await r.hset("task:m0", "created_at", time.time() - 100)
+    await run_one(r, tasks)
     line = [e.split("\n")[2] for e in await r.zrange("limit:waiting:one", 0, -1)]
     assert line[0] == "m0", line
 
@@ -861,3 +862,36 @@ async def test_a_worker_takes_several_jobs_in_one_round_trip(env):
     await r.set("queue:low", "x")
     reply = await r.eval(worker.PRIORITY_POP_MANY_SCRIPT, *worker.pop_many_call(["default"], 2, 4))
     assert reply == [0, "queue:low"]
+
+
+@needs_redis
+async def test_rate_limited_jobs_that_wait_for_a_thread_still_start_a_gap_apart(real7, tmp_path):
+    r, url = real7
+    w = Proc(url, tmp_path, "rl", WORKER_IO_WORKERS=2)
+    try:
+        await queueing.enqueue(r, queueing.new_payload("slow", [1.5], task_id="blocker1"))
+        await queueing.enqueue(r, queueing.new_payload("slow", [1.5], task_id="blocker2"))   # both threads busy
+        assert await _until(lambda: _status_is(r, "blocker2", "Processing"), timeout=20)
+        for i in range(8):
+            await queueing.enqueue(r, queueing.new_payload("paced", [f"p{i}"], task_id=f"p{i}"))
+        assert await _until(lambda: _all_done(r, [f"p{i}" for i in range(8)]), timeout=30)
+        starts = sorted(float(ln.split()[2]) for ln in w.runlog.read_text().splitlines() if ln.startswith("paced "))
+        gaps = [b - a for a, b in zip(starts, starts[1:])]
+        assert len(starts) == 8 and min(gaps) >= 0.09, gaps
+    finally:
+        w.proc.terminate()
+        w.proc.wait(30)
+
+
+async def _all_done(r, ids):
+    return all([await r.hget(f"task:{i}", "status") == "Success" for i in ids])
+
+
+async def test_a_first_turn_never_starts_closer_than_the_gap(env):
+    r = env
+    t = time.time()
+    for gap in (0.05, 0.2):
+        await r.delete("t", "s")
+        await r.set("s", repr(t - 0.01))                      # someone started 10 ms ago
+        answer = await r.eval(worker.RATE_SCRIPT, 2, "t", "s", repr(t), repr(gap), "job-a", "")
+        assert answer != "go" and float(answer) >= t - 0.01 + gap - 1e-6, (gap, answer)

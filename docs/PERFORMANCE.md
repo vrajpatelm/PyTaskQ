@@ -21,6 +21,12 @@ The 429s in 0.4 are not an error. 500 users created about 175 jobs a second, mor
 
 At 400 users, who create jobs a little slower than the worker finishes them, 0.4 refused nothing: 291 requests a second, a median response of 8 ms, the slowest 5% under 60 ms, and only 13 jobs left waiting at the end. That's the sustained capacity of this setup. See [Sizing](#sizing) for what to add when you need more.
 
+## What changed in 0.7
+
+- A worker with free slots takes up to 8 jobs per round trip to Redis. Before, it took one, so throughput per worker was capped at about one job per round trip whatever `WORKER_IO_WORKERS` was set to (measured at 50 IO threads and 0.2 s jobs: 86 jobs/s with a 10 ms round trip, 19 jobs/s at 50 ms, against 250 locally).
+- `delay_sync()` keeps its connections: 1,000 calls used about 1,000 new connections and 2 ms each before; now a handful of connections in total.
+- A queue whose due scheduled jobs and retries can't move (it's full) no longer holds up other queues' scheduled jobs: the leader reads past them, within a quarter of a second per pass.
+
 ## What changed in 0.5
 
 | | 0.4 | 0.5 |

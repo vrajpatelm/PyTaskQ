@@ -404,7 +404,8 @@ redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', now - 2 * gap - 1)
 local last_start = tonumber(redis.call('GET', KEYS[2]) or '0')
 local mine = tonumber(ARGV[4] ~= '' and ARGV[4] or redis.call('ZSCORE', KEYS[1], ARGV[3]) or '')
 local ttl = math.ceil(3 * gap * 1000) + 60000
-if mine and mine > now + 0.05 then
+local early = math.min(0.05, gap / 2)       -- a reserved turn this close counts as due (the gap still holds)
+if mine and mine > now + early then
     if redis.call('ZSCORE', KEYS[1], ARGV[3]) then return string.format('%.6f', mine) end   -- not yet
     mine = nil                                              -- its turn is gone: a new one below
 end
@@ -425,7 +426,7 @@ redis.call('ZREM', KEYS[1], ARGV[3])
 local slot = math.max(now, last_start + gap)
 local latest = redis.call('ZREVRANGE', KEYS[1], 0, 0, 'WITHSCORES')
 if latest[2] then slot = math.max(slot, tonumber(latest[2]) + gap) end
-if slot <= now + 0.05 then return start() end
+if slot <= now and now >= last_start + gap * 0.999 then return start() end
 redis.call('ZADD', KEYS[1], slot, ARGV[3])
 redis.call('PEXPIRE', KEYS[1], math.ceil((slot - now) * 1000) + ttl)
 return string.format('%.6f', slot)

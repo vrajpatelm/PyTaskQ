@@ -67,7 +67,7 @@ The image includes a small example app so you can try PyTaskQ immediately. For r
 
 ```dockerfile
 # Dockerfile.worker
-FROM ghcr.io/vrajpatelm/pytaskq:0.6
+FROM ghcr.io/vrajpatelm/pytaskq:0.7
 COPY requirements.txt .
 RUN pip install --user -r requirements.txt     # your task's own dependencies
 COPY tasks.py .
@@ -130,11 +130,13 @@ Why not just copy the file into Redis? Redis keeps an append-only log of every c
 ## Upgrading
 
 ```bash
-# in .env: PYTASKQ_VERSION=0.6.0
+# in .env: PYTASKQ_VERSION=0.7.0
 docker compose -f docker-compose.prod.yml exec backup sh /backup-loop.sh once   # backup first
 docker compose -f docker-compose.prod.yml pull
 docker compose -f docker-compose.prod.yml up -d
 ```
+
+**Adding a task?** Deploy the workers first, then the code that queues the new task. If the web app goes first, its jobs for the new task wait for a worker that has it (up to `UNKNOWN_TASK_WAIT`, 10 minutes) and then fail, so a slow rollout still works, but there's no reason to cut it close.
 
 Upgrade the web service and every worker to the same version. If you build your own worker image (`FROM ghcr.io/vrajpatelm/pytaskq:…`), rebuild it with the new tag too. Afterwards, *Settings → Performance* warns if any worker still runs another version or has different settings. Coming from 0.3.1, read [UPGRADING.md](UPGRADING.md) first.
 
@@ -205,5 +207,8 @@ Caddy adds `X-Forwarded-For` and `X-Forwarded-Proto`, so PyTaskQ sees the visito
 | 503 "Redis is full" | Redis reached `REDIS_MAXMEMORY`. Workers drain it; raise it if it happens again. [REDIS.md](REDIS.md#when-redis-is-full) |
 | Worker exits at once with "Redis refused this worker" | Wrong `REDIS_PASSWORD`. `docker compose -f docker-compose.prod.yml exec web pytaskq ping` tests it. |
 | *Settings → Performance* says versions or settings differ | A worker wasn't upgraded or uses another `.env`. The Workers tab shows each one's version. |
-| Jobs stay *Queued* with "Waiting…" | The task has `max_concurrency` or `rate_limit` and is waiting for its turn, or its queue is paused (the Queues row shows it). |
+| Jobs stay *Queued* with "Waiting…" | The task has `max_concurrency` or `rate_limit` and is waiting for its turn, its queue is paused (the Queues row shows it), or no running worker has the task yet (*"No running worker has task 'x' yet…"*: deploy the workers). |
+| A job is in dead letters with *"The worker running this job stopped 3 time(s)…"* | Its code crashed every worker that ran it (a segfault, the out-of-memory killer, code holding the GIL). Make the task `type="cpu"`, or fix the input, then replay it. |
+| A worker log says *"Redis keys of the wrong type: …"* | Another app writes to the same Redis with the same key names. Set `REDIS_KEY_PREFIX` (drain the queues first), or rename that app's keys. |
+| A worker log says *"Another worker took the name…"* and it exits with code 1 | It was paused longer than its heartbeat while another process with the same `WORKER_NAME` started. Give each worker its own name. |
 | The dashboard asks for a setup code after a restart, and accounts are gone | Redis lost its data (no volume, or flushed). The new setup code is in `docker compose -f docker-compose.prod.yml logs web`; restore a backup to get the old data back. [REDIS.md](REDIS.md#when-redis-loses-its-data) |

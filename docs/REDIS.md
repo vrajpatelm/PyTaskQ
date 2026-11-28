@@ -21,7 +21,7 @@ When Redis reaches `maxmemory`, the policy decides what happens:
 
 Managed Redis services often default to `volatile-lru` or `allkeys-lru`. Change it to `noeviction` in the provider's settings (it's usually called "eviction policy" or "maxmemory-policy").
 
-PyTaskQ checks the policy (through `INFO`, which works even where `CONFIG` is disabled). When it isn't `noeviction`, every worker and the dashboard log an error at startup, `/health` reports it, and *Settings → Performance* shows it at the top.
+PyTaskQ checks the policy (through `INFO`, which works even where `CONFIG` is disabled). When it isn't `noeviction`, every worker and the dashboard log an error at startup, `/health` reports it, and *Settings → Performance* shows it at the top. The workers' leader checks again every minute, so a policy switched on while everything runs (a plan change applied live, a failover to a differently configured replica) is logged too, and so is any key Redis evicted (*Redis evicted 4,576 key(s) since the last check…*).
 
 ### `maxmemory`
 
@@ -68,6 +68,8 @@ A Redis restart (an upgrade, a crash, `docker compose restart redis`) is handled
 
 - API requests made while Redis is down get `503` with `Retry-After`. The first request after Redis is back no longer fails: a connection that Redis closed is replaced and the request retried.
 - Workers pause and continue. A job that finished while Redis was down keeps its result in memory, which is saved once Redis is back.
+- The same holds while Redis answers but refuses writes for a while: `READONLY` (a failover in progress, or a client still pointed at the old primary), `NOREPLICAS` (`min-replicas-to-write` while a replica resyncs), `MISCONF` (a background save failed, often a full disk), `LOADING` (a restart reading its data), `BUSY` (another client's long Lua script). The outcome is saved once writes are allowed again, and the job isn't run twice. On `READONLY` the worker also reopens its connections, so a DNS-based failover reaches the new primary.
+- Don't run long Lua scripts or `KEYS *` on PyTaskQ's Redis: while one runs past `busy-reply-threshold` (5 s) every other client gets `BUSY`.
 - Open dashboards show "Redis unreachable" and continue updating on their own once Redis answers. *(Before 0.4.2 they froze until reloaded.)*
 
 ## When the network drops a connection
@@ -105,7 +107,9 @@ REDIS_KEY_PREFIX=shop        # keys become {shop}:queue:high, {shop}:task:…, {
 - Use it to run several PyTaskQ installations (staging and production, two apps) on one Redis, or PyTaskQ next to your app's own keys. Each installation sees only its own queues, jobs, workers, accounts and dashboard.
 - The braces make the prefix a Redis Cluster hash tag: every key of one installation lands in the same cluster slot, which PyTaskQ's multi-key scripts need. (PyTaskQ's client doesn't connect to Redis Cluster itself yet; this keeps the door open.)
 - The dashboard, every worker and your app must use the same prefix, set before they start. A process with another prefix simply sees an empty installation.
-- Without it (the default), keys keep the names earlier versions used. **Changing the prefix of an existing installation starts from an empty one**: the old keys stay where they were. Set it before you start, or move the data yourself.
+- Without it (the default), keys keep the names earlier versions used. **Changing the prefix of an existing installation starts from an empty one**: the old keys stay where they were. Set it before you start, or move the data yourself (drain the queues first).
+- A worker that finds PyTaskQ data under another prefix (or under none, when it has one) says so at startup and every few minutes: *"Found PyTaskQ data with no key prefix (5 job(s) waiting in its 'default' queue), but this process uses REDIS_KEY_PREFIX='myapp'"*. That's the sign of one process with a different `.env`.
+- **Sharing a Redis with another app? Set a prefix.** Without one, PyTaskQ's key names (`dlq`, `stats:failed`, `queue:high`…) are generic, and another app's key of the same name and a different type would get in the way. PyTaskQ never loses a job over it (the step is refused before anything changes, and the log names the key), but jobs that need that key wait until it's fixed.
 
 Separate Redis databases (`redis://…/1`) also keep installations apart, but managed Redis services and Redis Cluster often allow only database 0.
 
@@ -145,6 +149,14 @@ Each enqueue then waits (usually about one network round trip to the replica) un
 
 Run at least two workers, on different machines if possible: if one dies, the other takes over its jobs (after `WORKER_HEARTBEAT_TTL`, 30 s) and keeps the cron schedule running.
 
+## Connections
+
+Each worker holds about 6 connections when idle and a few more while busy; each API process up to `REDIS_MAX_CONNECTIONS` (200) under load, usually far fewer. `delay_sync()` keeps one small pool per process. Set Redis's `maxclients` (10,000 by default) with room to spare: when it's reached, workers say *"Redis has no free connections (maxclients reached)…"* and wait, and your app's `.delay()` fails.
+
+## Memory per job
+
+A waiting job takes about 1.5 KB plus about twice the size of its arguments (the job is kept in its queue and in its record). A finished job's record keeps its arguments and result for `RESULT_TTL`. With the shipped `maxmemory 400mb`, that's roughly 250,000 small waiting jobs, or about 1,700 with 100 KB of arguments each: keep arguments small and pass file locations instead.
+
 ## Passwords
 
 A wrong or missing Redis password stops a worker at startup with exit code 1 and the message *"Redis refused this worker … Check REDIS_URL / REDIS_PASSWORD"*, so Docker shows it as failed instead of running and doing nothing. `pytaskq ping` tests the connection settings without starting anything.
@@ -157,4 +169,5 @@ A wrong or missing Redis password stops a worker at startup with exit code 1 and
 - [ ] Backups are taken and copied elsewhere ([DEPLOYMENT.md](DEPLOYMENT.md#backups)).
 - [ ] Monitoring watches `/health` for `"status": "degraded"`, not only for its HTTP status.
 - [ ] For production that must survive losing a machine: a replica with automatic failover (managed Redis or Sentinel), and two or more workers.
-- [ ] If several installations share one Redis, each has its own `REDIS_KEY_PREFIX`.
+- [ ] If several installations share one Redis (or PyTaskQ shares it with another app), each has its own `REDIS_KEY_PREFIX`.
+- [ ] No long Lua scripts or `KEYS *` run on it.

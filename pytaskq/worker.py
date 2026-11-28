@@ -1239,6 +1239,43 @@ async def _hand_back(r, tasks, task_json, task_id) -> bool:
 
 
 RATE_HOLD = 0.5                    # a rate_limit turn closer than this is waited for in place (seconds)
+_rate_go: dict[str, tuple] = {}    # task id → (when its turn said "go", gap, task name, rate_limit) until it starts
+
+
+class _NotYet(Exception):
+    """A rate_limit job that waited for a thread or process and lost its turn meanwhile."""
+
+    def __init__(self, slot: float, rate: str):
+        super().__init__(slot)
+        self.slot, self.rate = slot, rate
+
+
+async def _confirm_turn(r, task_id: str) -> None:
+    """
+    Right before a rate_limit job really starts (it has its thread or process): if it waited for
+    one longer than the gap, other jobs may have started meanwhile, so it takes its turn again.
+    Starts are what the limit spaces out, not the decisions.
+    """
+    go = _rate_go.pop(task_id, None)
+    if go is None:
+        return
+    since, gap, name, rate = go
+    if time.monotonic() - since < gap:
+        return                             # nobody else could have gone since: its turn still holds
+    slot = None
+    for _ in range(RATE_HOLD_TRIES + 1):
+        now = clock.now()
+        answer = await _with_retries(
+            lambda _: r.eval(RATE_SCRIPT, 2, limit_key("turns", name), limit_key("started", name), "",
+                             repr(gap), task_id, "" if slot is None else repr(slot)),
+            "check a rate limit", task_id)
+        if answer == "go":
+            return
+        slot = float(answer)
+        if slot - now >= RATE_HOLD:
+            raise _NotYet(slot, rate)
+        await asyncio.sleep(max(0.0, slot - now))
+    raise _NotYet(slot or clock.now(), rate)
 RATE_HOLD_TRIES = 2                # …at most this many times per pop, then the job waits in the delayed set
 LEASE_TTL = HEARTBEAT_TTL * 2      # seconds a max_concurrency lease lasts; the heartbeat renews it while the job runs
 WAIT_MAX = 30.0                    # longest fallback wait of a max_concurrency job (normally a finishing job wakes it)
@@ -1307,6 +1344,8 @@ async def _within_limits(r, tasks, task_json, entry: dict) -> bool:
             # The turn is moments away: wait here rather than via the delayed set.
             await asyncio.sleep(max(0.0, wait))
             now = clock.now()
+        if answer == "go":
+            _rate_go[task_id] = (time.monotonic(), float(gap), name, entry.get("rate_limit"))
         if answer != "go":
             when = datetime.fromtimestamp(slot, timezone.utc).strftime("%H:%M:%S UTC")
             await _wait_in_delayed_set(r, tasks, task_json, slot, {"rate_slot": slot},
@@ -1656,6 +1695,7 @@ async def handle_task(task_json, sem, loop, process_pool, thread_pool):
         finally:
             _running.pop(tasks.task_id, None)
             _finishing.discard(tasks.task_id)
+            _rate_go.pop(tasks.task_id, None)
             ctx = _jobs.pop(tasks.task_id, None)
             if ctx is not None:
                 ctx.finished = True                # progress() from code it left running is ignored
@@ -1709,6 +1749,7 @@ async def _run(r, tasks, task_json, process_pool, thread_pool) -> None:
         async def started():
             # Called when the job gets a process/thread, so waiting for a slot doesn't count toward its timeout.
             nonlocal started_at
+            await _confirm_turn(r, task_id)
             started_at = clock.now()
 
             async def write(_):
@@ -1769,6 +1810,13 @@ async def _run(r, tasks, task_json, process_pool, thread_pool) -> None:
         except JobCancelled:
             await _record_cancelled(r, tasks, task_json, started_at)
             span.set_attribute("task.status", "Cancelled")
+            return
+
+        except _NotYet as e:
+            when = datetime.fromtimestamp(e.slot, timezone.utc).strftime("%H:%M:%S UTC")
+            await _wait_in_delayed_set(r, tasks, task_json, e.slot, {"rate_slot": e.slot},
+                                       f"Waiting for its turn under rate_limit={e.rate}: starts at {when}.")
+            span.set_attribute("task.status", "Waiting")
             return
 
         except PoolBroken as e:

@@ -58,7 +58,7 @@ Within its queues, a worker shares its turns between priorities by weight. With 
 | `1,1,1` | Priorities only break ties |
 | `strict` | Every `high` job first, then `default`, then `low` (the behaviour before 0.5). A steady stream of high jobs keeps the others waiting forever. |
 
-Between queues at the same priority a worker takes turns, so a queue with 10,000 waiting jobs can't starve one with 3. Use the same `PRIORITY_WEIGHTS` everywhere; the dashboard warns when workers differ.
+Between queues a worker takes turns for every priority separately, so each queue gets the same share of `high`, `default` and `low` turns: a queue with 10,000 waiting jobs can't starve one with 3, whatever the number of queues. Use the same `PRIORITY_WEIGHTS` everywhere; the dashboard warns when workers differ.
 
 ### Pausing a queue
 
@@ -86,7 +86,7 @@ Both connect to the same Redis. In Docker Compose, run two worker services with 
 
 `QUEUE_CAPACITY` (default 500) applies to **each** queue. When `images` is full, new image jobs sent through the API get `429` ("queue 'images' is full"), while emails keep being accepted.
 
-The limit protects the queue from outside traffic. Jobs your app queues with `.delay()`, cron runs, retries and dead-letter replays are never refused. Due scheduled jobs and retries wait in the schedule until their queue is below the limit, so a large backlog that becomes due at once drains steadily instead of filling the queue in one go.
+The limit protects the queue from outside traffic. Jobs your app queues with `.delay()`, cron runs, retries and dead-letter replays are never refused. Due scheduled jobs and retries wait in the schedule until their queue is below the limit, so a large backlog that becomes due at once drains steadily instead of filling the queue in one go. Jobs waiting for a full queue never hold up other queues' scheduled jobs and retries, however many there are; the leader logs once a minute which queues hold jobs back.
 
 ### What the dashboard shows
 
@@ -96,7 +96,7 @@ The limit protects the queue from outside traffic. Jobs your app queues with `.d
 
 ### Two apps on one queue
 
-If two different apps both use `default`, a worker of app A will sometimes take a job for app B's task. It doesn't fail the job: it hands it back to the queue for a worker that has the task, and the job runs a little later. This continues for up to 10 minutes, then the job fails normally (retries, then dead letters), so it can't loop forever. *Settings → Performance* shows how often it happened.
+If two different apps both use `default`, a worker of app A will sometimes take a job for app B's task. It doesn't fail the job: it hands it back to the queue for a worker that has the task, and the job runs a little later. When no running worker has the task yet (a rolling deploy where the web app went first), the job checks back less and less often. Either way it waits up to `UNKNOWN_TASK_WAIT` (10 minutes), then fails normally (retries, then dead letters), so it can't loop forever. *Settings → Performance* shows how often it happened. Only workers count as having a task: the dashboard's `--app` doesn't.
 
 It's wasted work, though. **Give each app its own queue**, for example `PyTaskQ(default_queue="emails")`.
 
@@ -119,9 +119,21 @@ def india_digest(): ...
 - **Daylight saving:**
   - When clocks go back, a time like 01:30 happens twice. The job runs once.
   - When clocks go forward, a time that's skipped (01:30 in London on the last Sunday of March) runs at the moment the clocks jump.
+  - Interval schedules (`*/30 * * * *`, `0 * * * *`) in a zone with daylight saving also run once per local time, so they skip the repeated hour when clocks go back. Use `tz="UTC"` (the default) for schedules that must run every N minutes without a gap.
 - Each tick runs once across all workers, and a cron job goes onto its task's queue.
 
 `pytaskq tasks --app tasks:queue` lists each task's queue and, for cron tasks, its time zone.
+
+### Runs that take longer than the interval
+
+A run that hasn't finished when the next tick comes **overlaps** it: both run (a warning in the log says so, at most once an hour). For syncs, reports and cleanups that sometimes run long, skip ticks instead:
+
+```python
+@queue.task(cron="*/5 * * * *", overlap=False)
+def sync_inventory(): ...
+```
+
+With `overlap=False` a tick is skipped (and counted, like ticks skipped for a paused queue) while the previous run is still waiting or running. `max_concurrency=1` isn't the same: it queues the extra runs, so they all still run, one after another.
 
 ### Missed runs and catch-up
 

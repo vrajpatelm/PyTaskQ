@@ -57,3 +57,8 @@ class Weird(Exception):
 
 def raise_weird():
     raise Weird("x", "y")
+
+
+@queue.task(type="io", max_retries=0, rate_limit="10/s")
+def paced(tag=""):
+    _log("paced", tag)

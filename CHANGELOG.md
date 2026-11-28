@@ -2,6 +2,59 @@
 
 All notable changes to PyTaskQ. Versions follow [semantic versioning](https://semver.org/).
 
+## 0.7.0 — 2026-11-28
+
+Fixes everything break tests #6 to #9 found (G, H, J and K findings), plus a `rate_limit` bug a 20-minute chaos soak test found. Read [UPGRADING.md](docs/UPGRADING.md#from-061-to-070): a few things are stricter.
+
+### Fixed: one job or one fault can't take the fleet down
+- **A job that kills its worker** (a segfault in a C extension, the out-of-memory killer, `os._exit()`, code holding Python's GIL past the heartbeat) was handed to the next worker, which died too: 3 of 3 workers in 22 s, a restarted worker 4 times in a second, forever. Recoveries of a running job are now counted; after `MAX_RECOVERIES` (3) it's dead-lettered with the reason. Workers also print a `faulthandler` stack on a segfault. (G1, J1)
+- **An `async def` task that catches `CancelledError`** ignored its timeout (ran 6 s with `timeout=1`), held a slot forever, made `cancel()` end in Success, and stopped its worker from ever exiting. It now gets `CANCEL_GRACE` (5 s), then is left running in the background with a warning: its slot is freed, its result ignored, and the worker exits without waiting for it. (K2)
+- **Temporary write refusals** (`READONLY` after a failover, `NOREPLICAS`, `MISCONF`, `BUSY` from another client's script, `LOADING`) made a finished job run a second time, blamed on "a lost reply". The outcome is now kept and saved once Redis takes writes again; on `READONLY` the connections are reopened. (G3, H3, K4)
+- **A key of the wrong type** under one of PyTaskQ's names (another app sharing the Redis) made a script stop half-way and lose the job, and one bad queue key stopped every queue. Every script now checks types before writing anything (the job is kept until the key is fixed, and the log names it), counters can no longer stop a script, the pop skips a bad list, and startup lists wrong keys. (G4)
+- **One full queue's due backlog** (over 10,000 scheduled jobs or retries waiting for room) froze every other queue's scheduled jobs and retries, silently. The leader now reads past jobs for full queues, carries on where it stopped, and logs which queues hold jobs back. (K1)
+- **Two live workers with one name** (one frozen past its heartbeat while a replacement started) put back each other's running jobs every 30 s. The heartbeat now checks the name still belongs to this process; if not, the worker stops without touching that name's jobs. (J2)
+- **After every leader restart** nothing scheduled, retried or swept for about 20 s. A stopping leader now hands the lock over at once; a crashed one is replaced within about 12 s. (H1)
+- **The retry of an IO job that timed out** ran at the same time as the abandoned attempt's thread. It now waits until that thread returns. (J4)
+- **`rate_limit` starts** could be milliseconds apart when jobs waited for a free thread or process after getting their turn (found by the soak test; also in 0.6.1). A job now takes its turn again when it gets a thread.
+- **A recovered `max_concurrency` job** went to the back of the line. Jobs now wait in the order they were queued. (J15)
+
+### Fixed: scheduling and deploys
+- **Queues weren't fair**: the queue rotation and the priority cycle shared one counter, so with 2 queues `qb`'s low-priority jobs never got the first pick. Every queue now gets the same share of every priority. (G6)
+- **Rolling deploys**: a job for a task no worker had yet was dead-lettered at once, or bounced between old workers for 10 minutes when the dashboard had `--app`. It now waits for a worker (up to `UNKNOWN_TASK_WAIT`, 10 minutes), checking back less and less often; only workers count. (H2)
+- **Cron runs could pile up** (3 copies of a long `* * * * *` task at once). A warning now says when runs overlap, and `overlap=False` skips a tick while the previous run is still going. (K5)
+- **Eviction switched on at runtime** deleted thousands of jobs without a word; the leader now checks every minute and logs evicted keys. Data under another `REDIS_KEY_PREFIX` is reported at startup and every minute. (J3, J5)
+- A worker takes up to 8 jobs per round trip, so a Redis in another zone doesn't cap it at one job per round trip (86 jobs/s at 10 ms before). (G7)
+
+### Fixed: the SDK
+- `await task.delay()` from a second event loop (`asyncio.run()` per call, threads, forked processes) raised `Event loop is closed` every other call although the job was queued. Each loop now gets its own client. (G5)
+- `delay_sync()` opened a new connection and event loop per call (1,000 calls = 1,002 connections, 2 ms each); it now reuses one pool per process. (G8)
+- Ids, task names, arguments and webhook URLs that can't work are refused when queueing, with the argument named: an integer or 5,000-character or multi-line `task_id`, a task name with spaces or newlines, dict keys that aren't text (`{1: "a", "1": "b"}` lost a value), `datetime`/`set`/`bytes` values, `args="abc"`, `on_success_url="not a url"` or a private address. (G9, J6, J8, J9)
+- `task.schedule(delay_seconds=…)` swallowed a task parameter of that name. (J7)
+- The last `progress()` before a task returned was lost (a finished job showed 40 %). (J10)
+- `app.cancel()` returned `True` for jobs that then succeeded. It now returns `"cancelled"` or `"stopping"` (both truthy) or `False`, and a job asked to stop ends Cancelled even if its code ran to the end. (J11)
+- A CPU task's exception that can't be rebuilt from its arguments hid the real error behind "something that can't be read". (J12)
+- A successful job whose result's `__str__` raises was dead-lettered (and replayed its side effects); it now succeeds with `<unreadable Name>`. (K6)
+- A job queued on a machine with a wrong clock got a wrong `created_at`. (K8)
+- `idempotency_key=""` was silently no key; a duplicate whose first job's record expired said `"queued"`. (K10)
+- Crashed CPU processes left pipe file descriptors open until a garbage collection. (K9)
+
+### Fixed: operations and messages
+- SIGHUP (closing the terminal) killed the worker without a word; it's now a clean stop. A second Ctrl+C skips the grace period. (H5, H6)
+- A record that vanished while its job ran (`FLUSHDB`) was saved as a nameless half-record; it's rebuilt from the job. (H7)
+- `maxclients`, wrong-type keys, read-only replicas and other refusals are explained in words; the main loop and leader election no longer repeat the same raw error several times a second; a dropped connection is retried at once instead of after 5 s; the watchdog tells a frozen process (GIL, SIGSTOP) apart from a blocked event loop; a job that finished but couldn't be saved at shutdown is no longer reported as "still running". (H8, G11, J14, K11)
+- Settings that can't work are refused at startup with the setting named: `RESULT_TTL=0` (deleted every record at once), `REDIS_MAX_CONNECTIONS` below 4, negative values, `WORKER_IO_WORKERS=-3`. (G10)
+- Waiting for a job from inside a job (which can deadlock a busy fleet) logs a warning pointing to workflows. (K3)
+
+### Added
+- `Unrecoverable`: raise it from a task to dead-letter the job at once without using retries (like BullMQ's `UnrecoverableError`). Unsafe webhook URLs fail this way too.
+- `with_job(fn)`: run code in a thread the task starts as part of the job (`progress()`, `cancelled()`, `current_task_id()` work there). (K7)
+- Cron `overlap=False`.
+- Settings `MAX_RECOVERIES` (3), `CANCEL_GRACE` (5), `LOOP_BLOCK_GIVE_UP` (0 = off: stop a worker whose event loop stays blocked that long, G12) and `UNKNOWN_TASK_WAIT` (600).
+- Redis keys `running:{id}`, `pytaskq:cron:last`, `pytaskq:registry:workers`; record field `recoveries`.
+
+### Docs
+- GUARANTEES, TASKS, WORKERS, QUEUES (fairness, overlap, daylight saving for interval schedules), REDIS (refusals, wrong-type keys, prefixes, connections, memory per job), DEPLOYMENT (rolling deploys, troubleshooting), PERFORMANCE, ARCHITECTURE, UPGRADING, `.env.example`.
+
 ## 0.6.1 — 2026-11-25
 
 ### Fixed
