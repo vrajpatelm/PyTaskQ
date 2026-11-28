@@ -63,6 +63,9 @@ async def reset_worker_globals():
     worker._abandoned_async.clear()
     worker._finishing.clear()
     worker._promote_from = 0
+    # "Say it once a minute" timers: a message logged by an earlier test mustn't hide the next one.
+    worker._held_back_logged = worker._bad_lists_logged = worker._leader_error_at = float("-inf")
+    worker._overlap_warned.clear()
     pressure._pending.clear()
     yield
     pressure._pending.clear()
