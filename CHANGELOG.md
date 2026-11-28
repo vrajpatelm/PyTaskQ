@@ -15,7 +15,7 @@ Fixes everything break tests #6 to #9 found (G, H, J and K findings), plus a `ra
 - **Two live workers with one name** (one frozen past its heartbeat while a replacement started) put back each other's running jobs every 30 s. The heartbeat now checks the name still belongs to this process; if not, the worker stops without touching that name's jobs. (J2)
 - **After every leader restart** nothing scheduled, retried or swept for about 20 s. A stopping leader now hands the lock over at once; a crashed one is replaced within about 12 s. (H1)
 - **The retry of an IO job that timed out** ran at the same time as the abandoned attempt's thread. It now waits until that thread returns. (J4)
-- **`rate_limit` starts** could be milliseconds apart when jobs waited for a free thread or process after getting their turn (found by the soak test; also in 0.6.1). A job now takes its turn again when it gets a thread.
+- **`rate_limit` starts** could be closer than the limit, found by the soak test (both also in 0.6.1): a job asking for its first turn started at once when its slot was up to 50 ms away (at `"20/s"` that's the whole gap: a third of the starts were milliseconds apart; at `"5/s"` starts were 0.15 s apart), and jobs that waited for a free thread after getting their turn all started together. A first turn now never starts before the gap, and a job takes its turn again when it gets its thread.
 - **A recovered `max_concurrency` job** went to the back of the line. Jobs now wait in the order they were queued. (J15)
 
 ### Fixed: scheduling and deploys
