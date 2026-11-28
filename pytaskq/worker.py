@@ -480,7 +480,7 @@ async def retry_scheduler():
             moved = await _promote_due_tasks()
             wait = await _next_promotion_in(redis_client.r, moved)
         except Exception as e:
-            logger.error(f"[Retry Scheduler] Redis error: {e}")
+            logger.error(f"[Retry Scheduler] Couldn't move due jobs: {redis_health.explain(e)}")
             wait = PROMOTE_IDLE
         await asyncio.sleep(wait)
 
@@ -1177,7 +1177,10 @@ async def _record_failure(r, tasks, task_json, task_id, error, max_retries, perm
             await _workflow_step(r, tasks, "failed", error=error)
         if outcome == 2:
             logger.warning(f"[DLQ] More than DLQ_LIMIT ({settings.DLQ_LIMIT}) dead letters; the oldest was dropped.")
-        logger.error(f"[DLQ] Task {task_id} failed after {tasks.retry_count} retries. Moving to DLQ. ({error})")
+        if permanent:
+            logger.error(f"[DLQ] Task {task_id} failed and isn't retried (retrying can't help). Moving to DLQ. ({error})")
+        else:
+            logger.error(f"[DLQ] Task {task_id} failed after {tasks.retry_count} retries. Moving to DLQ. ({error})")
         return "DeadLetter"
     logger.error(f"Task {task_id} failed: {error.rstrip('.')}. Retry {tasks.retry_count}/{max_retries} scheduled.")
     return "RetryScheduled"
@@ -1242,6 +1245,10 @@ RATE_HOLD = 0.5                    # a rate_limit turn closer than this is waite
 _rate_go: dict[str, tuple] = {}    # task id → (when its turn said "go", gap, task name, rate_limit) until it starts
 
 
+class _HandedOver(Exception):
+    """The job went to another worker while this one waited to start it (its heartbeat ran out): don't run it."""
+
+
 class _NotYet(Exception):
     """A rate_limit job that waited for a thread or process and lost its turn meanwhile."""
 
@@ -1260,14 +1267,14 @@ async def _confirm_turn(r, task_id: str) -> None:
     if go is None:
         return
     since, gap, name, rate = go
-    if time.monotonic() - since < gap:
-        return                             # nobody else could have gone since: its turn still holds
+    if time.monotonic() - since < 0.002:
+        return                             # it got its thread at once: its "go" is its start
     slot = None
     for _ in range(RATE_HOLD_TRIES + 1):
         now = clock.now()
         answer = await _with_retries(
             lambda _: r.eval(RATE_SCRIPT, 2, limit_key("turns", name), limit_key("started", name), "",
-                             repr(gap), task_id, "" if slot is None else repr(slot)),
+                             repr(gap), task_id, "" if slot is None else repr(slot), "confirm"),
             "check a rate limit", task_id)
         if answer == "go":
             return
@@ -1753,11 +1760,17 @@ async def _run(r, tasks, task_json, process_pool, thread_pool) -> None:
             started_at = clock.now()
 
             async def write(_):
-                return int(await r.eval(STARTED_SCRIPT, 2, queueing.task_key(task_id), cancel_key(task_id),
+                return int(await r.eval(STARTED_SCRIPT, 3, queueing.task_key(task_id), cancel_key(task_id),
+                                        rkey(f"fence:{task_id}"),
                                         "task_id", task_id, "task_name", tasks.task_name,
                                         "status", queueing.PROCESSING, "started_at", repr(started_at),
-                                        "worker_id", WORKER_ID, "retry_count", tasks.retry_count))
-            if not await _with_retries(write, "mark a job as started", task_id):
+                                        "worker_id", WORKER_ID, "retry_count", tasks.retry_count,
+                                        str(tasks.fence_token)))
+            outcome = await _with_retries(write, "mark a job as started", task_id)
+            if outcome == -1:
+                started_at = None
+                raise _HandedOver()
+            if not outcome:
                 started_at = None
                 raise JobCancelled()
             logger.info(f"Executing task {task_id} ({tasks.task_name})")
@@ -1810,6 +1823,14 @@ async def _run(r, tasks, task_json, process_pool, thread_pool) -> None:
         except JobCancelled:
             await _record_cancelled(r, tasks, task_json, started_at)
             span.set_attribute("task.status", "Cancelled")
+            return
+
+        except _HandedOver:
+            # Its copy here is stale: drop it from this worker's list (another worker holds the live one).
+            await _with_retries(lambda _: r.lrem(_processing_key(), 1, task_json), "drop a stale job", task_id)
+            logger.warning(f"Task {task_id} ({tasks.task_name}) went to another worker while this one waited to start "
+                           f"it (this worker's heartbeat ran out, e.g. Redis was unreachable). Not running it here.")
+            span.set_attribute("task.status", "HandedOver")
             return
 
         except _NotYet as e:

@@ -895,3 +895,35 @@ async def test_a_first_turn_never_starts_closer_than_the_gap(env):
         await r.set("s", repr(t - 0.01))                      # someone started 10 ms ago
         answer = await r.eval(worker.RATE_SCRIPT, 2, "t", "s", repr(t), repr(gap), "job-a", "")
         assert answer != "go" and float(answer) >= t - 0.01 + gap - 1e-6, (gap, answer)
+
+
+async def test_a_job_handed_to_another_worker_meanwhile_is_not_started_here(env):
+    """This worker took the job, then lost Redis long enough for its heartbeat to run out; the job ran elsewhere."""
+    r = env
+    ran = []
+    tasks = {"once": {"handler": lambda: ran.append(1), "type": "io", "max_retries": 0}}
+    await queueing.enqueue(r, queueing.new_payload("once", task_id="ho1"))
+    raw = await pop(r)
+    await r.set("fence:ho1", 5)                                  # recovered and given to another worker
+    await r.hset("task:ho1", mapping={"status": "Success", "result": "elsewhere"})
+    sem = asyncio.Semaphore(1)
+    await sem.acquire()
+    with patch.object(worker, "TASKS", tasks):
+        await worker.handle_task(raw, sem, asyncio.get_running_loop(),
+                                 None, __import__("concurrent.futures").futures.ThreadPoolExecutor(1))
+    assert ran == [], "the stale copy never ran"
+    assert await r.hget("task:ho1", "status") == "Success", "the record wasn't overwritten with Processing"
+    assert await r.llen(worker._processing_key()) == 0
+
+
+async def test_a_rate_limited_job_that_waited_for_its_thread_moves_its_start_to_when_it_really_began(env):
+    r = env
+    t = time.time()
+    assert await r.eval(worker.RATE_SCRIPT, 2, "t", "s", repr(t), "0.1", "a", "") == "go"
+    # a waits 30 ms for a thread; b asks meanwhile and gets t + 0.1
+    b = await r.eval(worker.RATE_SCRIPT, 2, "t", "s", repr(t + 0.01), "0.1", "b", "")
+    assert abs(float(b) - (t + 0.1)) < 1e-4
+    assert await r.eval(worker.RATE_SCRIPT, 2, "t", "s", repr(t + 0.03), "0.1", "a", "", "confirm") == "go"
+    # b's turn now counts from a's real start
+    again = await r.eval(worker.RATE_SCRIPT, 2, "t", "s", repr(t + 0.1), "0.1", "b", b)
+    assert again != "go" and float(again) >= t + 0.13 - 1e-4

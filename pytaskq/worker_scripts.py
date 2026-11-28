@@ -393,7 +393,9 @@ return 0
 # could be stale or skewed, letting two workers start closer than the gap.
 # KEYS: the task's turns, its last start
 # ARGV: now ("" = Redis's clock; a fixed time for tests), seconds between starts, task id, this job's turn ("")
-# Returns "go" (start now; recorded as the latest start) or the time of its (new) turn.
+#       [, "confirm": the job got its "go" earlier and is really starting now (it waited for a thread)]
+# Returns "go" (start now; recorded as the latest start) or the time of its (new) turn. With "confirm", a job
+# whose own "go" is still the latest start moves that start to now, so the next turn counts from its real start.
 RATE_SCRIPT = """
 local now, gap = tonumber(ARGV[1]), tonumber(ARGV[2])
 if not now then
@@ -414,6 +416,10 @@ local function start()
     redis.call('ZADD', KEYS[1], now, ARGV[3])
     redis.call('PEXPIRE', KEYS[1], ttl)
     return 'go'
+end
+if ARGV[5] == 'confirm' then
+    local own = tonumber(redis.call('ZSCORE', KEYS[1], ARGV[3]) or '')
+    if own and math.abs(own - last_start) < 0.00001 then return start() end
 end
 if mine and now >= last_start + gap * 0.999 then return start() end
 if mine and mine >= now - math.max(gap, 1.0) then
@@ -512,14 +518,22 @@ return 1
 """
 
 # A job really starts: record it. (PERSIST first, so this works when Redis is full.)
-# KEYS: task hash [, cancel request]   ARGV: field, value, …   Returns 0 if cancelled.
+# KEYS: task hash [, cancel request [, fence]]   ARGV: field, value, … [, this attempt's fence token: with KEYS[3]]
+# Returns 1 started, 0 cancelled, -1 stale: the job was handed to another worker meanwhile (its fence
+# moved on), so this attempt must not run or touch the record.
 STARTED_SCRIPT = """
 local unpack = unpack or table.unpack
+local last = #ARGV
+if KEYS[3] then
+    local current = redis.call('GET', KEYS[3])
+    if current and current ~= ARGV[#ARGV] then return -1 end
+    last = #ARGV - 1
+end
 -- Cancelled while it waited: don't start it.
 if KEYS[2] and redis.call('EXISTS', KEYS[2]) == 1 then return 0 end
 redis.call('PERSIST', KEYS[1])
 redis.call('HDEL', KEYS[1], 'progress', 'progress_message', 'progress_at', 'waiting_for')   -- a retry starts from zero
-redis.call('HSET', KEYS[1], unpack(ARGV))
+redis.call('HSET', KEYS[1], unpack(ARGV, 1, last))
 redis.call('PUBLISH', '__PYTASKQ__events:global', 'update')
 return 1
 """
