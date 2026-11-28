@@ -1,3 +1,4 @@
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -52,6 +53,15 @@ class Settings(BaseSettings):
     WORKER_NAME: str = ""              # stable, unique worker name ("{hostname}" allowed); empty = random each start
     WORKER_HEARTBEAT_TTL: int = 30     # seconds without a heartbeat before a worker counts as dead
     WORKER_SHUTDOWN_GRACE: float = 30  # seconds running jobs get to finish on Ctrl+C / docker stop
+    # A job whose worker stopped this many times while running it (a crash, an OOM kill, a segfault,
+    # code holding the GIL past the heartbeat) is dead-lettered instead of handed to the next worker.
+    MAX_RECOVERIES: int = 3            # 0 = no limit
+    CANCEL_GRACE: float = 5            # seconds an async task gets to stop after a timeout or cancel
+    # Stop a worker whose event loop stayed blocked this long (an async task that never yields),
+    # so its job goes to the dead-worker path; 0 = only warn.
+    LOOP_BLOCK_GIVE_UP: float = 0
+    # How long a job for a task no live worker has waits for one (a deploy in progress) before it fails.
+    UNKNOWN_TASK_WAIT: float = 600
 
     # ── Authentication (self-hosting) ────────────────────────────────────────
     PYTASKQ_AUTH: str = "on"           # "off" disables login (local development only)
@@ -67,6 +77,30 @@ class Settings(BaseSettings):
     ALLOWED_ORIGINS: str = "*"
     IDEMPOTENCY_TTL: int = 86400       # how long an Idempotency-Key is remembered (seconds)
     ENVIRONMENT: str = "development"
+
+    @field_validator("RESULT_TTL", "IDEMPOTENCY_TTL")
+    @classmethod
+    def _positive_ttl(cls, v: int, info):
+        if v < 1:
+            raise ValueError(f"{info.field_name} must be at least 1 (seconds); {v} would delete every record "
+                             f"as soon as it's written")
+        return v
+
+    @field_validator("REDIS_MAX_CONNECTIONS")
+    @classmethod
+    def _enough_connections(cls, v: int):
+        if v < 4:
+            raise ValueError(f"REDIS_MAX_CONNECTIONS must be at least 4 (a worker uses several at once); got {v}")
+        return v
+
+    @field_validator("WORKER_HEARTBEAT_TTL", "WORKER_SHUTDOWN_GRACE", "MAX_RECOVERIES", "CANCEL_GRACE",
+                     "LOOP_BLOCK_GIVE_UP", "UNKNOWN_TASK_WAIT", "QUEUE_CAPACITY", "MAX_RETRIES", "DLQ_LIMIT",
+                     "FINISHED_JOBS_KEPT", "MAX_QUEUES", "MAX_RESULT_BYTES", "MAX_PAYLOAD_BYTES", "TASK_TIMEOUT")
+    @classmethod
+    def _not_negative(cls, v, info):
+        if v < 0:
+            raise ValueError(f"{info.field_name} can't be negative (got {v}); 0 means no limit where a limit applies")
+        return v
 
     @property
     def auth_enabled(self) -> bool:

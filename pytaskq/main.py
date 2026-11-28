@@ -108,6 +108,7 @@ async def lifespan(app: FastAPI):
     from pytaskq.core import pressure, redis_client
     from pytaskq.services.live import broadcaster
 
+    redis_client.claim()               # this event loop owns the shared pool; other loops get their own
     background = [asyncio.create_task(pressure.flush_forever(redis_client.r), name="pytaskq-pressure")]
     if await _publish_app_registry():
         background.append(asyncio.create_task(_keep_app_registry_fresh(), name="pytaskq-registry"))

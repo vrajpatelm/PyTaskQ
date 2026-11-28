@@ -47,6 +47,7 @@ import json
 import os
 import logging
 import re
+import threading
 import time
 from typing import Any, Callable, Optional, cast
 
@@ -58,6 +59,7 @@ from pytaskq.net import SAFE_OPENER, assert_safe_url
 logger = logging.getLogger("pytaskq")
 
 TASK_TYPES = ("cpu", "io", "async")
+TASK_NAME_RE = re.compile(r"^[^\W\d][\w.:-]{0,199}$")
 
 # Option names `delay()` treats as queue options rather than task kwargs —
 # unless the task function itself declares a parameter with that name.
@@ -65,9 +67,13 @@ _DELAY_OPTIONS = ("priority", "queue", "on_success_url", "idempotency_key", "cou
 
 
 def _redis():
-    # Looked up at call time so tests (and apps) can swap the client.
+    """
+    The async client for the running event loop. Looked up at call time so tests (and apps) can
+    swap it. A connection pool belongs to the event loop that opened its connections, so another
+    loop (asyncio.run() per call, a thread, a forked process) gets a client of its own.
+    """
     from pytaskq.core import redis_client
-    return redis_client.r
+    return redis_client.for_this_loop()
 
 
 def _describe_params(func: Callable) -> list[dict]:
@@ -194,6 +200,7 @@ class PyTaskQ:
         queue: Optional[str] = None,
         tz: Optional[str] = None,
         catch_up: Optional[bool] = None,
+        overlap: Optional[bool] = None,
         max_retries: Optional[int] = None,
         timeout: Optional[float] = None,
         max_concurrency: Optional[int] = None,
@@ -211,6 +218,9 @@ class PyTaskQ:
         catch_up    For cron tasks: after an outage (no worker running when a tick was
                     due), run the latest missed tick once when workers are back
                     (default: the CRON_CATCH_UP setting, True). Missed runs are always logged.
+        overlap     For cron tasks: False skips a tick while the previous run is still
+                    waiting or running (for syncs and reports that sometimes run long).
+                    Default True: every tick runs, and a warning says when runs overlap.
         priority    "high", "default" or "low" within its queue.
         queue       Named queue (default "default", or the app's default_queue). Only
                     workers serving this queue run the task: use it to give a kind of
@@ -255,6 +265,8 @@ class PyTaskQ:
                 _check_time_zone(tz)
             if catch_up is not None and cron is None:
                 raise ValueError(f"{fn.__name__}: catch_up= only applies to cron tasks")
+            if overlap is not None and cron is None:
+                raise ValueError(f"{fn.__name__}: overlap= only applies to cron tasks")
             task_queue = queueing.check_queue_name(self.default_queue if queue is None else queue)
             if max_retries is not None and max_retries < 0:
                 raise ValueError("max_retries must be >= 0")
@@ -264,6 +276,9 @@ class PyTaskQ:
             rate_interval = parse_rate_limit(rate_limit) if rate_limit is not None else None
 
             task_name = name or fn.__name__
+            if not isinstance(task_name, str) or not TASK_NAME_RE.match(task_name):
+                raise ValueError(f"Task name {task_name!r} isn't valid: use 1–200 letters, digits, '_', '.', ':' or "
+                                 f"'-', starting with a letter or '_' (it appears in logs, URLs and Redis keys)")
             if task_name in self.TASKS and self.TASKS[task_name]["handler"] is not fn:
                 raise ValueError(f"A task named {task_name!r} is already registered")
 
@@ -275,6 +290,7 @@ class PyTaskQ:
                 "cron": cron,
                 "tz": tz,
                 "catch_up": catch_up,
+                "overlap": overlap,
                 "priority": prio,
                 "queue": task_queue,
                 "max_retries": retries,
@@ -322,9 +338,13 @@ class PyTaskQ:
                 kwargs, opts = _split(kwargs)
                 return await apply_async(args, kwargs, **opts)
 
-            async def schedule(*args, delay_seconds: float = 60, **kwargs) -> dict:
+            async def schedule(*args, **kwargs) -> dict:
+                # `delay_seconds=` is the delay, unless the task has a parameter with that name
+                # (then it's the task's, and the delay is `countdown=`, else 60 s).
+                delay_seconds = 60.0 if "delay_seconds" in own_params else kwargs.pop("delay_seconds", 60.0)
                 kwargs, opts = _split(kwargs)
-                return await apply_async(args, kwargs, countdown=delay_seconds, **opts)
+                opts.setdefault("countdown", delay_seconds)
+                return await apply_async(args, kwargs, **opts)
 
             def delay_sync(*args, **kwargs) -> dict:
                 """Enqueue from synchronous code (no running event loop). Takes the same options as delay()."""
@@ -382,6 +402,13 @@ class PyTaskQ:
         `poll_interval`), so a quick job's result comes back quickly without a
         long wait hammering Redis.
         """
+        inside = context.current_task_id()
+        if inside is not None and inside not in _warned_waits:
+            _warned_waits.add(inside)
+            logger.warning(f"Job {inside} is waiting for job {task_id} from inside a job. That holds a worker slot "
+                           f"while the other job needs one: when every slot holds a waiting job, nothing moves "
+                           f"(they time out, or wait forever). Use a workflow (chain/group) to run jobs one after "
+                           f"another, or put the waited-for job on a queue served by other workers.")
         deadline = time.monotonic() + timeout
         delay = min(0.02, poll_interval)
         while True:
@@ -397,14 +424,22 @@ class PyTaskQ:
             await asyncio.sleep(min(delay, max(0.0, deadline - time.monotonic())))
             delay = min(delay * 1.5, poll_interval)
 
-    async def cancel(self, task_id: str) -> bool:
+    async def cancel(self, task_id: str):
         """
-        Cancel a job. A waiting job won't run; a running one is stopped by its
-        worker within about a second (then its status is Cancelled). False if
-        it already finished or doesn't exist.
+        Cancel a job. Returns:
+
+        - "cancelled": it was waiting, and won't run;
+        - "stopping": it's running, and its worker stops it within about a second. Its status
+          becomes Cancelled, and whatever it does after that is ignored (an IO thread can't be
+          stopped, so its code may still run to the end);
+        - False: it already finished, or there's no such job.
+
+        Both strings are truthy, so `if await app.cancel(id):` keeps working.
         """
-        ok, _ = await queueing.cancel(_redis(), task_id)
-        return ok
+        ok, what = await queueing.cancel(_redis(), task_id)
+        if not ok:
+            return False
+        return "stopping" if str(what).lower() in ("stopping", "processing", "running") else "cancelled"
 
     # ── workflows ────────────────────────────────────────────────────────────
     async def workflow(self, flow, *, name: Optional[str] = None, on_failure: str = "stop",
@@ -512,6 +547,47 @@ def _check_time_zone(name: str) -> None:
                          f"or 'Asia/Kolkata'.") from None
 
 
+class _SyncBridge:
+    """
+    One background event loop per process for delay_sync(), with its own connection pool that
+    stays open: a sync enqueue costs one round trip, not a new connection and event loop each time.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._thread: Optional[threading.Thread] = None
+        self._pid = 0
+        self._clients: dict = {}
+
+    def _ensure(self) -> asyncio.AbstractEventLoop:
+        with self._lock:
+            if self._pid != os.getpid() or self._loop is None or self._thread is None or not self._thread.is_alive():
+                self._loop, self._clients, self._pid = asyncio.new_event_loop(), {}, os.getpid()
+                self._thread = threading.Thread(target=self._loop.run_forever, name="pytaskq-sync", daemon=True)
+                self._thread.start()
+            return self._loop
+
+    def run(self, coro_factory):
+        loop = self._ensure()
+        if threading.current_thread() is self._thread:
+            raise RuntimeError("delay_sync() can't be called from inside PyTaskQ's own event loop")
+
+        async def go():
+            from pytaskq.core import redis_client
+            key = (redis_client.make_client, settings.REDIS_URL, settings.REDIS_SENTINELS, settings.REDIS_HOST,
+                   settings.REDIS_PORT, settings.REDIS_DB, settings.REDIS_PASSWORD)
+            client = self._clients.get(key)
+            if client is None:
+                client = self._clients[key] = redis_client.make_client()
+            return await coro_factory(client)
+        return asyncio.run_coroutine_threadsafe(go(), loop).result()
+
+
+_bridge = _SyncBridge()
+_warned_waits: set = set()          # jobs that already got the "waiting inside a job" warning
+
+
 def _run_sync(coro_factory):
     try:
         asyncio.get_running_loop()
@@ -519,16 +595,7 @@ def _run_sync(coro_factory):
         pass
     else:
         raise RuntimeError("delay_sync() was called inside a running event loop; use `await task.delay(...)` instead")
-
-    async def runner():
-        from pytaskq.core.redis_client import make_client
-        client = make_client()
-        try:
-            return await coro_factory(client)
-        finally:
-            await client.aclose()
-
-    return asyncio.run(runner())
+    return _bridge.run(coro_factory)
 
 
 # ── Built-in task: webhook delivery ─────────────────────────────────────────────

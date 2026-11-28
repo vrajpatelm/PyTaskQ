@@ -20,7 +20,9 @@ import urllib.request
 
 
 class UnsafeURL(Exception):
-    """Raised when a user-supplied URL targets a non-public address."""
+    """Raised when a user-supplied URL targets a non-public address. Retrying can't help."""
+
+    permanent = True
 
 
 def assert_safe_url(url: str) -> None:

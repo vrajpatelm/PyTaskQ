@@ -56,13 +56,29 @@ class _RemoteTraceback(Exception):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _send_error(conn, exc: BaseException, prefix: str = "") -> None:
-    tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
-    message = f"{prefix}{exc}"
+    import pickle
     try:
-        conn.send(("err", exc if not prefix else None, type(exc).__name__, message, tb))
+        tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
     except Exception:
-        # The exception itself can't be pickled: send its name and text instead.
-        conn.send(("err", None, type(exc).__name__, message, tb))
+        tb = ""
+    try:
+        text = str(exc)
+    except Exception:
+        text = "(its message couldn't be read)"
+    message = f"{prefix}{text}"
+    sendable: Optional[BaseException] = exc if not prefix else None
+    if sendable is not None:
+        try:
+            # Many exceptions pickle but can't be rebuilt (an __init__ with extra arguments):
+            # check here, and send the name and text instead, so the real error is what's shown.
+            pickle.loads(pickle.dumps(sendable))
+        except Exception:
+            sendable = None
+    permanent = bool(getattr(exc, "permanent", False))
+    try:
+        conn.send(("err", sendable, type(exc).__name__, message, tb, permanent))
+    except Exception:
+        conn.send(("err", None, type(exc).__name__, message, tb, permanent))
 
 
 PARENT_CHECK = 1.0      # seconds between a CPU process's checks that its worker is still alive
@@ -148,9 +164,9 @@ def _child_job(conn, task_id):
 
 
 def _raise_child_error(msg) -> None:
-    _, exc, type_name, message, tb = msg
+    _, exc, type_name, message, tb, *rest = msg
     if exc is None or not isinstance(exc, Exception):     # never re-raise SystemExit & co in the worker
-        exc = type(type_name, (Exception,), {})(message)
+        exc = type(type_name, (Exception,), {"permanent": bool(rest and rest[0])})(message)
     exc.__cause__ = _RemoteTraceback(tb)
     raise exc
 
@@ -218,6 +234,14 @@ class _Child:
             pass
         try:
             self.conn.close()
+        except Exception:
+            pass
+
+    def release(self) -> None:
+        """After kill(): free the process's own pipe now, not at the next garbage collection."""
+        try:
+            if not self.process.is_alive():
+                self.process.close()
         except Exception:
             pass
 
@@ -308,6 +332,7 @@ class CpuPool:
                 await asyncio.sleep(delay)
                 delay *= 3
                 continue
+            child.release()                   # the crashed one: its pipe is freed now
             if self._closed:
                 self._children.discard(fresh)
                 await loop.run_in_executor(self._threads, fresh.kill)

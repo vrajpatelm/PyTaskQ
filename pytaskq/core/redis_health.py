@@ -35,6 +35,51 @@ def is_oom(exc: BaseException) -> bool:
     return isinstance(exc, redis_errors.OutOfMemoryError) or "OOM command not allowed" in str(exc)
 
 
+# Refusals that pass by themselves: a failover in progress (READONLY, MASTERDOWN), too few replicas
+# (NOREPLICAS), a failed background save (MISCONF), another client's long script (BUSY), a restart
+# loading its data (LOADING), a resharding (TRYAGAIN, CLUSTERDOWN). Recording an outcome waits them out.
+TEMPORARY_PREFIXES = ("READONLY", "NOREPLICAS", "MISCONF", "BUSY", "LOADING", "MASTERDOWN", "TRYAGAIN",
+                      "CLUSTERDOWN")
+_TEMPORARY_TEXT = ("You can't write against a read only replica", "Redis is loading the dataset in memory",
+                   "Redis is busy running a script", "max number of clients reached")
+
+
+def is_temporary(exc: BaseException) -> bool:
+    """A Redis refusal that goes away on its own (retry it), as opposed to a bug or a wrong setting."""
+    if isinstance(exc, (redis_errors.ReadOnlyError, redis_errors.BusyLoadingError)):
+        return True
+    if not isinstance(exc, redis_errors.ResponseError):
+        return False
+    text = str(exc).lstrip()
+    return text.startswith(TEMPORARY_PREFIXES) or any(t in text for t in _TEMPORARY_TEXT)
+
+
+def is_wrong_type(exc: BaseException) -> bool:
+    """A PyTaskQ script refused to touch a key that holds the wrong type (nothing was written)."""
+    return "PYTASKQ_WRONGTYPE" in str(exc)
+
+
+def explain(exc: BaseException) -> str:
+    """One line for the log: what Redis said and what to do about it."""
+    text = str(exc).strip() or type(exc).__name__
+    if is_oom(exc):
+        return "Redis is out of memory"
+    if is_config_error(exc):
+        return f"Redis refused the password or permissions ({text})"
+    if "max number of clients reached" in text:
+        return ("Redis has no free connections (maxclients reached). Each worker holds about 6, each API "
+                "process up to REDIS_MAX_CONNECTIONS; raise maxclients or use fewer processes")
+    if is_wrong_type(exc):
+        key = text.split("key ", 1)[-1]
+        return (f"a Redis key has the wrong type: {key}. Another app or a hand edit wrote it. Rename or delete "
+                f"that key, or give PyTaskQ its own keys with REDIS_KEY_PREFIX")
+    if isinstance(exc, redis_errors.ReadOnlyError) or text.startswith("READONLY"):
+        return f"Redis is read-only right now (a replica, or a failover in progress): {text}"
+    if is_temporary(exc):
+        return f"Redis refused it for now: {text}"
+    return f"{type(exc).__name__}: {text}"
+
+
 def is_config_error(exc: BaseException) -> bool:
     """Errors that retrying won't fix: a wrong password, a user without permission."""
     if isinstance(exc, (redis_errors.AuthenticationError, redis_errors.AuthenticationWrongNumberOfArgsError,
@@ -128,6 +173,67 @@ async def check_data(r, who: str = "PyTaskQ") -> Optional[float]:
         return float(lost) if lost else None
     except ValueError:
         return None
+
+
+_evicted_seen: Optional[int] = None
+_policy_seen: Optional[str] = None
+
+
+async def check_eviction(r, who: str = "PyTaskQ") -> Optional[str]:
+    """
+    Notice eviction switched on, or keys evicted, while PyTaskQ runs (a plan change applied live, a
+    failover to a differently configured replica, a CONFIG SET). Logs an error; returns its text.
+    """
+    global _evicted_seen, _policy_seen
+    try:
+        mem = await r.info("memory")
+        stats = await r.info("stats")
+    except Exception:
+        return None                                  # a restricted user without INFO: nothing to compare
+    policy = str(mem.get("maxmemory_policy") or "")
+    evicted = int(stats.get("evicted_keys") or 0)
+    text = None
+    if _evicted_seen is not None and evicted > _evicted_seen:
+        text = (f"Redis evicted {evicted - _evicted_seen:,} key(s) since the last check (maxmemory-policy is "
+                f"'{policy}'): jobs, queues and records may have been deleted. Set maxmemory-policy noeviction.")
+    elif policy and policy != "noeviction" and policy != _policy_seen:
+        text = (f"Redis's maxmemory-policy is now '{policy}': when it fills up it deletes keys, jobs included. "
+                f"Set maxmemory-policy noeviction.")
+    _evicted_seen, _policy_seen = evicted, policy
+    if text:
+        logger.error(f"[{who}] {text}")
+    return text
+
+
+async def other_prefix_data(r) -> Optional[str]:
+    """
+    PyTaskQ data under another REDIS_KEY_PREFIX than this process uses (workers and the web app
+    must use the same one, or they don't see each other's jobs). A short text, or None.
+    """
+    from pytaskq.core import keys
+    mine = keys.PREFIX
+    try:
+        bare = keys.layout("")
+        if mine:
+            if await r.exists(bare["install"]):
+                waiting = sum([await r.llen(k) for k in bare["queues"]])
+                return (f"Found PyTaskQ data with no key prefix ({waiting} job(s) waiting in its 'default' queue), "
+                        f"but this process uses REDIS_KEY_PREFIX={keys.settings.REDIS_KEY_PREFIX!r}")
+            return None
+        found = []
+        cursor, rounds = 0, 0
+        while rounds < 20:
+            cursor, batch = await r.scan(cursor, match=bare["install_pattern"], count=1000)
+            found += batch
+            rounds += 1
+            if not cursor or found:
+                break
+        if found:
+            name = str(found[0]).split("}", 1)[0].lstrip("{")
+            return f"Found PyTaskQ data under REDIS_KEY_PREFIX={name!r}, but this process uses no prefix"
+    except Exception:
+        return None
+    return None
 
 
 def reset_marker_state() -> None:

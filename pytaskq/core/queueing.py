@@ -56,6 +56,14 @@ RECENT_KEY = rkey("tasks:recent")
 REGISTRY_KEY = rkey("pytaskq:registry")              # HASH task name → spec (JSON)
 REGISTRY_SEEN_KEY = rkey("pytaskq:registry:seen")    # ZSET task name → last time something advertised it
 REGISTRY_TTL = 300                             # a task disappears 5 min after nothing advertises it
+WORKER_TASKS_KEY = rkey("pytaskq:registry:workers")  # ZSET task name → last time a WORKER (not the dashboard) had it
+WORKER_TASKS_TTL = 120                         # a worker re-advertises every minute
+
+
+async def worker_has_task(r, task_name: str) -> bool:
+    """Whether a running worker (not the dashboard's --app) advertised `task_name` in the last two minutes."""
+    seen = await r.zscore(WORKER_TASKS_KEY, task_name)
+    return seen is not None and float(seen) >= clock.now() - WORKER_TASKS_TTL
 EVENTS_CHANNEL = rkey("events:global")
 
 
@@ -128,6 +136,16 @@ class _ResultNotes(list):
     pass
 
 
+def safe_str(value: Any) -> str:
+    """str(value), or repr(), or a placeholder when both raise (an object whose __str__ is broken)."""
+    for fn in (str, repr):
+        try:
+            return fn(value)
+        except Exception:
+            continue
+    return f"<unreadable {type(value).__name__}>"
+
+
 def _jsonable(value, notes: _ResultNotes, depth: int = 0):
     """NaN/Infinity → None (JSON has no such numbers), noting what was changed."""
     if isinstance(value, float) and (value != value or value in (float("inf"), float("-inf"))):
@@ -155,16 +173,16 @@ def encode_result_noted(result: Any) -> tuple[str, list[str]]:
     def as_text(value):
         if "text" not in notes:
             notes.append("text")
-        return str(value)
+        return safe_str(value)
     try:
         return clean_text(json.dumps(result, default=as_text, allow_nan=False)), list(notes)
     except ValueError:
         try:
             return clean_text(json.dumps(_jsonable(result, notes), default=as_text, allow_nan=False)), list(notes)
-        except (TypeError, ValueError):
-            return clean_text(str(result)), ["text"]
-    except TypeError:
-        return clean_text(str(result)), ["text"]
+        except (TypeError, ValueError, RecursionError):
+            return clean_text(safe_str(result)), ["text"]
+    except (TypeError, RecursionError):
+        return clean_text(safe_str(result)), ["text"]
 
 
 def encode_result(result: Any) -> str:
@@ -175,6 +193,82 @@ def encode_result(result: Any) -> str:
 def _clean(mapping: dict) -> dict:
     """Redis hashes can't store None — drop those fields."""
     return {k: v for k, v in mapping.items() if v is not None}
+
+
+TASK_ID_MAX = 200
+_CONTROL = re.compile(r"[\x00-\x1f\x7f]")
+
+
+def check_task_id(task_id: Any) -> str:
+    """A task id the whole system can handle (the same rule as the API), or ValueError."""
+    if not isinstance(task_id, str) or not 1 <= len(task_id) <= TASK_ID_MAX or _CONTROL.search(task_id):
+        raise ValueError(f"task_id must be text of 1–{TASK_ID_MAX} characters without line breaks or control "
+                         f"characters, got {task_id!r:.80}")
+    try:
+        task_id.encode("utf-8")
+    except UnicodeEncodeError:
+        raise ValueError("task_id must be valid text (it contains a lone surrogate)") from None
+    return task_id
+
+
+_JSON_SCALARS = (str, int, float, bool, type(None))
+
+
+def check_arguments(args: Any, kwargs: Any) -> None:
+    """
+    Refuse arguments that wouldn't arrive as they were sent: arguments go through JSON, so dict
+    keys must be text and values JSON types (tuples arrive as lists). Names the argument.
+    """
+    if isinstance(args, (str, bytes, dict)):
+        raise TypeError(f"args must be a list or tuple of arguments, got {type(args).__name__} (the job wasn't queued)")
+    if kwargs is not None and not isinstance(kwargs, dict):
+        raise TypeError(f"kwargs must be a dict, got {type(kwargs).__name__} (the job wasn't queued)")
+
+    def walk(value, where: str, depth: int = 0) -> None:
+        if isinstance(value, _JSON_SCALARS) or depth > 100:
+            return
+        if isinstance(value, (list, tuple)):
+            for i, v in enumerate(value):
+                walk(v, f"{where}[{i}]", depth + 1)
+            return
+        if isinstance(value, dict):
+            for k, v in value.items():
+                if not isinstance(k, str):
+                    raise TypeError(f"{where} has a {type(k).__name__} key {k!r:.40}: it would arrive as the text "
+                                    f"{json.dumps(k) if isinstance(k, (int, float, bool, type(None))) else '?'}. "
+                                    f"Use text keys (the job wasn't queued).")
+                walk(v, f"{where}[{k!r:.40}]", depth + 1)
+            return
+        raise TypeError(f"{where} is a {type(value).__name__}, which can't be sent to a worker (arguments go "
+                        f"through JSON: use str, int, float, bool, None, list or dict; e.g. an ISO date string "
+                        f"for a datetime). The job wasn't queued.")
+    for i, v in enumerate(args or ()):
+        walk(v, f"argument {i + 1}")
+    for k, v in (kwargs or {}).items():
+        walk(v, f"argument {k!r}")
+
+
+def check_webhook_url(url: Any) -> str:
+    """An on_success_url that can work: http(s), a host, not a private address written out. ValueError otherwise."""
+    import ipaddress
+    import urllib.parse
+    if not isinstance(url, str) or not url:
+        raise ValueError("on_success_url must be an http(s) URL")
+    parsed = urllib.parse.urlparse(url)
+    host = parsed.hostname or ""
+    if parsed.scheme not in ("http", "https") or not host:
+        raise ValueError(f"on_success_url must be an http(s) URL with a host, got {url!r:.100}")
+    if host == "localhost" or host.endswith((".localhost", ".local", ".internal")):
+        raise ValueError(f"on_success_url can't point at an internal host ({host}): webhooks only go to public "
+                         f"addresses")
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return url
+    if not ip.is_global or ip.is_multicast:
+        raise ValueError(f"on_success_url can't point at a non-public address ({ip}): webhooks only go to public "
+                         f"addresses")
+    return url
 
 
 def new_payload(
@@ -193,6 +287,11 @@ def new_payload(
     if priority not in PRIORITIES:
         raise ValueError(f"priority must be one of {PRIORITIES}, got {priority!r}")
     queue = check_queue_name(queue)
+    check_arguments(args, kwargs)
+    if task_id is not None:
+        check_task_id(task_id)
+    if on_success_url is not None:
+        check_webhook_url(on_success_url)
     payload = {
         "task_id": task_id or str(uuid.uuid4()),
         "task_name": task_name,
@@ -258,6 +357,21 @@ local function pytaskq_keep(zkey, id, now, limit, task_prefix)
             for i = 1, #old, 2 do redis.call('DEL', task_prefix .. old[i]) end
         end
     end
+end
+"""
+
+
+# Refuse to touch a key that holds the wrong type (another app sharing the Redis, a hand edit),
+# BEFORE a script writes anything: Redis doesn't roll back a script that fails half-way, so a
+# WRONGTYPE error after a job left its list would lose it. Use as
+#   local bad = pytaskq_need(KEYS[4], 'list') or pytaskq_need(KEYS[6], 'zset'); if bad then return bad end
+TYPE_LUA = """
+local function pytaskq_need(key, kind)
+    local t = redis.call('TYPE', key)['ok']
+    if t ~= 'none' and t ~= kind then
+        return redis.error_reply('PYTASKQ_WRONGTYPE key ' .. key .. ' holds a ' .. t .. ', PyTaskQ needs a ' .. kind)
+    end
+    return nil
 end
 """
 
@@ -391,12 +505,17 @@ async def find_duplicate(r, key: Optional[str], payload: dict, delay_seconds: fl
 #         11 "1" = may run when Redis is full (internal follow-ups), 12 MAX_QUEUES (0 = none),
 #         13.. task hash fields (name, value, …)
 # Returns {1} queued, {2, record} idempotency key already used, {3} lock already taken, {0, waiting} full,
-#         {4, status} the task id belongs to a job that hasn't finished, {5, count} too many queues.
+#         {4, status} the task id belongs to a job that hasn't finished, {5, count} too many queues;
+#         a PYTASKQ_WRONGTYPE error (nothing written) when one of these keys holds another type.
 # Reusing the id of a finished job drops its old record, fence, history entry and cancel request.
 # A cancel request for an id with no record yet is kept: it stops a cancelled workflow's later steps.
 # The task hash has no expiry while the job waits: it gets RESULT_TTL when the job finishes.
-ENQUEUE_SCRIPT = WAKE_LUA + """
+ENQUEUE_SCRIPT = WAKE_LUA + TYPE_LUA + """
 local unpack = unpack or table.unpack
+local bad = pytaskq_need(KEYS[1], ARGV[2] == 'list' and 'list' or 'zset') or pytaskq_need(KEYS[2], 'hash')
+    or pytaskq_need(KEYS[3], 'list') or pytaskq_need(KEYS[4], 'set') or pytaskq_need(KEYS[7], 'list')
+    or pytaskq_need(KEYS[8], 'list') or pytaskq_need(KEYS[9], 'list') or pytaskq_need(KEYS[11], 'zset')
+if bad then return bad end
 if ARGV[11] == '1' then redis.call('DEL', '__PYTASKQ__pytaskq:oom-probe') end
 -- Re-sent after a lost reply: this call already queued the job.
 for i = 13, #ARGV - 1, 2 do
@@ -471,7 +590,7 @@ async def enqueue(r, payload: dict, delay_seconds: float = 0, created_by: Option
     delay_seconds = float(delay_seconds or 0)
     if not math.isfinite(delay_seconds) or not 0 <= delay_seconds <= MAX_DELAY_SECONDS:
         raise ValueError(f"delay must be between 0 and {MAX_DELAY_SECONDS} seconds (a year), got {delay_seconds!r}")
-    idem = _idempotency_redis_key(idempotency_key) if idempotency_key else None
+    idem = _idempotency_redis_key(idempotency_key) if idempotency_key is not None else None
     fingerprint = _fingerprint(payload, delay_seconds) if idem else ""
 
     with tracing.producer_span(payload):
@@ -479,7 +598,7 @@ async def enqueue(r, payload: dict, delay_seconds: float = 0, created_by: Option
         priority = payload.get("priority", "default")
         queue = payload_queue(payload)
         raw = dumps_payload(payload, max_bytes)
-        now = await clock.sync(r) if delay_seconds > 0 else clock.now()
+        now = await clock.sync(r)          # Redis's time (asks Redis at most once a minute)
         status = SCHEDULED if delay_seconds > 0 else QUEUED
         meta = _meta(payload, raw, status, now, delay_seconds)
         meta["enqueue_nonce"] = uuid.uuid4().hex       # recognises this call if it's re-sent
@@ -519,7 +638,11 @@ async def enqueue(r, payload: dict, delay_seconds: float = 0, created_by: Option
                     _warn_unreplicated(task_id, int(acked), replicas)
             return result
         if code == 2:
-            return _duplicate(reply[1], fingerprint)
+            first = _duplicate(reply[1], fingerprint)
+            # Say where the first job is now; its record may be gone (RESULT_TTL / FINISHED_JOBS_KEPT).
+            current = await r.hget(task_key(first.get("task_id", "")), "status") if first.get("task_id") else None
+            first["status"] = current.lower() if current else "unknown"
+            return first
         if code == 3:
             return None
         if code == 4:
@@ -930,14 +1053,20 @@ async def registry_lookup(r, task_name: str) -> tuple[Optional[dict], int]:
     return parse_registry_lookup(raw, seen, count, cutoff)
 
 
-async def publish_registry(r, specs: dict[str, dict]) -> None:
-    """Advertise `specs` (name → JSON-able spec), alongside tasks other workers advertise."""
+async def publish_registry(r, specs: dict[str, dict], worker: bool = False) -> None:
+    """
+    Advertise `specs` (name → JSON-able spec), alongside tasks other workers advertise.
+    worker: a worker that runs these tasks (the dashboard's --app only describes them).
+    """
     if not specs:
         return
     now = clock.now()
     async with r.pipeline(transaction=True) as pipe:
         pipe.hset(REGISTRY_KEY, mapping={k: json.dumps(v, default=str) for k, v in specs.items()})
         pipe.zadd(REGISTRY_SEEN_KEY, {k: now for k in specs})
+        if worker:
+            pipe.zadd(WORKER_TASKS_KEY, {k: now for k in specs})
+            pipe.zremrangebyscore(WORKER_TASKS_KEY, "-inf", now - 7 * 86400)
         pipe.publish(EVENTS_CHANNEL, "update")
         await pipe.execute()
 

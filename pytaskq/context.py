@@ -39,6 +39,7 @@ class Job:
     cancel: threading.Event = field(default_factory=threading.Event)
     stop: Optional[Callable[[], object]] = None      # set by the worker while the job runs
     left_running: Optional[object] = None            # an IO thread still running after a timeout/cancel
+    finished: bool = False                           # the job is over: later progress() calls are ignored
 
 
 _current: contextvars.ContextVar[Optional[Job]] = contextvars.ContextVar("pytaskq_job", default=None)
@@ -66,11 +67,35 @@ def progress(percent: Optional[float] = None, message: Optional[str] = None) -> 
     Returns False when not called from inside a job.
     """
     job = _current.get()
-    if job is None:
+    if job is None or job.finished:
         return False
     percent, message = _check(percent, message)
     job.report(job.task_id, percent, message)
     return True
+
+
+def with_job(func):
+    """
+    `func` wrapped to run as part of the current job, for code the task starts in its own threads
+    (a `threading.Thread`, a `ThreadPoolExecutor`): there `progress()`, `cancelled()` and
+    `current_task_id()` work as in the task itself. Outside a job it returns `func` unchanged.
+
+        pool.submit(with_job(download), url)
+    """
+    job = _current.get()
+    if job is None:
+        return func
+
+    def run(*args, **kwargs):
+        return run_as(job, func, args, kwargs)
+    return run
+
+
+class Unrecoverable(Exception):
+    """
+    Raise this from a task when retrying can't help (bad input, a record that no longer exists):
+    the job goes to dead letters at once, without using its retries.
+    """
 
 
 def cancelled() -> bool:
@@ -199,6 +224,11 @@ class Latest:
         with self._lock:
             pending, self._pending = self._pending, {}
         return pending
+
+    def take_one(self, task_id: str):
+        """The pending progress of one job (removed), or None."""
+        with self._lock:
+            return self._pending.pop(task_id, None)
 
     def drop(self, task_id: str) -> None:
         with self._lock:

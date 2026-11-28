@@ -26,7 +26,7 @@ Async-first, self-hosted, built on FastAPI and Redis.
 
 - **Plain Python.** One decorator. Sync, `async def`, CPU-heavy and I/O-bound tasks each run in the right pool automatically.
 - **See everything.** A live dashboard shows every job's arguments, timing, result and error, and lets you run, cancel and replay jobs.
-- **Built for failure.** Retries with backoff, a dead-letter queue, crash recovery, fencing tokens, safe retries with idempotency keys and graceful shutdown come built in. [What PyTaskQ guarantees](https://github.com/vrajpatelm/PyTaskQ/blob/main/docs/GUARANTEES.md), stated plainly.
+- **Built for failure.** Retries with backoff, a dead-letter queue, crash recovery, fencing tokens, safe retries with idempotency keys and graceful shutdown come built in. A job that crashes every worker it touches is dead-lettered after three tries instead of taking the fleet down, and Redis failovers, full disks or another client's long script don't lose or repeat jobs. Tested by repeated break tests and a chaos soak test. [What PyTaskQ guarantees](https://github.com/vrajpatelm/PyTaskQ/blob/main/docs/GUARANTEES.md), stated plainly.
 - **In control.** Report progress from a task, stop a running job, pause a queue, limit how many of a task run at once or how fast, and search every finished job.
 - **Workflows.** Run jobs one after another or side by side and pass results on (`chain`, `group`), see the whole flow in the dashboard, and resume it after fixing a failed step. No result backend needed.
 - **Fast on small servers.** On a 2-core server, 500 simultaneous users get a typical response in 16 ms, and the dashboard tells you which setting to change when it can't keep up.
@@ -237,7 +237,7 @@ docker compose -f docker-compose.prod.yml up -d
 For your own tasks, build a worker image on top of the official one:
 
 ```dockerfile
-FROM ghcr.io/vrajpatelm/pytaskq:0.6
+FROM ghcr.io/vrajpatelm/pytaskq:0.7
 COPY tasks.py .
 CMD ["pytaskq", "worker", "--app", "tasks:queue"]
 ```

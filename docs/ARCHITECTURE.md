@@ -54,7 +54,8 @@ With `REDIS_KEY_PREFIX=shop`, every key below (and the pub/sub channel) starts w
 | `processing_queue:{worker}` | List | Jobs a worker is running right now (its safety net if it crashes) |
 | `delayed_tasks` | Sorted set | Scheduled jobs and retries, scored by the time they're due |
 | `dlq` | List | Dead letters: jobs that failed every retry, with their last error, and "(invalid job)" entries (the newest `DLQ_LIMIT`) |
-| `task:{id}` | Hash | One job's record: status, the job itself (`payload`, which holds its arguments), timings, result or error. Kept while the job waits or runs; expires `RESULT_TTL` (a day) after it finishes |
+| `task:{id}` | Hash | One job's record: status, the job itself (`payload`, which holds its arguments), timings, result or error, `recoveries` (times its worker died while running it). Kept while the job waits or runs; expires `RESULT_TTL` (a day) after it finishes. Rebuilt from the job if it vanished while the job ran |
+| `running:{id}` | String | An IO attempt that timed out is still running in its thread; its retry waits until this is gone (deleted when the thread returns, else expires) |
 | `tasks:recent` | List | The newest `HISTORY_LIMIT` job ids, for the Jobs list |
 | `pytaskq:finished` | Sorted set | Finished jobs by finish time. Beyond `FINISHED_JOBS_KEPT`, the oldest are removed together with their records. Searched by the History tab |
 | `pytaskq:wake:{queue}` | List | Wake-up tokens: queueing a job pushes one, an idle worker waits on them (at most 100 per queue) |
@@ -64,13 +65,15 @@ With `REDIS_KEY_PREFIX=shop`, every key below (and the pub/sub channel) starts w
 | `limit:turns:{task}`, `limit:started:{task}` | Sorted set, String | `rate_limit` turns reserved per job (a cancelled job's turn is removed) and the time of the latest real start |
 | `wf:{id}`, `wf:{id}:results:{stage}`, `pytaskq:workflows` | Hash, Hash, Sorted set | A workflow (plan, stage, counts, status), each stage's results, and the list of workflows |
 | `pytaskq:workflows:running` | Sorted set | Running workflows, scored by when their stage started (or was last swept), so the leader's sweep reads only the ones that may be stuck |
-| `pytaskq:cron:skipped` | Hash | Cron ticks skipped because their queue was paused |
+| `pytaskq:cron:skipped` | Hash | Cron ticks skipped because their queue was paused, or because the previous run was still going (`overlap=False`) |
+| `pytaskq:cron:last` | Hash | The job id each cron task's latest tick queued (to tell whether runs overlap) |
 | `pytaskq:cron`, `pytaskq:cron:missed` | Hash | The latest tick handled for each scheduled task, and how many runs each missed |
 | `fence:{id}` | String | The job's fence token (see *Fencing* below) |
 | `active_workers`, `worker:{id}` | Sorted set, Hash | Which workers are alive (heartbeat, on Redis's clock), and each one's counters, health, version and shared settings |
 | `pytaskq:workers` | Set | Every worker that may own a `processing_queue`, so the leader also finds the lists of workers that stopped without a heartbeat |
-| `pytaskq:leader_lock`, `cron_lock:{task}:{tick}` | String | Which worker runs the background loops; one run per cron tick (kept 3 hours) |
-| `pytaskq:registry`, `pytaskq:registry:seen` | Hash, Sorted set | Tasks that running workers advertise, and when each was last advertised |
+| `pytaskq:leader_lock`, `cron_lock:{task}:{tick}` | String | Which worker runs the background loops (10 s, renewed every second, handed over on a clean stop); one run per cron tick (kept 3 hours) |
+| `pytaskq:registry`, `pytaskq:registry:seen` | Hash, Sorted set | Tasks that running workers (and a dashboard started with `--app`) advertise, and when each was last advertised |
+| `pytaskq:registry:workers` | Sorted set | When a running worker (not the dashboard) last advertised each task: decides whether a job for an unknown task waits for one |
 | `idempotency:{key}` | String | Which job an `Idempotency-Key` created. Expires after `IDEMPOTENCY_TTL` (a day) |
 | `stats:completed`, `stats:failed` | String | All-time totals. Everything else the dashboard counts is read from the lists above |
 | `stats:pressure:{minute}` | Hash | Requests turned away, and jobs handed back, per minute |

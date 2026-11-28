@@ -74,6 +74,7 @@ def cmd_worker(args):
         worker.NAME_OVERRIDE = args.name
     worker.set_tasks(app.TASKS, app_name=args.app)
     log.info(f"Starting PyTaskQ worker for app: {args.app}")
+    worker.EXIT_WHEN_STUCK = True       # don't wait at exit for task code that ignores being stopped
     asyncio.run(worker.consumer_task())
     if worker.EXIT_CODE or worker.THREADS_LEFT_RUNNING:
         # Python would wait for IO threads still stuck in task code forever; don't.

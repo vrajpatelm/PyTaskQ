@@ -66,12 +66,16 @@ async def handle(raw, tasks):
 
 def test_c1_scripts_that_drain_jobs_work_when_redis_is_full():
     """Redis refuses memory-growing commands only as a script's FIRST write (checked on a real Redis 7)."""
-    for name in ("PRIORITY_POP_SCRIPT", "LEADER_SCRIPT", "TIMEOUT_FENCE_SCRIPT", "HEARTBEAT_SCRIPT"):
+    for name in ("PRIORITY_POP_SCRIPT", "PRIORITY_POP_MANY_SCRIPT", "LEADER_SCRIPT", "TIMEOUT_FENCE_SCRIPT",
+                 "HEARTBEAT_SCRIPT"):
         assert getattr(worker, name).startswith(redis_health.OOM_PROBE), name
     # These already start with a write that needs no memory (LREM, ZREM, PERSIST).
     for name, first in (("COMPLETE_SCRIPT", "LREM"), ("FAIL_SCRIPT", "LREM"), ("PUT_BACK_SCRIPT", "LREM"),
                         ("HAND_BACK_SCRIPT", "LREM"), ("STARTED_SCRIPT", "PERSIST"), ("INVALID_SCRIPT", "REM")):
-        src = getattr(worker, name).replace(queueing.KEEP_LUA, "").replace(queueing.WAKE_LUA, "")  # definitions
+        src = getattr(worker, name)
+        for definitions in (queueing.KEEP_LUA, queueing.WAKE_LUA, queueing.TYPE_LUA,
+                            __import__("pytaskq.worker_scripts", fromlist=["x"]).REBUILD_LUA):
+            src = src.replace(definitions, "")
         writes = [w for w in ("'LREM'", "'ZREM'", "'PERSIST'", "'HSET'", "'ZADD'", "'LPUSH'", "'RPUSH'", "'SET'",
                               "'INCR'", "'SADD'") if w in src]
         firsts = sorted(writes, key=src.index)

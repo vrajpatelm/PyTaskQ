@@ -4,7 +4,9 @@ This guide explains where your task code runs, what a `timeout` really does for 
 
 ## How a worker takes jobs
 
-An idle worker waits for a wake-up token that queueing a job leaves on its queue, so it starts a new job within a few milliseconds and puts almost no load on Redis while idle. (It also looks every 5 seconds anyway, for jobs queued by older versions.) It takes jobs only from the queues it serves and that aren't paused, sharing its turns between priorities by `PRIORITY_WEIGHTS` ([QUEUES.md](QUEUES.md#priorities)).
+An idle worker waits for a wake-up token that queueing a job leaves on its queue, so it starts a new job within a few milliseconds and puts almost no load on Redis while idle. (It also looks every 5 seconds anyway, for jobs queued by older versions.) It takes jobs only from the queues it serves and that aren't paused, sharing its turns between priorities by `PRIORITY_WEIGHTS` and between queues equally ([QUEUES.md](QUEUES.md#priorities)).
+
+A worker with several free slots takes up to 8 jobs in one round trip to Redis, so a Redis in another zone or region doesn't hold it to one job per round trip.
 
 ## Where each task runs
 
@@ -91,19 +93,25 @@ A task can't stop or wedge the worker, whatever its code does:
 | returns a generator | Its items are collected into a list (its code only runs when it's read). |
 | returns text with invalid UTF-8 (a file name from `os.listdir()`) or raises with it | Stored with `\udcff`-style escapes. |
 | raises with a huge message | The error is cut to `MAX_ERROR_BYTES` (4 KB, start and end kept) before it's stored or logged. |
-| returns `NaN`, a set, bytes, an object | Stored as `null` / its text, with a warning in the log. |
+| returns `NaN`, a set, bytes, an object | Stored as `null` / its text, with a warning in the log. An object whose `__str__` raises is stored as `<unreadable Name>`; the job still succeeds. |
+| is an `async def` that catches `asyncio.CancelledError` and carries on | After a timeout or cancel it gets `CANCEL_GRACE` (5 s) to stop; then it's left running in the background with a warning, its slot is freed, and its result is ignored. At shutdown the worker exits without waiting for it. |
+| kills its own process (a segfault in a C extension, the out-of-memory killer, `os._exit()`) | The worker dies with it, and the job is handed to another worker. After `MAX_RECOVERIES` (3) such deaths it's dead-lettered with the reason, so one bad job can't take every worker down in turn. A `faulthandler` stack is printed for a segfault. `type="cpu"` isolates it: only the job fails. |
+| holds Python's GIL for a long time (a catastrophic regex, sorting or `pickle` of a huge object, some C extensions) | The whole worker freezes, heartbeat included; the watchdog says so afterwards. Past `WORKER_HEARTBEAT_TTL` the job is handed to another worker, which counts toward `MAX_RECOVERIES`. Run such code as `type="cpu"`. |
+| raises `Unrecoverable` | Dead-lettered at once, without using its retries. |
 
 And whatever else goes wrong while saving a job's outcome (other than Redis being away), the job becomes a dead letter that says why, instead of staying in *Processing* and running again on every restart. *(Before 0.6, a task calling `sys.exit()` stopped the worker, and then every worker the job was handed to next.)*
 
 ## When Redis goes away for a moment
 
-A job that finishes while Redis is unreachable keeps its result in memory, and the worker retries saving it until Redis is back. The log says so once:
+A job that finishes while Redis is unreachable, or while Redis refuses writes for a while (read-only during a failover, `NOREPLICAS`, `MISCONF` after a failed save, `BUSY` while another client's script runs, `LOADING` after a restart), keeps its result in memory, and the worker retries saving it until Redis takes it. It isn't run a second time. The log says so once:
 
 ```
 [Redis] Couldn't save a result for task 3f2a… (ConnectionError: …). Retrying until Redis is back; nothing is lost.
 ```
 
-Saving the outcome and removing the job from the worker's processing list happen in one Redis step, so a job can't end up marked finished while still listed as running, or listed as running forever.
+Saving the outcome and removing the job from the worker's processing list happen in one Redis step, so a job can't end up marked finished while still listed as running, or listed as running forever. If one of PyTaskQ's keys holds the wrong type (another app using the same names), that step is refused before anything changes: the job is kept, the log names the key, and saving goes through once the key is fixed.
+
+When the main loop can't take jobs it says why, in words (`Redis is read-only right now…`, `Redis has no free connections (maxclients reached)…`), once every 30 seconds. A single dropped connection is retried at once.
 
 ## When Redis is full
 
@@ -117,11 +125,11 @@ A wrong Redis password stops the worker at startup with exit code 1, since retry
 
 ## Stopping a worker
 
-Ctrl+C, `docker stop` or SIGTERM:
+Ctrl+C, `docker stop`, SIGTERM, or SIGHUP (the terminal or SSH session running it closed):
 
-1. The worker stops taking new jobs.
-2. Running jobs get up to `WORKER_SHUTDOWN_GRACE` seconds (default 30) to finish.
-3. Jobs still running after that are stopped (CPU processes are killed, async tasks cancelled) and **put back at the front of their queue**, so another worker runs them. An IO thread can't be stopped, so the worker exits without waiting for it.
+1. The worker stops taking new jobs and hands the leader lock to another worker, so scheduling and cron carry on within about 2 seconds.
+2. Running jobs get up to `WORKER_SHUTDOWN_GRACE` seconds (default 30) to finish. **Press Ctrl+C again** (or send a second signal) to skip the wait.
+3. Jobs still running after that are stopped (CPU processes are killed, async tasks cancelled) and **put back at the front of their queue**, so another worker runs them. An IO thread, or an async task that ignores being cancelled, can't be stopped, so the worker exits without waiting for it. A job that had finished but whose result couldn't be saved (Redis unreachable) is reported as such.
 4. The worker leaves the fleet, and its leftover processes are stopped.
 
 A job stopped this way runs again from the start, so keep tasks safe to repeat (see the checklist below).
@@ -132,13 +140,19 @@ Docker's own limit is 10 seconds by default, after which it kills the worker out
 
 Each worker sends a heartbeat every `WORKER_HEARTBEAT_TTL / 3` seconds (10 by default). One worker, the leader, checks every 10 seconds for workers whose heartbeat is older than `WORKER_HEARTBEAT_TTL` (30 s) and puts their jobs back at the front of their queues. A job is therefore picked up again within about 40 seconds of its worker crashing. The crashed worker's CPU processes notice within a second that it's gone and exit, so they don't keep running (and holding memory) on their own.
 
+Each time a running job comes back this way counts as a recovery. After `MAX_RECOVERIES` (3) the job goes to dead letters instead (*The worker running this job stopped 3 time(s) while running it…*), so a job that crashes whatever runs it can't stop the whole fleet. A clean stop, or a job a worker took but never started, doesn't count. Replay it from the dashboard once the cause is fixed.
+
+If the leader itself crashes, another worker takes over within about 12 seconds (the lock lasts 10 s).
+
 **Faster recovery with a worker name.** Give each worker a stable name and a restarted worker puts its own unfinished jobs back the moment it starts:
 
 ```bash
 WORKER_NAME=images-1 pytaskq worker --app tasks:queue
 ```
 
-In Docker, `WORKER_NAME={hostname}` uses the container's name, which survives restarts. The compose files in this repo do this. Two live workers can't share a name: the second one waits for the first one's heartbeat to stop, and refuses to start if it doesn't. A restart is recognised by a boot id the worker leaves in its temp folder (`/tmp/pytaskq-worker-<name>.boot`), not by hostname and process id: two containers with the same `hostname:` (or `network_mode: host`) both run as process 1, and before 0.6 the second one took over the first one's running job.
+In Docker, `WORKER_NAME={hostname}` uses the container's name, which survives restarts. The compose files in this repo do this. Two live workers can't share a name: the second one waits for the first one's heartbeat to stop, and refuses to start if it doesn't. A restart is recognised by a boot id the worker leaves in its temp folder (`/tmp/pytaskq-worker-<name>.boot`), not by hostname and process id: two containers with the same `hostname:` (or `network_mode: host`) both run as process 1.
+
+A worker that was frozen past its heartbeat (a VM pause, a laptop asleep) while a new worker took its name stops at its next heartbeat (exit code 1, *Another worker took the name…*), leaving the jobs under that name to the new one.
 
 Heartbeat times come from Redis's clock, not each machine's, so a server whose clock is off doesn't make its workers look dead.
 
@@ -152,11 +166,15 @@ Cancelling a running job (dashboard, `POST /task/{id}/cancel`, `app.cancel()`) p
 | `async def` | The coroutine is cancelled. |
 | `type="io"` | The thread keeps running (Python can't stop it); `pytaskq.cancelled()` returns `True` from now on, and its result is ignored. |
 
-The job is recorded as `Cancelled`, isn't retried, and its record says who cancelled it. A job that a worker had taken but not yet started is cancelled without running. [TASKS.md](TASKS.md#cancelling-a-job) shows `cancelled()`.
+The job is recorded as `Cancelled` (also when its code ran to the end after the request), isn't retried, and its record says who cancelled it. A job that a worker had taken but not yet started is cancelled without running. [TASKS.md](TASKS.md#cancelling-a-job) shows `cancelled()`.
 
 ## Jobs that wait for their turn
 
-A task with `max_concurrency` or `rate_limit` ([TASKS.md](TASKS.md#limiting-how-many-run-and-how-fast)) can be taken by a worker before it may start. The worker doesn't hold on to it: it puts the job back in the schedule until its turn (for `max_concurrency`, in line: a finishing job starts the one that waited longest), with the reason shown in the dashboard, and takes other work meanwhile. Waiting never uses up a retry. Jobs on a paused queue simply aren't taken. A job that was cancelled while it waited never starts: the cancel request is checked right before every start.
+A task with `max_concurrency` or `rate_limit` ([TASKS.md](TASKS.md#limiting-how-many-run-and-how-fast)) can be taken by a worker before it may start. The worker doesn't hold on to it: it puts the job back in the schedule until its turn (for `max_concurrency`, in line by when it was queued: a finishing job starts the one that waited longest, and a job put back after its worker died keeps its place), with the reason shown in the dashboard, and takes other work meanwhile. A `rate_limit` job that then waits for a free thread or process takes its turn again when it gets one. Waiting never uses up a retry. Jobs on a paused queue simply aren't taken. A job that was cancelled while it waited never starts: the cancel request is checked right before every start.
+
+The retry of an **IO job that timed out** waits the same way until the timed-out attempt's thread returns (at most 4 × the timeout, and at least a minute), so two copies of the job never run at the same time.
+
+A job for a **task this worker doesn't have** goes back to wait for one that does. While no running worker has it (a deploy where the web app went first), it waits up to `UNKNOWN_TASK_WAIT` (10 minutes) and then fails. Deploy workers before the code that queues a new task.
 
 ## Progress
 
@@ -187,7 +205,9 @@ A job's record (status, arguments, result) never expires while the job is waitin
 
 - **Safe to run twice.** A job can run again after a crash, a timeout or a shutdown. Use an idempotency key in the systems you call, or check whether the work is already done. [GUARANTEES.md](GUARANTEES.md) lists exactly when.
 - **IO tasks set timeouts on their own network calls.**
-- **Async tasks never call blocking code.** Use `await`, or make the task a plain function with `type="io"`.
+- **Async tasks never call blocking code**, and let `asyncio.CancelledError` propagate. Use `await`, or make the task a plain function with `type="io"`.
+- **Native code that may crash or hold the GIL runs as `type="cpu"`.**
+- **Tasks don't wait for other jobs.** Use a workflow.
 - **Large inputs and outputs go in storage**, not in the job.
 - **CPU tasks that need a lot of memory get a machine with room**, or their own queue and worker (`@queue.task(queue="heavy")`, `--queues heavy`).
 - **Long tasks report progress** with `progress()`, and long IO tasks check `cancelled()`.
@@ -203,3 +223,7 @@ A job's record (status, arguments, result) never expires while the job is waitin
 | `WORKER_NAME` | random | Stable name (`{hostname}` allowed). Same as `pytaskq worker --name` |
 | `TASK_TIMEOUT` | 300 | Default `timeout` for tasks that don't set one (`0` = none) |
 | `MAX_ERROR_BYTES` | 4096 | A failed job's error text is cut to this |
+| `MAX_RECOVERIES` | 3 | A running job whose worker died this many times is dead-lettered (`0` = no limit) |
+| `CANCEL_GRACE` | 5 | Seconds an async task gets to stop after a timeout or cancel |
+| `LOOP_BLOCK_GIVE_UP` | 0 | Stop (exit code 1) when the event loop stays blocked this long; `0` = only warn |
+| `UNKNOWN_TASK_WAIT` | 600 | Seconds a job waits for a worker that has its task |

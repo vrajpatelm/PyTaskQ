@@ -205,7 +205,7 @@ async def test_status_wait_and_cancel_helpers(patched):
     assert info["status"] == "Queued" and info["args"] == []
     assert "payload" not in info, "internal payload must not leak to callers"
 
-    assert await q.cancel(tid) is True
+    assert await q.cancel(tid) == "cancelled"
     assert await r.llen("queue:default") == 0
     assert (await queueing.queue_overview(r))["waiting"] == 0
     done = await q.wait(tid, timeout=1)

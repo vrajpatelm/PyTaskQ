@@ -22,6 +22,7 @@ How a job is kept safe:
 """
 
 import asyncio
+import faulthandler
 import json
 import logging
 import os
@@ -58,7 +59,7 @@ APP_NAME = ""
 QUEUES: list[str] = []          # the queues this worker serves (set at startup)
 QUEUES_OVERRIDE = ""            # `pytaskq worker --queues a,b` (else WORKER_QUEUES, else its tasks' queues)
 NAME_OVERRIDE = ""              # `pytaskq worker --name x` (else WORKER_NAME, else a random id)
-HAND_BACK_FOR = 600             # seconds a job keeps being handed back for a worker that has its task
+HAND_BACK_FOR = float(settings.UNKNOWN_TASK_WAIT)   # seconds a job waits for a worker that has its task
 WORKERS_KEY = rkey("pytaskq:workers")  # SET of every worker id that may own a processing_queue
 EXIT_CODE = 0                   # non-zero when the worker stopped because it couldn't work any more
 THREADS_LEFT_RUNNING = 0        # IO threads still busy at exit (the CLI exits without waiting for them)
@@ -91,10 +92,26 @@ HEARTBEAT_TTL = max(3, int(settings.WORKER_HEARTBEAT_TTL))
 SHUTDOWN_GRACE = float(settings.WORKER_SHUTDOWN_GRACE)
 LOOP_BLOCKED_WARN = 5           # seconds the event loop may be blocked before the watchdog warns
 
+def _env_count(name: str, default: str) -> int:
+    """A count from the environment; a clear error (not a traceback later) for a value that can't work."""
+    raw = os.getenv(name, default).strip() or default
+    try:
+        value = int(raw)
+    except ValueError:
+        raise SystemExit(f"{name} must be a whole number, got {raw!r}.") from None
+    if value < 0:
+        raise SystemExit(f"{name} can't be negative (got {value}); 0 means \"choose for me\".")
+    return value
+
+
 _TOTAL_CORES = os.cpu_count() or 1
-_RESERVED_CORES = int(os.getenv("WORKER_RESERVED_CORES", "1"))
-CPU_WORKERS = int(os.getenv("WORKER_CPU_WORKERS", "0")) or max(1, _TOTAL_CORES - _RESERVED_CORES)
-IO_WORKERS = int(os.getenv("WORKER_IO_WORKERS", "0")) or max(4, _TOTAL_CORES * 4)
+_RESERVED_CORES = _env_count("WORKER_RESERVED_CORES", "1")
+CPU_WORKERS = _env_count("WORKER_CPU_WORKERS", "0") or max(1, _TOTAL_CORES - _RESERVED_CORES)
+IO_WORKERS = _env_count("WORKER_IO_WORKERS", "0") or max(4, _TOTAL_CORES * 4)
+MAX_RECOVERIES = int(settings.MAX_RECOVERIES)
+CANCEL_GRACE = float(settings.CANCEL_GRACE)
+LOOP_BLOCK_GIVE_UP = float(settings.LOOP_BLOCK_GIVE_UP)
+EXIT_WHEN_STUCK = False         # the CLI sets this: exit without waiting for task code that won't stop
 CONCURRENCY = CPU_WORKERS + IO_WORKERS
 
 REDIS_DOWN = (redis_errors.ConnectionError, redis_errors.TimeoutError, ConnectionError, OSError)
@@ -159,23 +176,35 @@ def priority_schedule(setting: Optional[str] = None) -> list[str]:
 _SCHEDULE: list[str] = []
 
 
+def _rotation(queues: list[str], turn: int) -> tuple[str, list[str]]:
+    """
+    The priority this pop prefers, and the queues in the order to try. Queues rotate separately
+    for each priority (counting the pops that preferred it), so every queue gets the first pick
+    of every priority in turn, whatever the number of queues.
+    """
+    global _SCHEDULE
+    if not _SCHEDULE:
+        _SCHEDULE = priority_schedule()
+    size = len(_SCHEDULE)
+    pos = turn % size
+    first = _SCHEDULE[pos]
+    times = (turn // size) * _SCHEDULE.count(first) + _SCHEDULE[:pos].count(first)
+    start = (times + queueing.PRIORITIES.index(first)) % len(queues)   # offset per priority: queues alternate
+    return first, queues[start:] + queues[:start]
+
+
 def pop_keys(queues: list[str], turn: int = 0) -> list[str]:
     """
     The lists to pop from, in order.
 
     The preferred priority comes from the PRIORITY_WEIGHTS cycle; after it, the
     others in the usual order (high, default, low). Within one priority the
-    starting queue rotates with `turn`, so a busy queue can't starve the others.
+    starting queue rotates, so a busy queue can't starve the others.
     """
-    global _SCHEDULE
     if not queues:
         return []
-    if not _SCHEDULE:
-        _SCHEDULE = priority_schedule()
-    first = _SCHEDULE[turn % len(_SCHEDULE)]
+    first, rotated = _rotation(queues, turn)
     order = [first] + [p for p in queueing.PRIORITIES if p != first]
-    start = turn % len(queues)
-    rotated = queues[start:] + queues[:start]
     return [queueing.queue_key(p, q) for p in order for q in rotated]
 
 
@@ -184,10 +213,22 @@ def pop_call(queues: list[str], turn: int = 0) -> list:
     keys = pop_keys(queues, turn)
     if not keys:
         return [1, _processing_key()]
-    start = turn % len(queues)
-    rotated = queues[start:] + queues[:start]
+    _, rotated = _rotation(queues, turn)
     names = rotated * (len(keys) // len(rotated))      # pop_keys lists each priority over `rotated`
     return [len(keys) + 2, _processing_key(), *keys, queueing.PAUSED_KEY, *names]
+
+
+POP_BATCH = 8                   # at most this many jobs taken in one round trip (when that many slots are free)
+
+
+def pop_many_call(queues: list[str], turn: int, count: int) -> list:
+    """Arguments for PRIORITY_POP_MANY_SCRIPT: numkeys, keys…, count, names…."""
+    keys = pop_keys(queues, turn)
+    if not keys:
+        return [1, _processing_key(), count]
+    _, rotated = _rotation(queues, turn)
+    names = rotated * (len(keys) // len(rotated))
+    return [len(keys) + 2, _processing_key(), *keys, queueing.PAUSED_KEY, count, *names]
 
 
 def cron_zone(name: Optional[str]):
@@ -225,7 +266,7 @@ from pytaskq.worker_scripts import (  # noqa: F401  (re-exported: worker.X_SCRIP
     FENCE_SCRIPT, TIMEOUT_FENCE_SCRIPT, PRIORITY_POP_SCRIPT, LEADER_SCRIPT, COMPLETE_SCRIPT, FAIL_SCRIPT,
     PUT_BACK_SCRIPT, HAND_BACK_SCRIPT, CANCELLED_RUN_SCRIPT, PROGRESS_SCRIPT, LEASE_SCRIPT,
     WAIT_FOR_LEASE_SCRIPT, RELEASE_SCRIPT, RATE_SCRIPT, PROMOTE_SCRIPT, INVALID_SCRIPT, STARTED_SCRIPT,
-    HEARTBEAT_SCRIPT, FORGET_WORKER_SCRIPT,
+    HEARTBEAT_SCRIPT, FORGET_WORKER_SCRIPT, LEADER_RELEASE_SCRIPT, PRIORITY_POP_MANY_SCRIPT,
 )
 
 
@@ -257,13 +298,17 @@ async def _with_retries(op, what: str, task_id: str = ""):
             if attempt:
                 logger.info(f"[Redis] Back again: {what}" + (f" for task {task_id}" if task_id else "") + " done.")
             return result
-        except (*REDIS_DOWN, redis_errors.OutOfMemoryError) as e:
-            if _hard_stop.is_set():
+        except (*REDIS_DOWN, redis_errors.OutOfMemoryError, redis_errors.ResponseError) as e:
+            temporary = isinstance(e, (*REDIS_DOWN, redis_errors.OutOfMemoryError)) or redis_health.is_temporary(e)
+            wrong_type = redis_health.is_wrong_type(e)
+            if _hard_stop.is_set() or not (temporary or wrong_type):
                 raise
-            if attempt == 0:
-                why = "Redis is out of memory" if redis_health.is_oom(e) else f"{type(e).__name__}: {e}"
-                logger.warning(f"[Redis] Couldn't {what}" + (f" for task {task_id}" if task_id else "")
-                               + f" ({why}). Retrying until Redis is back; nothing is lost.")
+            if isinstance(e, redis_errors.ReadOnlyError) and attempt == 0:
+                _reopen_connections()          # a failover behind a DNS name: the next try reaches the new primary
+            if attempt == 0 or (wrong_type and attempt % 60 == 0):
+                log = logger.error if wrong_type else logger.warning
+                log(f"[Redis] Couldn't {what}" + (f" for task {task_id}" if task_id else "")
+                    + f" ({redis_health.explain(e)}). Retrying until Redis is back; nothing is lost.")
             attempt += 1
             await asyncio.sleep(delay)
             delay = min(delay * 2, 5)
@@ -273,12 +318,30 @@ async def _with_retries(op, what: str, task_id: str = ""):
 # Leader election and the leader's background loops
 # ─────────────────────────────────────────────────────────────────────────────
 
+LEADER_TTL = 10                 # seconds; the leader renews it every second while it leads
+_leader_error_at = float("-inf")
+
+
 async def is_leader() -> bool:
+    global _leader_error_at
+    if shutdown_event.is_set():
+        return False                   # stopping: the lock was handed over; don't take it back
     try:
-        return bool(await redis_client.r.eval(LEADER_SCRIPT, 1, rkey("pytaskq:leader_lock"), WORKER_ID, 20))
+        return bool(await redis_client.r.eval(LEADER_SCRIPT, 1, rkey("pytaskq:leader_lock"), WORKER_ID, LEADER_TTL))
     except Exception as e:
-        logger.warning(f"[Leader Election] Redis error: {e}")
+        if time.monotonic() - _leader_error_at > 30:      # several loops ask at once: say it once
+            _leader_error_at = time.monotonic()
+            logger.warning(f"[Leader Election] Couldn't reach Redis ({redis_health.explain(e)}). "
+                           f"Scheduling, cron and recovery wait until it answers.")
         return False
+
+
+async def release_leader() -> None:
+    """On a clean stop: hand the lock over at once instead of leaving the fleet without a leader for LEADER_TTL."""
+    try:
+        await redis_client.r.eval(LEADER_RELEASE_SCRIPT, 1, rkey("pytaskq:leader_lock"), WORKER_ID)
+    except Exception:
+        pass
 
 
 async def cron_scheduler():
@@ -295,7 +358,9 @@ async def cron_scheduler():
 CRON_LOCK_TTL = 3 * 3600
 CRON_STATE_KEY = rkey("pytaskq:cron")          # HASH task → the latest tick handled (Unix time)
 CRON_MISSED_KEY = rkey("pytaskq:cron:missed")       # HASH task → missed ticks; "task:at" → when last noticed
-CRON_SKIPPED_KEY = rkey("pytaskq:cron:skipped")      # HASH task → ticks skipped because their queue was paused
+CRON_SKIPPED_KEY = rkey("pytaskq:cron:skipped")      # HASH task → ticks skipped (queue paused, or overlap=False)
+CRON_LAST_KEY = rkey("pytaskq:cron:last")            # HASH task → id of the job its latest tick queued
+_overlap_warned: dict[str, float] = {}
 MISSED_COUNT_LIMIT = 10_000
 
 
@@ -370,11 +435,27 @@ async def run_due_cron_jobs(now: Optional[float] = None) -> int:
                     logger.info(f"[Cron] Skipped {task_name} for {prev_tick.isoformat()}: queue '{queue}' is paused.")
                 await r.hset(CRON_STATE_KEY, task_name, repr(tick_at))
                 continue
+            previous = await r.hget(CRON_LAST_KEY, task_name)
+            still = (await r.hget(queueing.task_key(previous), "status")) if previous else None
+            busy = still in (queueing.QUEUED, queueing.PROCESSING, "Scheduled", "RetryScheduled")
+            if busy and task_info.get("overlap") is False:
+                if await r.set(lock, "skipped", nx=True, ex=CRON_LOCK_TTL):
+                    await r.hincrby(CRON_SKIPPED_KEY, task_name, 1)
+                    logger.info(f"[Cron] Skipped {task_name} for {prev_tick.isoformat()}: its previous run "
+                                f"({previous}) is still {str(still).lower()} (overlap=False).")
+                await r.hset(CRON_STATE_KEY, task_name, repr(tick_at))
+                continue
+            if busy and time.monotonic() - _overlap_warned.get(task_name, -3600.0) >= 3600:
+                _overlap_warned[task_name] = time.monotonic()
+                logger.warning(f"[Cron] {task_name}: queuing the {prev_tick.isoformat()} run while the previous one "
+                               f"({previous}) is still {str(still).lower()}, so runs overlap. Set overlap=False on the "
+                               f"task to skip a tick instead.")
             payload = queueing.new_payload(task_name, priority=task_info.get("priority") or "default", queue=queue)
             # The lock only has to outlive the tick and a clock going back an hour.
             if await queueing.enqueue(redis_client.r, payload, lock=lock, lock_ttl=CRON_LOCK_TTL,
                                       max_bytes=0, note=note or None) is not None:
                 queued += 1
+                await r.hset(CRON_LAST_KEY, task_name, payload["task_id"])
                 logger.info(f"[Cron] Queued {task_name} for {prev_tick.isoformat()}" + (" (late)" if note else ""))
             await r.hset(CRON_STATE_KEY, task_name, repr(tick_at))
         except Exception as e:
@@ -392,14 +473,14 @@ async def retry_scheduler():
     while True:
         if time.monotonic() >= leader_until:
             if not await is_leader():
-                await asyncio.sleep(5)
+                await asyncio.sleep(2)              # take over soon after a leader stops
                 continue
-            leader_until = time.monotonic() + 1.0   # the lock lasts 20 s
+            leader_until = time.monotonic() + 1.0   # renewed every second; the lock lasts LEADER_TTL
         try:
             moved = await _promote_due_tasks()
             wait = await _next_promotion_in(redis_client.r, moved)
         except Exception as e:
-            logger.error(f"[Retry Scheduler] Redis error: {e}")
+            logger.error(f"[Retry Scheduler] Couldn't move due jobs: {redis_health.explain(e)}")
             wait = PROMOTE_IDLE
         await asyncio.sleep(wait)
 
@@ -417,24 +498,36 @@ async def _next_promotion_in(r, moved: int) -> float:
 
 
 PROMOTE_BATCH = 500
-PROMOTE_MAX_BATCHES = 20       # at most 10,000 jobs per second, so the leader's other loops keep running
+PROMOTE_BUDGET = 0.25          # seconds per pass, so the leader's other loops keep running
+_promote_from = 0              # where the last pass stopped (past jobs for full queues), or 0
+_held_back_logged = float("-inf")
 
 
 async def _promote_due_tasks(now: Optional[float] = None) -> int:
     """
-    Move due delayed jobs and retries onto their queues, in batches of 500 and only
-    while a queue is below QUEUE_CAPACITY, so a big backlog drains as workers keep up.
+    Move due delayed jobs and retries onto their queues, in batches of 500 and only while a
+    queue is below QUEUE_CAPACITY, so a big backlog drains as workers keep up.
+
+    Jobs for a full queue stay due; the pass reads past them, so one backed-up queue never holds
+    up another queue's scheduled jobs and retries. A pass that runs out of time carries on from
+    there next time (and starts from the front again after reaching the end).
     """
+    global _promote_from, _held_back_logged
     r = redis_client.r
     now = clock.now() if now is None else now
-    moved_total, offset, batches = 0, 0, 0
-    while batches < PROMOTE_MAX_BATCHES:
-        batches += 1
+    began = time.monotonic()
+    moved_total, offset = 0, _promote_from
+    full_queues: set[str] = set()
+    held: dict[str, int] = {}
+    reached_end = False
+    while True:
         raws = await r.zrangebyscore(rkey("delayed_tasks"), "-inf", now, start=offset, num=PROMOTE_BATCH)
         if not raws:
+            reached_end = True
             break
         queues: list[str] = []
         items: list[tuple[str, int, str, str]] = []
+        skipped = 0
         for raw in raws:
             try:
                 data = json.loads(raw)
@@ -444,6 +537,10 @@ async def _promote_due_tasks(now: Optional[float] = None) -> int:
                 await _dead_letter_invalid(r, raw, "not a JSON object with a task_id", source=rkey("delayed_tasks"))
                 continue
             queue = queueing.payload_queue(data)
+            if queue in full_queues:          # known full this pass: stays due, no need to ask Redis again
+                skipped += 1
+                held[queue] = held.get(queue, 0) + 1
+                continue
             if queue not in queues:
                 queues.append(queue)
             items.append((raw, queues.index(queue) + 1,
@@ -455,13 +552,29 @@ async def _promote_due_tasks(now: Optional[float] = None) -> int:
             for raw, qi, target, hash_key in items:
                 keys += [target, hash_key]
                 argv += [raw, qi]
-            moved, full = await r.eval(PROMOTE_SCRIPT, len(keys), *keys, *argv)
-            moved_total += int(moved)
-            offset += int(full)           # jobs for full queues stay due; look past them for other queues
-        if len(raws) < PROMOTE_BATCH or not await is_leader():
+            reply = await r.eval(PROMOTE_SCRIPT, len(keys), *keys, *argv)
+            moved, full = int(reply[0]), int(reply[1])
+            newly_full = {queues[int(i) - 1] for i in (reply[2] if len(reply) > 2 else [])}
+            full_queues |= newly_full
+            for q in newly_full:                # roughly: the ones in this batch that didn't fit
+                held[q] = held.get(q, 0) + sum(1 for _, qi, _, _ in items if queues[qi - 1] == q)
+            moved_total += moved
+            skipped += full
+        offset += skipped                   # jobs for full queues stay due; look past them
+        if len(raws) < PROMOTE_BATCH:
+            reached_end = True
             break
+        if time.monotonic() - began > PROMOTE_BUDGET or not await is_leader():
+            break
+    _promote_from = 0 if reached_end else offset
     if moved_total:
         logger.info(f"[Scheduler] Moved {moved_total} due job(s) onto their queues")
+    if held and time.monotonic() - _held_back_logged > 60:
+        _held_back_logged = time.monotonic()
+        parts = ", ".join(f"'{q}' ({n:,})" for q, n in sorted(held.items(), key=lambda x: -x[1])[:5])
+        logger.warning(f"[Scheduler] Due jobs are waiting because their queue is full (QUEUE_CAPACITY="
+                       f"{settings.QUEUE_CAPACITY}): {parts}. They move as workers make room; other queues' "
+                       f"jobs aren't held up.")
     return moved_total
 
 
@@ -517,7 +630,8 @@ async def _sweep_dead_workers() -> int:
     for worker_id in gone:
         if worker_id == WORKER_ID:
             continue          # never take jobs from ourselves (our heartbeat thread may just be late)
-        recovered = await _recover_worker(worker_id, f"Recovered from worker {worker_id}, which stopped")
+        recovered = await _recover_worker(worker_id, f"Recovered from worker {worker_id}, which stopped "
+                                                     f"(or froze) while running it", count=True)
         await r.eval(FORGET_WORKER_SCRIPT, 3, rkey("active_workers"), rkey(f"worker:{worker_id}"), WORKERS_KEY,
                      worker_id, repr(clock.now()))
         total += recovered
@@ -526,8 +640,48 @@ async def _sweep_dead_workers() -> int:
     return total
 
 
-async def _put_back(r, worker_id: str, raw: str, note: str, side: str = "front") -> int:
-    """Move one job from a processing list back onto its queue (see PUT_BACK_SCRIPT). Returns its result."""
+def _still_running_key(task_id: str) -> str:
+    return rkey(f"running:{task_id}")
+
+
+async def _mark_still_running(r, task_id: str, running, timeout: float) -> None:
+    """Note that a timed-out attempt's thread still runs (cleared when it returns, or after a cap)."""
+    key, cap = _still_running_key(task_id), int(max(60.0, 4 * float(timeout or 0)))
+    try:
+        await r.set(key, WORKER_ID, ex=cap)
+    except Exception:
+        return                                  # best effort: the retry then simply doesn't wait
+    loop = asyncio.get_running_loop()
+
+    def returned(_):
+        try:
+            loop.call_soon_threadsafe(lambda: asyncio.ensure_future(_forget(key)))
+        except RuntimeError:
+            pass                                # the worker stopped; the key runs out by itself
+    running.add_done_callback(returned)
+
+
+async def _forget(key: str) -> None:
+    try:
+        await redis_client.r.delete(key)
+    except Exception:
+        pass
+
+
+def _recovery_error(n: int) -> str:
+    return (f"The worker running this job stopped {n} time(s) while running it (a crash, an out-of-memory kill, a "
+            f"segfault in a C extension, or code holding Python's GIL longer than WORKER_HEARTBEAT_TTL). It was "
+            f"moved to dead letters instead of being handed to another worker (MAX_RECOVERIES={n}). If the task "
+            f"runs native code, give it type=\"cpu\": a crash there only fails the job.")
+
+
+async def _put_back(r, worker_id: str, raw: str, note: str, side: str = "front", count: bool = False) -> int:
+    """
+    Move one job from a processing list back onto its queue (see PUT_BACK_SCRIPT). Returns its result.
+
+    count: the job's worker died while running it, so this is a recovery; at MAX_RECOVERIES the job is
+    dead-lettered instead (3), so one job that crashes every worker can't take the fleet down.
+    """
     try:
         data = json.loads(raw)
     except ValueError:
@@ -541,15 +695,29 @@ async def _put_back(r, worker_id: str, raw: str, note: str, side: str = "front")
         token = max(_as_int(current), _as_int(data.get("fence_token"))) + 1
         new_raw = json.dumps({**data, "fence_token": token})
         queue = queueing.payload_queue(data)
-        result = await r.eval(
-            PUT_BACK_SCRIPT, 6,
-            _processing_key(worker_id), rkey(f"fence:{task_id}"),
-            queueing.queue_key(_priority(data), queue), queueing.task_key(task_id), queueing.QUEUES_KEY,
-            queueing.wake_key(queue),
-            raw, new_raw, current or "", str(token), note, side, queue,
-        )
+        keys = [_processing_key(worker_id), rkey(f"fence:{task_id}"),
+                queueing.queue_key(_priority(data), queue), queueing.task_key(task_id), queueing.QUEUES_KEY,
+                queueing.wake_key(queue)]
+        argv = [raw, new_raw, current or "", str(token), note, side, queue]
+        if count and MAX_RECOVERIES > 0:
+            error = _recovery_error(MAX_RECOVERIES)
+            entry = json.dumps({**data, "error": error, "failed_at": clock.now()})
+            keys += [rkey("dlq"), queueing.FINISHED_KEY, rkey("stats:failed")]
+            argv += [MAX_RECOVERIES, entry, repr(clock.now()), int(settings.RESULT_TTL), max(0, settings.DLQ_LIMIT),
+                     *queueing.keep_args(), error]
+        result = int(await r.eval(PUT_BACK_SCRIPT, len(keys), *keys, *argv))
+        if result == 3:
+            logger.error(f"[Recovery] Task {task_id} ({data.get('task_name')}): its worker stopped "
+                         f"{MAX_RECOVERIES} times while running it. Moved to dead letters instead of handing it to "
+                         f"another worker. Replay it from the dashboard once the cause is fixed.")
+            if isinstance(data.get("workflow"), dict):
+                try:
+                    from pytaskq import workflows
+                    await workflows.step_finished(r, data["workflow"], "failed", error=_recovery_error(MAX_RECOVERIES))
+                except Exception as e:
+                    logger.error(f"[Workflow] Couldn't record step {task_id} ({queueing.error_text(e)}).")
         if result != -2:
-            return int(result)
+            return result
     return -2
 
 
@@ -611,8 +779,11 @@ async def _reconciler():
             logger.debug(f"[Reconcile] Couldn't check this worker's own list ({e})")
 
 
-async def _recover_worker(worker_id: str, note: str) -> int:
-    """Put every job in `worker_id`'s processing list back at the front of its queue."""
+async def _recover_worker(worker_id: str, note: str, count: bool = False) -> int:
+    """
+    Put every job in `worker_id`'s processing list back at the front of its queue.
+    count: the worker died (not a clean stop): jobs it was running count a recovery (MAX_RECOVERIES).
+    """
     r = redis_client.r
     key = _processing_key(worker_id)
     recovered = 0
@@ -620,7 +791,7 @@ async def _recover_worker(worker_id: str, note: str) -> int:
         items = await r.lrange(key, 0, 0)       # newest first, so the oldest ends up first in line
         if not items:
             break
-        result = await _put_back(r, worker_id, items[0], note, side="front")
+        result = await _put_back(r, worker_id, items[0], note, side="front", count=count)
         if result == -2:
             logger.warning(f"[Sweeper] Job in {key} keeps changing; will try again next round.")
             break
@@ -673,9 +844,9 @@ class _Heartbeat(threading.Thread):
         super().__init__(name="pytaskq-heartbeat", daemon=True)
         self.stop_event = threading.Event()
         self._client = None
-        self._last_warning = 0.0
-        self._last_error = 0.0
-        self._last_stall_warning = 0.0
+        self._last_warning = float("-inf")
+        self._last_error = float("-inf")
+        self._last_stall_warning = float("-inf")
         self.gave_up = False
         self.blocked_for = 0.0
 
@@ -692,9 +863,27 @@ class _Heartbeat(threading.Thread):
         info = {**_worker_info(), **_health(), "last_seen": now, "started_at": _started_at or now,
                 "loop_blocked_seconds": round(self.blocked_for) if self.blocked_for >= LOOP_BLOCKED_WARN else 0}
         fields = [str(x) for kv in info.items() for x in kv]
+        mine = c.eval(HEARTBEAT_SCRIPT, 4, rkey("active_workers"), rkey(f"worker:{WORKER_ID}"), WORKERS_KEY,
+                      queueing.QUEUES_KEY, WORKER_ID, repr(now + HEARTBEAT_TTL), HEARTBEAT_TTL * 4, len(QUEUES),
+                      *QUEUES, *fields)
+        if not int(mine):
+            self.name_taken()
+            return
         _renew_leases(c, now)
-        c.eval(HEARTBEAT_SCRIPT, 4, rkey("active_workers"), rkey(f"worker:{WORKER_ID}"), WORKERS_KEY, queueing.QUEUES_KEY,
-               WORKER_ID, repr(now + HEARTBEAT_TTL), HEARTBEAT_TTL * 4, len(QUEUES), *QUEUES, *fields)
+
+    def name_taken(self) -> None:
+        """Another process took this worker's name while this one was frozen: leave without touching its jobs."""
+        global EXIT_CODE, _name_lost
+        if _name_lost:
+            return
+        _name_lost = True
+        EXIT_CODE = 1
+        self.stop_event.set()
+        logger.critical(f"[Heartbeat] Another worker took the name {WORKER_ID!r} while this one was paused or frozen "
+                        f"(longer than WORKER_HEARTBEAT_TTL={HEARTBEAT_TTL}s). Stopping now (exit code 1) without "
+                        f"touching the jobs listed under that name: they belong to the other worker.")
+        if _event_loop is not None:
+            _event_loop.call_soon_threadsafe(_stop_now)
 
     def _redis_watchdog(self) -> bool:
         """
@@ -707,8 +896,8 @@ class _Heartbeat(threading.Thread):
         if stalled < REDIS_STALL * 3:
             if time.monotonic() - self._last_stall_warning > 30:
                 self._last_stall_warning = time.monotonic()
-                logger.error(f"[Watchdog] No answer from Redis on this worker's connections for {stalled:.0f}s, "
-                             f"although Redis is reachable. Reopening them.")
+                logger.error(f"[Watchdog] No answer from Redis on the event loop's connections for {stalled:.0f}s, "
+                             f"while the heartbeat's own connection works. Reopening them.")
                 _event_loop.call_soon_threadsafe(_reopen_connections)
             return True
         if not self.gave_up:
@@ -718,23 +907,59 @@ class _Heartbeat(threading.Thread):
             _event_loop.call_soon_threadsafe(_stop_stalled_worker)
         return False
 
+    def frozen(self, gap: float) -> None:
+        """This thread itself didn't run for `gap` seconds: the whole process was frozen."""
+        running = ", ".join(f"{name} ({tid})" for tid, name in list(_running.items())[:5]) or "none"
+        logger.warning(
+            f"[Watchdog] This whole worker was frozen for {gap:.0f}s: even its heartbeat thread couldn't run. "
+            f"Either a task held Python's GIL (C code such as a catastrophic regex, sorting or deduplicating "
+            f"millions of items, json or pickle of a huge object, a C extension), or the process was paused "
+            f"(SIGSTOP, a VM pause, heavy swapping). Jobs running then: {running}. "
+            + (f"That was longer than WORKER_HEARTBEAT_TTL ({HEARTBEAT_TTL}s), so other workers may have taken "
+               f"over its jobs (each such takeover counts toward MAX_RECOVERIES). " if gap >= HEARTBEAT_TTL else "")
+            + "Run code like that as type=\"cpu\": it gets its own process."
+        )
+        self._last_warning = time.monotonic()
+
     def _watchdog(self) -> None:
+        global EXIT_CODE
         blocked = time.monotonic() - _loop_tick
+        if LOOP_BLOCK_GIVE_UP > 0 and blocked >= LOOP_BLOCK_GIVE_UP and not self.gave_up:
+            self.gave_up = True
+            names = ", ".join(f"{name} ({tid})" for tid, name in list(_running_async.items())[:5]) or "unknown"
+            logger.critical(f"[Watchdog] The event loop has been blocked for {blocked:.0f}s (LOOP_BLOCK_GIVE_UP="
+                            f"{LOOP_BLOCK_GIVE_UP:g}). Async tasks running: {names}. Stopping this worker now "
+                            f"(exit code 1): its jobs go to other workers, and a job that keeps doing this is "
+                            f"dead-lettered after MAX_RECOVERIES.")
+            logging.shutdown()
+            os._exit(1)
         if blocked < LOOP_BLOCKED_WARN or time.monotonic() - self._last_warning < 30:
             return
         self._last_warning = time.monotonic()
-        names = ", ".join(f"{name} ({tid})" for tid, name in list(_running_async.items())[:5]) or "none"
-        logger.warning(
-            f"[Watchdog] The event loop has been blocked for {blocked:.0f}s. Async tasks running now: {names}. "
-            f"An `async def` task is probably calling blocking code (time.sleep, requests, a sync database "
-            f"driver). Use `await asyncio.sleep()` / an async client, or make it a type='io' task. Timeouts "
-            f"can't fire while the loop is blocked; the heartbeat keeps going, so its jobs aren't run twice."
-        )
+        names = ", ".join(f"{name} ({tid})" for tid, name in list(_running_async.items())[:5])
+        if names:
+            logger.warning(
+                f"[Watchdog] The event loop has been blocked for {blocked:.0f}s. Async tasks running now: {names}. "
+                f"An `async def` task is probably calling blocking code (time.sleep, requests, a sync database "
+                f"driver). Use `await asyncio.sleep()` / an async client, or make it a type='io' task. Timeouts "
+                f"can't fire while the loop is blocked; the heartbeat keeps going, so its jobs aren't run twice."
+            )
+        else:
+            logger.warning(
+                f"[Watchdog] The event loop has been blocked for {blocked:.0f}s, with no async task running. "
+                f"Something in this process holds it up (a task holding Python's GIL in C code, or a blocking "
+                f"call in PyTaskQ's own code). The heartbeat thread is still running."
+            )
 
     def run(self) -> None:
         interval = max(1.0, HEARTBEAT_TTL / 3)
         next_beat = time.monotonic() + interval
+        last_wake = time.monotonic()
         while not self.stop_event.wait(1.0):
+            gap = time.monotonic() - last_wake
+            last_wake = time.monotonic()
+            if gap > max(LOOP_BLOCKED_WARN, 5):
+                self.frozen(gap)
             self._watchdog()
             if time.monotonic() < next_beat or not self._redis_watchdog():
                 continue
@@ -745,7 +970,8 @@ class _Heartbeat(threading.Thread):
                 next_beat = time.monotonic() + min(5.0, interval)
                 if time.monotonic() - self._last_error > 30:
                     self._last_error = time.monotonic()
-                    logger.warning(f"[Heartbeat] Redis unreachable: {e}. Retrying every {min(5.0, interval):g}s")
+                    logger.warning(f"[Heartbeat] Couldn't send a heartbeat ({redis_health.explain(e)}). "
+                                   f"Retrying every {min(5.0, interval):g}s")
         try:
             if self._client is not None:
                 self._client.close()
@@ -783,6 +1009,19 @@ def _stop_stalled_worker() -> None:
     shutdown_event.set()
 
 
+_name_lost = False              # another live process took this worker's name: leave its jobs alone
+_skip_grace = asyncio.Event()   # set by a second stop signal: don't wait for running jobs
+_finishing: set = set()         # ids of jobs whose code is done and whose outcome is being saved
+
+
+def _stop_now() -> None:
+    """(In the event loop) stop at once: no grace period, running jobs are abandoned (they aren't ours)."""
+    _hard_stop.set()
+    shutdown_event.set()
+    for t in list(active_tasks):
+        t.cancel()
+
+
 async def _loop_ticker():
     """Proves to the watchdog that the event loop is running."""
     global _loop_tick
@@ -794,14 +1033,30 @@ async def _loop_ticker():
 async def _publish_registry():
     from pytaskq.app import describe_tasks
     if TASKS:
-        await queueing.publish_registry(redis_client.r, describe_tasks(TASKS))
+        await queueing.publish_registry(redis_client.r, describe_tasks(TASKS), worker=True)
 
 
 async def _periodic():
-    """Advertise this worker's tasks every minute and flush its counters every 10 s."""
+    """
+    Advertise this worker's tasks every minute and flush its counters every 10 s. The leader
+    also checks once a minute that Redis hasn't started evicting keys and that no data sits under
+    another REDIS_KEY_PREFIX.
+    """
     from pytaskq.core import pressure
     last_registry = time.monotonic()
+    last_health = float("-inf")
     while True:
+        if time.monotonic() - last_health >= 60:
+            last_health = time.monotonic()
+            try:
+                if await is_leader():
+                    await redis_health.check_eviction(redis_client.r, "Worker")
+                    other = await redis_health.other_prefix_data(redis_client.r)
+                    if other:
+                        logger.warning(f"[Redis] {other}. The web app and every worker must use the same "
+                                       f"REDIS_KEY_PREFIX, or they don't see each other's jobs (docs/REDIS.md).")
+            except Exception:
+                pass
         try:
             await redis_health.check_data(redis_client.r, "Worker")
         except Exception:
@@ -865,14 +1120,14 @@ def _validation_summary(e: Exception) -> str:
     return str(e).splitlines()[0][:500] if str(e) else type(e).__name__
 
 
-async def _record_failure(r, tasks, task_json, task_id, error, max_retries) -> str:
+async def _record_failure(r, tasks, task_json, task_id, error, max_retries, permanent: bool = False) -> str:
     """
     Schedule a retry or dead-letter a failed attempt, unless it's stale (its fence token was
     bumped because the job went to another worker). One Lua script does the fence check,
     the retry or dead letter, and the removal from the processing list.
     """
     finished_at = clock.now()
-    dead = tasks.retry_count >= max_retries
+    dead = permanent or tasks.retry_count >= max_retries
     if dead:
         dlq_entry = json.loads(task_json)
         dlq_entry["fence_token"] = tasks.fence_token
@@ -880,7 +1135,8 @@ async def _record_failure(r, tasks, task_json, task_id, error, max_retries) -> s
         dlq_entry["failed_at"] = finished_at
         entry, due, ttl = json.dumps(dlq_entry), "0", str(int(settings.RESULT_TTL))
         fields = {"task_id": task_id, "status": queueing.DEAD_LETTER, "finished_at": finished_at,
-                  "error": f"Failed after {tasks.retry_count} retries. Last error: {error}"}
+                  "error": (f"Failed, not retried (retrying can't help): {error}" if permanent
+                            else f"Failed after {tasks.retry_count} retries. Last error: {error}")}
         target = rkey("dlq")
     else:
         tasks.retry_count += 1
@@ -921,7 +1177,10 @@ async def _record_failure(r, tasks, task_json, task_id, error, max_retries) -> s
             await _workflow_step(r, tasks, "failed", error=error)
         if outcome == 2:
             logger.warning(f"[DLQ] More than DLQ_LIMIT ({settings.DLQ_LIMIT}) dead letters; the oldest was dropped.")
-        logger.error(f"[DLQ] Task {task_id} failed after {tasks.retry_count} retries. Moving to DLQ. ({error})")
+        if permanent:
+            logger.error(f"[DLQ] Task {task_id} failed and isn't retried (retrying can't help). Moving to DLQ. ({error})")
+        else:
+            logger.error(f"[DLQ] Task {task_id} failed after {tasks.retry_count} retries. Moving to DLQ. ({error})")
         return "DeadLetter"
     logger.error(f"Task {task_id} failed: {error.rstrip('.')}. Retry {tasks.retry_count}/{max_retries} scheduled.")
     return "RetryScheduled"
@@ -949,24 +1208,31 @@ def _storable_result(result) -> tuple[str, str]:
 
 async def _hand_back(r, tasks, task_json, task_id) -> bool:
     """
-    This worker lacks the job's task but another live worker advertises it: put the job back
-    for that worker without counting a retry. After HAND_BACK_FOR seconds the job fails
-    normally, so it can't loop forever.
+    This worker lacks the job's task: put the job back (through the delayed set, without
+    counting a retry) for a worker that has it. When a live worker advertises the task it comes
+    back within seconds; when none does (a rolling deploy where the web app went first), it
+    checks again less and less often. After UNKNOWN_TASK_WAIT seconds it fails normally, so it
+    can't wait forever.
     """
     now = clock.now()
     since = tasks.handed_back_since or now
-    if now - since > HAND_BACK_FOR:
+    limit = float(HAND_BACK_FOR)
+    if now - since >= limit:
         return False
-    spec, _ = await queueing.registry_lookup(r, tasks.task_name)
-    if spec is None:
-        return False
+    somewhere = await queueing.worker_has_task(r, tasks.task_name)
     payload = json.loads(task_json)
     payload["bounces"] = tasks.bounces + 1
     payload["handed_back_since"] = since
     raw = json.dumps(payload)
-    due = now + random.uniform(0.5, 2.0)   # via the delayed set, so it doesn't bounce straight back here
-    note = (f"Waiting for a worker that has task '{tasks.task_name}' (worker {WORKER_ID} doesn't). "
-            f"Give each app its own queue to avoid this.")
+    if somewhere:
+        due = now + random.uniform(0.5, 2.0)    # via the delayed set, so it doesn't bounce straight back here
+        note = (f"Waiting for a worker that has task '{tasks.task_name}' (worker {WORKER_ID} serves queue "
+                f"'{tasks.queue}' but doesn't have it: a deploy in progress, or two apps sharing a queue).")
+    else:
+        due = now + min(30.0, 2.0 * (tasks.bounces + 1))
+        left = max(0, round(since + limit - now))
+        note = (f"No running worker has task '{tasks.task_name}' yet (a deploy in progress? deploy workers first "
+                f"when adding a task). It waits up to {left}s more (UNKNOWN_TASK_WAIT), then fails.")
     await _with_retries(lambda _: r.eval(HAND_BACK_SCRIPT, 3, _processing_key(), rkey("delayed_tasks"),
                                          queueing.task_key(task_id), task_json, raw, repr(due), note),
                         "hand a job back", task_id)
@@ -976,6 +1242,47 @@ async def _hand_back(r, tasks, task_json, task_id) -> bool:
 
 
 RATE_HOLD = 0.5                    # a rate_limit turn closer than this is waited for in place (seconds)
+_rate_go: dict[str, tuple] = {}    # task id → (when its turn said "go", gap, task name, rate_limit) until it starts
+
+
+class _HandedOver(Exception):
+    """The job went to another worker while this one waited to start it (its heartbeat ran out): don't run it."""
+
+
+class _NotYet(Exception):
+    """A rate_limit job that waited for a thread or process and lost its turn meanwhile."""
+
+    def __init__(self, slot: float, rate: str):
+        super().__init__(slot)
+        self.slot, self.rate = slot, rate
+
+
+async def _confirm_turn(r, task_id: str) -> None:
+    """
+    Right before a rate_limit job really starts (it has its thread or process): if it waited for
+    one longer than the gap, other jobs may have started meanwhile, so it takes its turn again.
+    Starts are what the limit spaces out, not the decisions.
+    """
+    go = _rate_go.pop(task_id, None)
+    if go is None:
+        return
+    since, gap, name, rate = go
+    if time.monotonic() - since < 0.002:
+        return                             # it got its thread at once: its "go" is its start
+    slot = None
+    for _ in range(RATE_HOLD_TRIES + 1):
+        now = clock.now()
+        answer = await _with_retries(
+            lambda _: r.eval(RATE_SCRIPT, 2, limit_key("turns", name), limit_key("started", name), "",
+                             repr(gap), task_id, "" if slot is None else repr(slot), "confirm"),
+            "check a rate limit", task_id)
+        if answer == "go":
+            return
+        slot = float(answer)
+        if slot - now >= RATE_HOLD:
+            raise _NotYet(slot, rate)
+        await asyncio.sleep(max(0.0, slot - now))
+    raise _NotYet(slot or clock.now(), rate)
 RATE_HOLD_TRIES = 2                # …at most this many times per pop, then the job waits in the delayed set
 LEASE_TTL = HEARTBEAT_TTL * 2      # seconds a max_concurrency lease lasts; the heartbeat renews it while the job runs
 WAIT_MAX = 30.0                    # longest fallback wait of a max_concurrency job (normally a finishing job wakes it)
@@ -1044,6 +1351,8 @@ async def _within_limits(r, tasks, task_json, entry: dict) -> bool:
             # The turn is moments away: wait here rather than via the delayed set.
             await asyncio.sleep(max(0.0, wait))
             now = clock.now()
+        if answer == "go":
+            _rate_go[task_id] = (time.monotonic(), float(gap), name, entry.get("rate_limit"))
         if answer != "go":
             when = datetime.fromtimestamp(slot, timezone.utc).strftime("%H:%M:%S UTC")
             await _wait_in_delayed_set(r, tasks, task_json, slot, {"rate_slot": slot},
@@ -1065,7 +1374,14 @@ async def _within_limits(r, tasks, task_json, entry: dict) -> bool:
             waits = tasks.waits + 1
             payload = json.loads(task_json)
             payload.update(waits=waits, rate_slot=slot)
-            payload.setdefault("waiting_since", now)
+            if "waiting_since" not in payload:
+                # Its place in line is when it was queued, so a job put back after its worker died
+                # (it held a place and never waited) keeps its turn ahead of later ones.
+                created = await r.hget(queueing.task_key(task_id), "created_at")
+                try:
+                    payload["waiting_since"] = min(now, float(created)) if created else now
+                except ValueError:
+                    payload["waiting_since"] = now
             raw = json.dumps(payload)
             # Fallback only: normally a finishing job wakes the one that waited longest.
             due = now + min(WAIT_MAX, 5 * 1.5 ** min(waits, 10)) * random.uniform(0.9, 1.1)
@@ -1152,9 +1468,13 @@ async def _stoppable(execute, ctx: context.Job):
         raise
     finally:
         ctx.stop = None
+    if ctx.cancel.is_set():
+        # Asked to stop: whatever it returned or raised afterwards is ignored (an async task that
+        # swallowed the cancel, or an IO thread that ran to its end), so `cancel()` keeps its word.
+        if not job.cancelled():
+            job.exception()                 # retrieved, so asyncio doesn't log it
+        raise JobCancelled()
     if job.cancelled():
-        if ctx.cancel.is_set():
-            raise JobCancelled()
         raise RuntimeError("The task was cancelled from inside (asyncio.CancelledError).")
     return job.result()
 
@@ -1241,13 +1561,25 @@ async def _flush_progress() -> int:
         return 0
 
 
+async def _flush_progress_of(task_id: str) -> None:
+    pending = _progress.take_one(task_id)
+    if pending is None:
+        return
+    percent, message, at = pending
+    try:
+        await redis_client.r.eval(PROGRESS_SCRIPT, 1, queueing.task_key(task_id), WORKER_ID,
+                                  "" if percent is None else repr(percent), message or "", repr(at))
+    except Exception as e:
+        logger.debug(f"[Progress] Couldn't write the last progress of {task_id} ({e})")
+
+
 async def _progress_writer():
     while True:
         await asyncio.sleep(PROGRESS_EVERY)
         await _flush_progress()
 
 
-_last_stuck_warning = 0.0
+_last_stuck_warning = float("-inf")
 
 
 async def _leave_for_other_workers(r, tasks, task_json) -> None:
@@ -1293,6 +1625,31 @@ def _wrap_executor(executor):
     return pool
 
 
+_abandoned_async: dict = {}    # task id → (name, asyncio task) of async tasks that ignored a cancel
+
+
+async def _stop_async(job: "asyncio.Future", task_id: str, task_name: str, why: str) -> bool:
+    """
+    Cancel an async task and wait up to CANCEL_GRACE for it to stop. A task that catches
+    asyncio.CancelledError and carries on is left running in the background (its slot is freed and
+    its result ignored), so it can't hold the worker. Returns True if it stopped.
+    """
+    job.cancel()
+    try:
+        done, _ = await asyncio.wait({job}, timeout=CANCEL_GRACE)
+    except asyncio.CancelledError:
+        done = set()
+    if done:
+        return True
+    _abandoned_async[task_id] = (task_name, job)
+    job.add_done_callback(lambda _: _abandoned_async.pop(task_id, None))
+    logger.warning(f"Task {task_id} ({task_name}) ignored being cancelled ({why}) for {CANCEL_GRACE:g}s: it catches "
+                   f"asyncio.CancelledError (a bare `except:`, `except BaseException`, or a retry helper) and keeps "
+                   f"going. Its slot is freed and whatever it does from now on is ignored. Re-raise CancelledError "
+                   f"in async tasks.")
+    return False
+
+
 async def _run_async(func, args, kwargs, timeout, task_id, task_name, started, ctx=None):
     await started()
     _running_async[task_id] = task_name
@@ -1303,22 +1660,25 @@ async def _run_async(func, args, kwargs, timeout, task_id, task_name, started, c
     finally:
         context._current.reset(token)
     try:
-        if timeout and timeout > 0:
-            done, _ = await asyncio.wait({job}, timeout=timeout)
-            if not done:
-                job.cancel()
-                await asyncio.gather(job, return_exceptions=True)
+        try:
+            done, _ = await asyncio.wait({job}, timeout=timeout if timeout and timeout > 0 else None)
+        except asyncio.CancelledError:
+            # Cancelled (by a user, or the worker stopping): make sure the task really stops.
+            await _stop_async(job, task_id, task_name, "a cancel or the worker stopping")
+            raise
+        if not done:
+            if await _stop_async(job, task_id, task_name, f"its {timeout:g}s timeout"):
                 raise TaskTimeoutError(f"Task exceeded {timeout:g}s limit. Execution was cancelled.")
-            took = time.monotonic() - began
-            if took > timeout + 1:
-                # It finished, so it counts; blocking code stopped the timeout from firing.
-                logger.warning(f"Task {task_id} ({task_name}) finished after {took:.0f}s, over its {timeout:g}s "
-                               f"timeout: it blocked the event loop, so the timeout couldn't fire.")
-            return job.result()
-        return await job
-    except asyncio.CancelledError:
-        job.cancel()
-        raise
+            raise TaskTimeoutError(f"Task exceeded {timeout:g}s limit. It ignored the cancel (it catches "
+                                   f"asyncio.CancelledError), so it may still be running; its result is ignored.")
+        took = time.monotonic() - began
+        if timeout and timeout > 0 and took > timeout + 1:
+            # It finished, so it counts; blocking code stopped the timeout from firing.
+            logger.warning(f"Task {task_id} ({task_name}) finished after {took:.0f}s, over its {timeout:g}s "
+                           f"timeout: it blocked the event loop, so the timeout couldn't fire.")
+        if job.cancelled():
+            raise asyncio.CancelledError()
+        return job.result()
     finally:
         _running_async.pop(task_id, None)
 
@@ -1341,7 +1701,11 @@ async def handle_task(task_json, sem, loop, process_pool, thread_pool):
             await _run(r, tasks, task_json, process_pool, thread_pool)
         finally:
             _running.pop(tasks.task_id, None)
+            _finishing.discard(tasks.task_id)
+            _rate_go.pop(tasks.task_id, None)
             ctx = _jobs.pop(tasks.task_id, None)
+            if ctx is not None:
+                ctx.finished = True                # progress() from code it left running is ignored
             _progress.drop(tasks.task_id)
             await _release_lease(r, tasks.task_id, ctx)
     except asyncio.CancelledError:
@@ -1392,14 +1756,21 @@ async def _run(r, tasks, task_json, process_pool, thread_pool) -> None:
         async def started():
             # Called when the job gets a process/thread, so waiting for a slot doesn't count toward its timeout.
             nonlocal started_at
+            await _confirm_turn(r, task_id)
             started_at = clock.now()
 
             async def write(_):
-                return int(await r.eval(STARTED_SCRIPT, 2, queueing.task_key(task_id), cancel_key(task_id),
+                return int(await r.eval(STARTED_SCRIPT, 3, queueing.task_key(task_id), cancel_key(task_id),
+                                        rkey(f"fence:{task_id}"),
                                         "task_id", task_id, "task_name", tasks.task_name,
                                         "status", queueing.PROCESSING, "started_at", repr(started_at),
-                                        "worker_id", WORKER_ID, "retry_count", tasks.retry_count))
-            if not await _with_retries(write, "mark a job as started", task_id):
+                                        "worker_id", WORKER_ID, "retry_count", tasks.retry_count,
+                                        str(tasks.fence_token)))
+            outcome = await _with_retries(write, "mark a job as started", task_id)
+            if outcome == -1:
+                started_at = None
+                raise _HandedOver()
+            if not outcome:
                 started_at = None
                 raise JobCancelled()
             logger.info(f"Executing task {task_id} ({tasks.task_name})")
@@ -1414,6 +1785,13 @@ async def _run(r, tasks, task_json, process_pool, thread_pool) -> None:
                     f"Task '{tasks.task_name}' is not registered on worker {WORKER_ID}. "
                     f"Registered tasks: {known}"
                 )
+            if tasks.after_timeout and await r.exists(_still_running_key(task_id)):
+                await _wait_in_delayed_set(
+                    r, tasks, task_json, clock.now() + 2.0, {},
+                    "Waiting for its previous attempt to finish: that attempt timed out, but Python can't stop a "
+                    "running thread, so its code is still running. This retry starts once it returns.")
+                span.set_attribute("task.status", "Waiting")
+                return
             if not await _within_limits(r, tasks, task_json, entry):
                 span.set_attribute("task.status", "Waiting")
                 return
@@ -1447,6 +1825,21 @@ async def _run(r, tasks, task_json, process_pool, thread_pool) -> None:
             span.set_attribute("task.status", "Cancelled")
             return
 
+        except _HandedOver:
+            # Its copy here is stale: drop it from this worker's list (another worker holds the live one).
+            await _with_retries(lambda _: r.lrem(_processing_key(), 1, task_json), "drop a stale job", task_id)
+            logger.warning(f"Task {task_id} ({tasks.task_name}) went to another worker while this one waited to start "
+                           f"it (this worker's heartbeat ran out, e.g. Redis was unreachable). Not running it here.")
+            span.set_attribute("task.status", "HandedOver")
+            return
+
+        except _NotYet as e:
+            when = datetime.fromtimestamp(e.slot, timezone.utc).strftime("%H:%M:%S UTC")
+            await _wait_in_delayed_set(r, tasks, task_json, e.slot, {"rate_slot": e.slot},
+                                       f"Waiting for its turn under rate_limit={e.rate}: starts at {when}.")
+            span.set_attribute("task.status", "Waiting")
+            return
+
         except PoolBroken as e:
             # Not the job's fault: leave it for a healthy worker. This worker is stopping.
             logger.error(f"Task {task_id} couldn't run: {e}. Putting it back on its queue.")
@@ -1462,15 +1855,24 @@ async def _run(r, tasks, task_json, process_pool, thread_pool) -> None:
                     "record a timeout", task_id))
                 if new_token >= 0:
                     tasks.fence_token = new_token
+                running = getattr(_jobs.get(task_id), "left_running", None)
+                if running is not None and not running.done():
+                    # The thread can't be stopped: its retry waits until it returns, so two copies of the
+                    # job never run at the same time.
+                    await _mark_still_running(r, task_id, running, timeout)
+                    tasks.after_timeout = True
             error = queueing.error_text(e)
             span.set_status(trace.StatusCode.ERROR, error[:1000])
             span.record_exception(e)
-            outcome = await _record_failure(r, tasks, task_json, task_id, error, max_retries)
+            permanent = isinstance(e, context.Unrecoverable) or bool(getattr(e, "permanent", False))
+            outcome = await _record_failure(r, tasks, task_json, task_id, error, max_retries, permanent)
             span.set_attribute("task.status", outcome)
             if outcome == "Discarded":
                 span.set_attribute("task.discard_reason", "fence_token_stale")
             return
 
+        _finishing.add(task_id)
+        await _flush_progress_of(task_id)       # the last progress() before it returned isn't lost
         encoded, dropped = _storable_result(result)
         if tasks.workflow:
             # Kept with the job, so the leader's sweep can pass it on if this worker stops before
@@ -1643,7 +2045,8 @@ async def _startup(named: str) -> bool:
             await r.ping()
             if named:
                 await _claim_name(r)
-                recovered = await _recover_worker(WORKER_ID, f"Put back after worker {WORKER_ID} restarted")
+                recovered = await _recover_worker(WORKER_ID, f"Put back after worker {WORKER_ID} restarted",
+                                                  count=True)
                 if recovered:
                     logger.info(f"Put back {recovered} job(s) this worker was running before it restarted.")
             break
@@ -1675,11 +2078,56 @@ async def _startup(named: str) -> bool:
         logger.error(f"[Startup] {redis_health.describe_oom(mem) if redis_health.is_oom(e) else e}. Starting "
                      f"anyway: taking and finishing waiting jobs frees memory. New jobs are refused meanwhile.")
     await _check_redis_setup(r)
+    if not await _check_key_types(r):
+        EXIT_CODE = 1
+        return False
     await _check_fleet(r)
     try:
         await _refresh_paused()
     except Exception:
         pass                                   # the pause watcher tries again in a moment
+    return True
+
+
+def _fixed_keys() -> dict:
+    """PyTaskQ's own keys with fixed names, and the type each must have."""
+    out = {rkey("active_workers"): "zset", WORKERS_KEY: "set", rkey("dlq"): "list", rkey("delayed_tasks"): "zset",
+           rkey("stats:completed"): "string", rkey("stats:failed"): "string", queueing.FINISHED_KEY: "zset",
+           queueing.QUEUES_KEY: "set", rkey("tasks:recent"): "list", queueing.PAUSED_KEY: "hash",
+           rkey("pytaskq:leader_lock"): "string"}
+    for q in QUEUES:
+        for key in queueing.queue_keys(q):
+            out[key] = "list"
+    return out
+
+
+async def _check_key_types(r) -> bool:
+    """
+    Say clearly which key holds the wrong type (another app sharing this Redis, a hand edit),
+    instead of failing later with a bare WRONGTYPE. False when this worker can't run at all.
+    """
+    expected = _fixed_keys()
+    try:
+        async with r.pipeline(transaction=False) as pipe:
+            for key in expected:
+                pipe.type(key)
+            found = await pipe.execute()
+    except Exception:
+        return True                            # can't tell (a restricted Redis user): carry on
+    wrong = {key: (kind, have) for (key, kind), have in zip(expected.items(), found)
+             if have not in ("none", kind)}
+    if not wrong:
+        return True
+    listing = "; ".join(f"{key} is a {have}, should be a {kind}" for key, (kind, have) in wrong.items())
+    essential = {rkey("active_workers"), WORKERS_KEY} & set(wrong)
+    advice = ("Another app (or a hand edit) is using PyTaskQ's key names. Rename or delete those keys, or give "
+              "PyTaskQ its own keys with REDIS_KEY_PREFIX (see docs/REDIS.md).")
+    if essential:
+        logger.critical(f"[Startup] Redis keys of the wrong type: {listing}. A worker can't run like this. "
+                        f"{advice} Stopping with exit code 1.")
+        return False
+    logger.error(f"[Startup] Redis keys of the wrong type: {listing}. Jobs that need them wait (none are lost) "
+                 f"until they're fixed. {advice}")
     return True
 
 
@@ -1695,10 +2143,15 @@ async def _check_fleet(r) -> None:
 
 
 async def _check_redis_setup(r) -> None:
-    """Warn loudly when Redis is set up to delete keys, or nearly full."""
+    """Warn loudly when Redis is set up to delete keys, or nearly full, or holds data under another prefix."""
     for problem in redis_health.problems(await redis_health.memory(r)):
         log = logger.error if problem["level"] == "critical" else logger.warning
         log(f"[Redis] {problem['title']}. {problem['detail']}")
+    await redis_health.check_eviction(r, "Worker")       # the baseline later checks compare with
+    other = await redis_health.other_prefix_data(r)
+    if other:
+        logger.warning(f"[Redis] {other}. The web app and every worker must use the same REDIS_KEY_PREFIX, or "
+                       f"they don't see each other's jobs (docs/REDIS.md).")
 
 
 def _cpu_modules() -> tuple:
@@ -1715,6 +2168,16 @@ async def consumer_task():
     global QUEUES, WORKER_ID, EXIT_CODE, THREADS_LEFT_RUNNING, _started_at, _loop_tick, _pause_changed, _paused
     global _suspects
     EXIT_CODE = THREADS_LEFT_RUNNING = 0
+    global _name_lost
+    _name_lost = False
+    global _skip_grace
+    _skip_grace = asyncio.Event()
+    _abandoned_async.clear()
+    _finishing.clear()
+    try:
+        faulthandler.enable()           # a segfault in task code leaves a Python stack in the log
+    except Exception:
+        pass
     _held.clear()
     _suspects = set()
     _pause_changed, _paused = asyncio.Event(), set()
@@ -1744,17 +2207,28 @@ async def consumer_task():
                        f"another worker must serve them, or their jobs will wait.")
 
     loop = asyncio.get_running_loop()
+    redis_client.claim(loop)           # the SDK inside tasks shares this loop's pool
     sem = asyncio.Semaphore(concurrency)
 
     def _signal_handler():
-        if shutdown_event.is_set():
+        if _hard_stop.is_set():
             return
-        logger.info(f"Shutdown signal received. Finishing running tasks (up to {SHUTDOWN_GRACE:g}s)...")
+        if shutdown_event.is_set():
+            n = len(active_tasks)
+            logger.warning(f"Second stop signal: stopping now. {n} running job(s) go back on their queues"
+                           + (" and run again on a worker." if n else "."))
+            _skip_grace.set()
+            return
+        logger.info(f"Shutdown signal received. Finishing running tasks (up to {SHUTDOWN_GRACE:g}s); "
+                    f"press Ctrl+C again to stop now...")
         shutdown_event.set()
 
+    stop_signals = [signal.SIGINT, signal.SIGTERM]
+    if hasattr(signal, "SIGHUP"):
+        stop_signals.append(signal.SIGHUP)       # the terminal or SSH session running the worker closed
     try:
-        loop.add_signal_handler(signal.SIGINT, _signal_handler)
-        loop.add_signal_handler(signal.SIGTERM, _signal_handler)
+        for sig in stop_signals:
+            loop.add_signal_handler(sig, _signal_handler)
     except NotImplementedError:  # Windows
         signal.signal(signal.SIGINT, lambda s, f: loop.call_soon_threadsafe(_signal_handler))
         signal.signal(signal.SIGTERM, lambda s, f: loop.call_soon_threadsafe(_signal_handler))
@@ -1809,10 +2283,14 @@ async def consumer_task():
     logger.info(f"Worker {WORKER_ID} started and ready to process tasks.")
 
     turn = 0
+    _last_quick_retry = _last_loop_error = float("-inf")
+    _last_loop_error_type: Optional[type] = None
 
     while not shutdown_event.is_set():
+        slots = 0
         try:
             await sem.acquire()
+            slots = 1
             if shutdown_event.is_set():     # stopping: don't start another job
                 sem.release()
                 break
@@ -1829,31 +2307,60 @@ async def consumer_task():
                 sem.release()
                 await _wait_for_work([])
                 continue
-            call = pop_call(serving, turn)
+            while slots < POP_BATCH and not sem.locked():
+                await sem.acquire()         # free slots: take them without waiting
+                slots += 1
+            reply = await redis_client.r.eval(PRIORITY_POP_MANY_SCRIPT, *pop_many_call(serving, turn, slots))
             turn += 1
-            task_json = await redis_client.r.eval(PRIORITY_POP_SCRIPT, *call)
-            if task_json:
-                _hold(task_json)            # before any other await: the reconciler must see it as ours
+            got = int(reply[0])
+            jobs, bad = reply[1:1 + got], reply[1 + got:]
+            for raw in jobs:
+                _hold(raw)                  # before any other await: the reconciler must see them as ours
             _mark_redis_ok()
-
-            if not task_json:
+            if bad and not jobs:
+                _report_bad_lists(bad)
+            for _ in range(slots - got):
                 sem.release()
+            slots = got
+            if not jobs:
                 await _wait_for_work(serving)
                 continue
         except Exception as e:
-            sem.release()
-            why = ("Redis is out of memory" if redis_health.is_oom(e)
-                   else "Redis refused the password or permissions" if redis_health.is_config_error(e)
-                   else f"Redis error: {e.__class__.__name__}")
-            logger.error(f"[Main loop] {why}. Backing off 5s...")
+            for _ in range(slots):
+                sem.release()
+            now_m = time.monotonic()
+            quick = isinstance(e, redis_errors.ConnectionError) and now_m - _last_quick_retry > 5
+            if quick:
+                # A single dropped connection (Redis restarted it, an idle timeout): reconnect at once.
+                _last_quick_retry = now_m
+                await asyncio.sleep(0.2)
+                continue
+            if now_m - _last_loop_error > 30 or type(e) is not _last_loop_error_type:
+                _last_loop_error, _last_loop_error_type = now_m, type(e)
+                logger.error(f"[Main loop] Can't take jobs: {redis_health.explain(e)}. Retrying every 5s...")
             await asyncio.sleep(5)
             continue
 
-        task = asyncio.create_task(handle_task(task_json, sem, loop, cpu_pool, io_pool))
-        active_tasks.add(task)
-        task.add_done_callback(active_tasks.discard)
+        for task_json in jobs:
+            task = asyncio.create_task(handle_task(task_json, sem, loop, cpu_pool, io_pool))
+            active_tasks.add(task)
+            task.add_done_callback(active_tasks.discard)
 
     await _shutdown(background, heart, cpu_pool, io_pool)
+
+
+_bad_lists_logged = float("-inf")
+
+
+def _report_bad_lists(keys: list) -> None:
+    """A queue list holds another type (another app's key, a hand edit): it's skipped; say so once a minute."""
+    global _bad_lists_logged
+    if time.monotonic() - _bad_lists_logged < 60:
+        return
+    _bad_lists_logged = time.monotonic()
+    logger.error(f"[Main loop] Skipping Redis key(s) that should be queue lists but hold another type: "
+                 f"{', '.join(map(str, keys))}. Jobs on the other queues still run. Rename or delete those keys "
+                 f"(another app or a hand edit wrote them), or give PyTaskQ its own keys with REDIS_KEY_PREFIX.")
 
 
 # Seconds an idle worker blocks before checking its queues anyway; catches jobs from versions that
@@ -1922,14 +2429,25 @@ async def _shutdown(background, heart, cpu_pool, io_pool):
     r = redis_client.r
     if cpu_pool is not None:
         cpu_pool.draining = True      # a process stopped from now on isn't replaced
+    await release_leader()            # another worker leads at once (scheduling, cron, recovery)
     if active_tasks:
         grace = SHUTDOWN_GRACE if SHUTDOWN_GRACE > 0 else None
         logger.info(f"Waiting for {len(active_tasks)} active tasks to complete...")
-        _, pending = await asyncio.wait(set(active_tasks), timeout=grace)
+        jobs = asyncio.ensure_future(asyncio.wait(set(active_tasks), timeout=grace))
+        skip = asyncio.ensure_future(_skip_grace.wait())      # a second Ctrl+C ends the grace period
+        await asyncio.wait({jobs, skip}, return_when=asyncio.FIRST_COMPLETED)
+        jobs.cancel()
+        skip.cancel()
+        pending = {t for t in active_tasks if not t.done()}
         if pending:
-            names = ", ".join(f"{n} ({t})" for t, n in list(_running.items())[:10]) or "jobs waiting to start"
-            logger.warning(f"{len(pending)} job(s) still running after {SHUTDOWN_GRACE:g}s: {names}. Stopping them; "
-                           f"they go back on their queues and run again on a worker.")
+            saving = [t for t, n in _running.items() if t in _finishing]
+            running = [f"{n} ({t})" for t, n in list(_running.items())[:10] if t not in _finishing]
+            if running:
+                logger.warning(f"{len(running)} job(s) still running: {', '.join(running)}. Stopping them; they go "
+                               f"back on their queues and run again on a worker.")
+            if saving:
+                logger.warning(f"{len(saving)} job(s) finished but their outcome couldn't be saved (Redis unreachable): "
+                               f"{', '.join(saving[:10])}. They go back on their queues and run again.")
             _hard_stop.set()
             for t in pending:
                 t.cancel()
@@ -1939,19 +2457,22 @@ async def _shutdown(background, heart, cpu_pool, io_pool):
         bg.cancel()
     await asyncio.gather(*background, return_exceptions=True)
 
-    try:
-        left = await asyncio.wait_for(
-            _recover_worker(WORKER_ID, f"Put back: worker {WORKER_ID} stopped before it finished"), 15)
-        if left:
-            logger.info(f"Put {left} unfinished job(s) back on their queues.")
-    except Exception as e:
-        logger.error(f"Couldn't put unfinished jobs back ({type(e).__name__}: {e}); another worker will recover "
-                     f"them once this worker's heartbeat runs out.")
+    if _name_lost:
+        logger.warning(f"Left the jobs listed under {WORKER_ID!r} to the worker that now has that name.")
+    else:
+        try:
+            left = await asyncio.wait_for(
+                _recover_worker(WORKER_ID, f"Put back: worker {WORKER_ID} stopped before it finished"), 15)
+            if left:
+                logger.info(f"Put {left} unfinished job(s) back on their queues.")
+        except Exception as e:
+            logger.error(f"Couldn't put unfinished jobs back ({redis_health.explain(e)}); another worker will "
+                         f"recover them once this worker's heartbeat runs out.")
 
     heart.stop()
     await asyncio.get_running_loop().run_in_executor(None, heart.join, 6)   # a beat in flight can't re-add us
     try:
-        if not await r.exists(_processing_key()):
+        if not _name_lost and not await r.exists(_processing_key()):
             # Only leave the fleet with nothing listed; otherwise the leader recovers what's left.
             await r.zrem(rkey("active_workers"), WORKER_ID)
             await r.srem(WORKERS_KEY, WORKER_ID)
@@ -1961,10 +2482,14 @@ async def _shutdown(background, heart, cpu_pool, io_pool):
 
     if cpu_pool is not None:
         await cpu_pool.close(grace=2)
-    THREADS_LEFT_RUNNING = len(io_pool.stuck) + len(_running)
+    threads = len(io_pool.stuck) + len([t for t in _running if t not in _running_async])
+    stubborn = len(_abandoned_async) + len(_running_async)
+    THREADS_LEFT_RUNNING = threads + stubborn
     io_pool.close()
-    if THREADS_LEFT_RUNNING:
-        logger.warning(f"{THREADS_LEFT_RUNNING} IO thread(s) are still running task code; exiting without "
+    if threads:
+        logger.warning(f"{threads} IO thread(s) are still running task code; exiting without waiting for them.")
+    if stubborn:
+        logger.warning(f"{stubborn} async task(s) ignored being cancelled and are still running; exiting without "
                        f"waiting for them.")
     _pools["cpu"] = _pools["io"] = None
     try:
@@ -1976,6 +2501,10 @@ async def _shutdown(background, heart, cpu_pool, io_pool):
     if hasattr(provider, "force_flush"):
         provider.force_flush()
     logger.info(f"Worker {WORKER_ID} stopped" + (" (exit code 1)." if EXIT_CODE else " cleanly."))
+    if EXIT_WHEN_STUCK and (stubborn or _name_lost):
+        # asyncio.run() would wait forever for a task that ignores cancellation: leave now.
+        logging.shutdown()
+        os._exit(EXIT_CODE)
 
 
 if __name__ == "__main__":

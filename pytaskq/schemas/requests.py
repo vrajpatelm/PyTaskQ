@@ -27,6 +27,7 @@ class Taskloader(BaseModel):
     timeout: Optional[float] = Field(None, ge=0, allow_inf_nan=False)  # per-task override (else registry / settings)
     trace_carrier: dict = Field(default_factory=dict)
     workflow: Optional[Dict[str, Any]] = None   # {"id", "stage", "index"} for a step of a workflow
+    after_timeout: bool = False   # a retry of an IO attempt whose thread may still run: waits until it returns
     on_success_url: Optional[str] = None  # If set, worker enqueues a webhook delivery task on success
 
     @field_validator("queue", mode="before")
