@@ -16,7 +16,7 @@ But a job **can run more than once**:
 | A worker can't reach Redis for longer than `WORKER_HEARTBEAT_TTL` (30 s), or is frozen that long (a VM pause, a task holding Python's GIL) | The others think it's dead and run its jobs elsewhere, while it may still be running them. |
 | Redis loses the last second of writes (a crash with `appendfsync everysec`) | A job's "finished" record can be lost, so it runs again. |
 
-What PyTaskQ does guarantee is that **only one attempt's outcome counts**. Each job carries a fence token; a stale attempt's result or failure is ignored, so a job never ends up both succeeded and dead-lettered, or retried twice.
+What PyTaskQ does guarantee is that **only one attempt's outcome counts**. Each job carries a fence token; a stale attempt's result or failure is ignored, so a job never ends up both succeeded and dead-lettered, or retried twice. A stale attempt that hasn't started yet (its worker lost Redis while waiting for a free slot, and the job went to another worker) doesn't start at all.
 
 A **lost reply** doesn't make duplicates either. If the connection drops after Redis has done something but before the answer arrives (a network blip, a failover), the client sends the command again; PyTaskQ recognises the repeat: a job is queued once (the caller gets "queued", not an error), a failure is one dead letter, a success counts once. A job a worker took but never received goes back on its queue within about a minute.
 
