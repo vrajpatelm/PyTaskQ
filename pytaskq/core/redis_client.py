@@ -13,7 +13,9 @@ High availability: with REDIS_SENTINELS set, the client asks Redis Sentinel
 which server is the primary and follows it through failovers (docs/REDIS.md).
 """
 
+import os
 import socket
+import weakref
 from typing import Any, Optional
 
 from redis import asyncio as redis
@@ -171,3 +173,39 @@ def pool_stats(client=None) -> dict:
 
 # Any: redis-py types async commands as `Awaitable[T] | T`, which makes every `await` a type error.
 r: Any = make_client()
+_default = r
+_home: Optional[tuple] = None            # (pid, loop) that owns `r`'s connections
+_others: "weakref.WeakKeyDictionary[Any, tuple]" = weakref.WeakKeyDictionary()
+
+
+def claim(loop=None) -> None:
+    """The worker and the API call this at startup: `r` belongs to their event loop."""
+    global _home
+    import asyncio
+    _home = (os.getpid(), loop or asyncio.get_running_loop())
+
+
+def for_this_loop() -> Any:
+    """
+    `r` in the event loop that owns it; a separate client (cached) in any other loop or
+    process, since a pool's connections can't move between loops. A replaced `r` (tests, an app
+    that set its own) is always used as is.
+    """
+    global _home
+    if r is not _default:
+        return r
+    import asyncio
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return r
+    me = (os.getpid(), loop)
+    if _home is None:
+        _home = me
+    if _home[0] == me[0] and _home[1] is loop:
+        return r
+    found = _others.get(loop)
+    if found is None or found[0] != me[0]:
+        found = (me[0], make_client())
+        _others[loop] = found
+    return found[1]

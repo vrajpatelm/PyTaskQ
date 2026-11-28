@@ -1090,14 +1090,14 @@ def _validation_summary(e: Exception) -> str:
     return str(e).splitlines()[0][:500] if str(e) else type(e).__name__
 
 
-async def _record_failure(r, tasks, task_json, task_id, error, max_retries) -> str:
+async def _record_failure(r, tasks, task_json, task_id, error, max_retries, permanent: bool = False) -> str:
     """
     Schedule a retry or dead-letter a failed attempt, unless it's stale (its fence token was
     bumped because the job went to another worker). One Lua script does the fence check,
     the retry or dead letter, and the removal from the processing list.
     """
     finished_at = clock.now()
-    dead = tasks.retry_count >= max_retries
+    dead = permanent or tasks.retry_count >= max_retries
     if dead:
         dlq_entry = json.loads(task_json)
         dlq_entry["fence_token"] = tasks.fence_token
@@ -1105,7 +1105,8 @@ async def _record_failure(r, tasks, task_json, task_id, error, max_retries) -> s
         dlq_entry["failed_at"] = finished_at
         entry, due, ttl = json.dumps(dlq_entry), "0", str(int(settings.RESULT_TTL))
         fields = {"task_id": task_id, "status": queueing.DEAD_LETTER, "finished_at": finished_at,
-                  "error": f"Failed after {tasks.retry_count} retries. Last error: {error}"}
+                  "error": (f"Failed, not retried (retrying can't help): {error}" if permanent
+                            else f"Failed after {tasks.retry_count} retries. Last error: {error}")}
         target = rkey("dlq")
     else:
         tasks.retry_count += 1
@@ -1484,6 +1485,18 @@ async def _flush_progress() -> int:
         return 0
 
 
+async def _flush_progress_of(task_id: str) -> None:
+    pending = _progress.take_one(task_id)
+    if pending is None:
+        return
+    percent, message, at = pending
+    try:
+        await redis_client.r.eval(PROGRESS_SCRIPT, 1, queueing.task_key(task_id), WORKER_ID,
+                                  "" if percent is None else repr(percent), message or "", repr(at))
+    except Exception as e:
+        logger.debug(f"[Progress] Couldn't write the last progress of {task_id} ({e})")
+
+
 async def _progress_writer():
     while True:
         await asyncio.sleep(PROGRESS_EVERY)
@@ -1614,6 +1627,8 @@ async def handle_task(task_json, sem, loop, process_pool, thread_pool):
             _running.pop(tasks.task_id, None)
             _finishing.discard(tasks.task_id)
             ctx = _jobs.pop(tasks.task_id, None)
+            if ctx is not None:
+                ctx.finished = True                # progress() from code it left running is ignored
             _progress.drop(tasks.task_id)
             await _release_lease(r, tasks.task_id, ctx)
     except asyncio.CancelledError:
@@ -1750,13 +1765,15 @@ async def _run(r, tasks, task_json, process_pool, thread_pool) -> None:
             error = queueing.error_text(e)
             span.set_status(trace.StatusCode.ERROR, error[:1000])
             span.record_exception(e)
-            outcome = await _record_failure(r, tasks, task_json, task_id, error, max_retries)
+            permanent = isinstance(e, context.Unrecoverable) or bool(getattr(e, "permanent", False))
+            outcome = await _record_failure(r, tasks, task_json, task_id, error, max_retries, permanent)
             span.set_attribute("task.status", outcome)
             if outcome == "Discarded":
                 span.set_attribute("task.discard_reason", "fence_token_stale")
             return
 
         _finishing.add(task_id)
+        await _flush_progress_of(task_id)       # the last progress() before it returned isn't lost
         encoded, dropped = _storable_result(result)
         if tasks.workflow:
             # Kept with the job, so the leader's sweep can pass it on if this worker stops before
@@ -2086,6 +2103,7 @@ async def consumer_task():
                        f"another worker must serve them, or their jobs will wait.")
 
     loop = asyncio.get_running_loop()
+    redis_client.claim(loop)           # the SDK inside tasks shares this loop's pool
     sem = asyncio.Semaphore(concurrency)
 
     def _signal_handler():

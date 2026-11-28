@@ -562,3 +562,221 @@ async def test_a_recovered_max_concurrency_job_keeps_its_place_in_line(env):
         await run_one(r, tasks)
     line = [e.split("\n")[2] for e in await r.zrange("limit:waiting:one", 0, -1)]
     assert line[0] == "m0", line
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# The SDK: event loops, connections, ids, arguments, URLs, results, progress, clocks
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _sdk_script(url: str, body: str) -> subprocess.CompletedProcess:
+    env = {**os.environ, "REDIS_URL": url, "PYTASKQ_AUTH": "off",
+           "PYTHONPATH": os.pathsep.join(filter(None, [os.getcwd(), os.environ.get("PYTHONPATH")]))}
+    return subprocess.run([sys.executable, "-c", body], env=env, capture_output=True, text=True, timeout=60)
+
+
+@needs_redis
+def test_await_delay_works_from_one_event_loop_after_another(redis_url):
+    url = redis_url.replace("/0", "/10")
+    out = _sdk_script(url, (
+        "import asyncio, redis\nfrom tests.v070_tasks import echo\n"
+        "redis.Redis.from_url('" + url + "').flushdb()\n"
+        "errors = 0\n"
+        "for i in range(6):\n"
+        "    try:\n"
+        "        asyncio.run(echo.delay(x=i))\n"
+        "    except Exception as e:\n"
+        "        errors += 1; print(type(e).__name__, e)\n"
+        "print('errors', errors, 'queued', redis.Redis.from_url('" + url + "').llen('queue:default'))\n"))
+    assert "errors 0 queued 6" in out.stdout, out.stdout + out.stderr
+
+
+@needs_redis
+def test_delay_sync_reuses_its_connections(redis_url):
+    url = redis_url.replace("/0", "/11")
+    out = _sdk_script(url, (
+        "import redis\nfrom tests.v070_tasks import echo\n"
+        "c = redis.Redis.from_url('" + url + "', decode_responses=True); c.flushdb(); c.config_resetstat()\n"
+        "ids = [echo.delay_sync(x=i)['task_id'] for i in range(200)]\n"
+        "print('jobs', c.llen('queue:default'), 'connections', c.info('stats')['total_connections_received'])\n"))
+    jobs, connections = out.stdout.split()[1], int(out.stdout.split()[3])
+    assert jobs == "200" and connections <= 5, out.stdout + out.stderr
+
+
+@pytest.mark.parametrize("bad", [123, "x" * 201, "a\nb", "\udcff-surrogate", ""])
+def test_task_ids_the_system_cant_handle_are_refused_when_queueing(bad):
+    with pytest.raises(ValueError, match="task_id"):
+        queueing.new_payload("echo", task_id=bad)
+
+
+@pytest.mark.parametrize("args,kwargs,where", [
+    ([{1: "a"}], {}, "argument 1 has a int key"),
+    ([{None: 1}], {}, "argument 1 has a NoneType key"),
+    ([], {"when": __import__("datetime").datetime(2026, 1, 1)}, "argument 'when' is a datetime"),
+    ([{"nested": [1, {2: "x"}]}], {}, "argument 1['nested'][1] has a int key"),
+    ([b"raw"], {}, "argument 1 is a bytes"),
+])
+def test_arguments_that_would_change_on_the_way_are_refused_and_named(args, kwargs, where):
+    with pytest.raises(TypeError, match=__import__("re").escape(where)):
+        queueing.new_payload("echo", args, kwargs)
+
+
+def test_a_string_for_args_is_refused_but_tuples_are_fine():
+    with pytest.raises(TypeError, match="args must be a list"):
+        queueing.new_payload("echo", "abc")
+    assert queueing.new_payload("echo", ((1, 2),))["args"] == [(1, 2)]
+
+
+@pytest.mark.parametrize("url", ["not a url", "ftp://x.example/a", "http://127.0.0.1/x", "http://10.0.0.5/hook",
+                                 "http://localhost/hook", "http://box.internal/hook"])
+def test_webhook_urls_that_can_never_work_are_refused_when_queueing(url):
+    with pytest.raises(ValueError, match="on_success_url"):
+        queueing.new_payload("echo", on_success_url=url)
+    assert queueing.new_payload("echo", on_success_url="https://hooks.example.com/x")["on_success_url"]
+
+
+async def test_schedule_leaves_a_tasks_own_delay_seconds_parameter_alone(env):
+    from pytaskq import PyTaskQ
+    r = env
+    q = PyTaskQ()
+
+    @q.task(type="io")
+    def reminder(delay_seconds=0, tag=""):
+        return delay_seconds
+    with patch("pytaskq.app._redis", lambda: r):
+        job = await reminder.schedule(delay_seconds=7, tag="s", countdown=30)
+    stored = json.loads(await r.hget(f"task:{job['task_id']}", "payload"))
+    assert stored["kwargs"] == {"delay_seconds": 7, "tag": "s"} and job["execute_in_seconds"] == 30
+
+
+async def test_an_unrecoverable_error_is_dead_lettered_without_retries(env):
+    from pytaskq import Unrecoverable
+    r = env
+
+    def lookup():
+        raise Unrecoverable("customer 42 was deleted")
+    tasks = {"lookup": {"handler": lookup, "type": "io", "max_retries": 5}}
+    await queueing.enqueue(r, queueing.new_payload("lookup", task_id="u1", max_retries=5))
+    await run_one(r, tasks)
+    record = await r.hgetall("task:u1")
+    assert record["status"] == "DeadLetter" and "not retried" in record["error"]
+    from pytaskq.net import UnsafeURL
+    assert UnsafeURL.permanent, "an unsafe webhook URL isn't retried either"
+
+
+async def test_the_last_progress_before_returning_is_kept(env):
+    from pytaskq import progress
+    r = env
+
+    def work():
+        for p in range(0, 81, 20):
+            progress(p, f"step {p}")
+        progress(99, "almost")
+        return "done"
+    tasks = {"work": {"handler": work, "type": "io", "max_retries": 0}}
+    await queueing.enqueue(r, queueing.new_payload("work", task_id="pg1"))
+    await run_one(r, tasks)
+    record = await r.hgetall("task:pg1")
+    assert record["status"] == "Success" and record["progress"] == "99.0" and record["progress_message"] == "almost"
+
+
+async def test_with_job_carries_the_job_into_threads_and_progress_stops_when_it_ends(env):
+    import threading
+    from pytaskq import current_task_id, progress, with_job
+    r = env
+    seen = {}
+    leftovers = []
+
+    def work():
+        t = threading.Thread(target=with_job(lambda: seen.update(id=current_task_id(), ok=progress(50, "half"))))
+        t.start()
+        t.join()
+        leftovers.append(with_job(lambda: progress(70)))
+        return "done"
+    tasks = {"work": {"handler": work, "type": "io", "max_retries": 0}}
+    await queueing.enqueue(r, queueing.new_payload("work", task_id="pg2"))
+    await run_one(r, tasks)
+    assert seen == {"id": "pg2", "ok": True}
+    assert leftovers[0]() is False, "a finished job takes no more progress"
+
+
+async def test_a_result_that_cant_be_turned_into_text_still_succeeds(env):
+    r = env
+
+    class Broken:
+        def __str__(self):
+            raise RuntimeError("str exploded")
+
+        __repr__ = __str__
+    tasks = {"ret": {"handler": lambda: {"a": Broken()}, "type": "io", "max_retries": 0}}
+    await queueing.enqueue(r, queueing.new_payload("ret", task_id="br1"))
+    await run_one(r, tasks)
+    record = await r.hgetall("task:br1")
+    assert record["status"] == "Success" and "unreadable Broken" in record["result"]
+
+
+async def test_a_cpu_tasks_exception_that_cant_be_rebuilt_keeps_its_name_and_message():
+    from pytaskq.pools import CpuPool
+    from tests import v070_tasks
+    pool = CpuPool(1, modules=("tests.v070_tasks",))
+    await pool.start()
+    try:
+        async def started():
+            return None
+        with pytest.raises(Exception) as info:
+            await pool.execute(v070_tasks.raise_weird, (), {}, 10, started)
+        assert type(info.value).__name__ == "Weird" and str(info.value) == "x"
+    finally:
+        await pool.close(grace=1)
+
+
+async def test_jobs_queued_on_a_machine_with_a_wrong_clock_get_redis_time(env):
+    from pytaskq.core import clock
+    r = env
+    real = time.time
+    with patch.object(clock, "_offset", 0.0), patch.object(clock, "_measured_at", 0.0), \
+            patch.object(clock, "time", __import__("types").SimpleNamespace(time=lambda: real() - 600,
+                                                                           monotonic=time.monotonic)):
+        await queueing.enqueue(r, queueing.new_payload("echo", task_id="ck1"))
+    assert abs(float(await r.hget("task:ck1", "created_at")) - real()) < 5
+
+
+async def test_an_empty_idempotency_key_is_refused_and_a_duplicate_reports_where_the_job_is(env):
+    r = env
+    with pytest.raises(ValueError, match="Idempotency-Key"):
+        await queueing.enqueue(r, queueing.new_payload("echo"), idempotency_key="")
+    first = await queueing.enqueue(r, queueing.new_payload("echo"), idempotency_key="k-1")
+    again = await queueing.enqueue(r, queueing.new_payload("echo"), idempotency_key="k-1")
+    assert again["duplicate"] and again["task_id"] == first["task_id"] and again["status"] == "queued"
+    await r.delete(f"task:{first['task_id']}")                      # finished long ago, record gone
+    gone = await queueing.enqueue(r, queueing.new_payload("echo"), idempotency_key="k-1")
+    assert gone["duplicate"] and gone["status"] == "unknown"
+
+
+def test_cpu_process_crashes_dont_leak_pipes():
+    import asyncio as aio
+    from pytaskq.pools import CpuPool, ProcessCrashed
+    from tests import brk_tasks
+
+    def fds():
+        return len(os.listdir("/proc/self/fd")) if os.path.isdir("/proc/self/fd") else 0
+
+    async def go():
+        pool = CpuPool(1, modules=("tests.brk_tasks",))
+        await pool.start()
+
+        async def started():
+            return None
+        before = fds()
+        for _ in range(30):
+            with pytest.raises(ProcessCrashed):
+                await pool.execute(brk_tasks.crash, (), {}, 10, started)
+            for _ in range(50):
+                if pool._idle.qsize():
+                    break
+                await aio.sleep(0.05)
+        after = fds()
+        await pool.close(grace=1)
+        return before, after
+    before, after = aio.run(go())
+    if before:
+        assert after - before <= 6, (before, after)

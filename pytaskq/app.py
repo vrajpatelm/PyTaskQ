@@ -47,6 +47,7 @@ import json
 import os
 import logging
 import re
+import threading
 import time
 from typing import Any, Callable, Optional, cast
 
@@ -66,9 +67,13 @@ _DELAY_OPTIONS = ("priority", "queue", "on_success_url", "idempotency_key", "cou
 
 
 def _redis():
-    # Looked up at call time so tests (and apps) can swap the client.
+    """
+    The async client for the running event loop. Looked up at call time so tests (and apps) can
+    swap it. A connection pool belongs to the event loop that opened its connections, so another
+    loop (asyncio.run() per call, a thread, a forked process) gets a client of its own.
+    """
     from pytaskq.core import redis_client
-    return redis_client.r
+    return redis_client.for_this_loop()
 
 
 def _describe_params(func: Callable) -> list[dict]:
@@ -333,9 +338,13 @@ class PyTaskQ:
                 kwargs, opts = _split(kwargs)
                 return await apply_async(args, kwargs, **opts)
 
-            async def schedule(*args, delay_seconds: float = 60, **kwargs) -> dict:
+            async def schedule(*args, **kwargs) -> dict:
+                # `delay_seconds=` is the delay, unless the task has a parameter with that name
+                # (then it's the task's, and the delay is `countdown=`, else 60 s).
+                delay_seconds = 60.0 if "delay_seconds" in own_params else kwargs.pop("delay_seconds", 60.0)
                 kwargs, opts = _split(kwargs)
-                return await apply_async(args, kwargs, countdown=delay_seconds, **opts)
+                opts.setdefault("countdown", delay_seconds)
+                return await apply_async(args, kwargs, **opts)
 
             def delay_sync(*args, **kwargs) -> dict:
                 """Enqueue from synchronous code (no running event loop). Takes the same options as delay()."""
@@ -408,14 +417,22 @@ class PyTaskQ:
             await asyncio.sleep(min(delay, max(0.0, deadline - time.monotonic())))
             delay = min(delay * 1.5, poll_interval)
 
-    async def cancel(self, task_id: str) -> bool:
+    async def cancel(self, task_id: str):
         """
-        Cancel a job. A waiting job won't run; a running one is stopped by its
-        worker within about a second (then its status is Cancelled). False if
-        it already finished or doesn't exist.
+        Cancel a job. Returns:
+
+        - "cancelled": it was waiting, and won't run;
+        - "stopping": it's running, and its worker stops it within about a second. Its status
+          becomes Cancelled, and whatever it does after that is ignored (an IO thread can't be
+          stopped, so its code may still run to the end);
+        - False: it already finished, or there's no such job.
+
+        Both strings are truthy, so `if await app.cancel(id):` keeps working.
         """
-        ok, _ = await queueing.cancel(_redis(), task_id)
-        return ok
+        ok, what = await queueing.cancel(_redis(), task_id)
+        if not ok:
+            return False
+        return "stopping" if str(what).lower() in ("stopping", "processing", "running") else "cancelled"
 
     # ── workflows ────────────────────────────────────────────────────────────
     async def workflow(self, flow, *, name: Optional[str] = None, on_failure: str = "stop",
@@ -523,6 +540,46 @@ def _check_time_zone(name: str) -> None:
                          f"or 'Asia/Kolkata'.") from None
 
 
+class _SyncBridge:
+    """
+    One background event loop per process for delay_sync(), with its own connection pool that
+    stays open: a sync enqueue costs one round trip, not a new connection and event loop each time.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._thread: Optional[threading.Thread] = None
+        self._pid = 0
+        self._clients: dict = {}
+
+    def _ensure(self) -> asyncio.AbstractEventLoop:
+        with self._lock:
+            if self._pid != os.getpid() or self._loop is None or self._thread is None or not self._thread.is_alive():
+                self._loop, self._clients, self._pid = asyncio.new_event_loop(), {}, os.getpid()
+                self._thread = threading.Thread(target=self._loop.run_forever, name="pytaskq-sync", daemon=True)
+                self._thread.start()
+            return self._loop
+
+    def run(self, coro_factory):
+        loop = self._ensure()
+        if threading.current_thread() is self._thread:
+            raise RuntimeError("delay_sync() can't be called from inside PyTaskQ's own event loop")
+
+        async def go():
+            from pytaskq.core import redis_client
+            key = (redis_client.make_client, settings.REDIS_URL, settings.REDIS_SENTINELS, settings.REDIS_HOST,
+                   settings.REDIS_PORT, settings.REDIS_DB, settings.REDIS_PASSWORD)
+            client = self._clients.get(key)
+            if client is None:
+                client = self._clients[key] = redis_client.make_client()
+            return await coro_factory(client)
+        return asyncio.run_coroutine_threadsafe(go(), loop).result()
+
+
+_bridge = _SyncBridge()
+
+
 def _run_sync(coro_factory):
     try:
         asyncio.get_running_loop()
@@ -530,16 +587,7 @@ def _run_sync(coro_factory):
         pass
     else:
         raise RuntimeError("delay_sync() was called inside a running event loop; use `await task.delay(...)` instead")
-
-    async def runner():
-        from pytaskq.core.redis_client import make_client
-        client = make_client()
-        try:
-            return await coro_factory(client)
-        finally:
-            await client.aclose()
-
-    return asyncio.run(runner())
+    return _bridge.run(coro_factory)
 
 
 # ── Built-in task: webhook delivery ─────────────────────────────────────────────

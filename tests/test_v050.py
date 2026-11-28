@@ -895,7 +895,7 @@ async def test_7d_finished_jobs_cant_be_cancelled_and_app_cancel_reports_it(env)
         await queueing.enqueue(r, queueing.new_payload("ok", [], task_id="d2"))
         await pop(r)
         await r.hset("task:d2", "status", "Processing")
-        assert await q.cancel("d2") is True
+        assert await q.cancel("d2") == "stopping"
 
 
 # ── 7e. pausing queues ───────────────────────────────────────────────────────

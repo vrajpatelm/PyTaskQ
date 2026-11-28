@@ -45,3 +45,15 @@ async def stubborn_forever(tag=""):
             await asyncio.sleep(0.2)
         except BaseException:
             _log("stubborn_swallowed", tag)
+
+
+class Weird(Exception):
+    """Like many client-library errors: pickles, but can't be rebuilt from its args."""
+
+    def __init__(self, a, b):
+        super().__init__(a)
+        self.b = b
+
+
+def raise_weird():
+    raise Weird("x", "y")
