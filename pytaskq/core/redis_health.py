@@ -35,6 +35,51 @@ def is_oom(exc: BaseException) -> bool:
     return isinstance(exc, redis_errors.OutOfMemoryError) or "OOM command not allowed" in str(exc)
 
 
+# Refusals that pass by themselves: a failover in progress (READONLY, MASTERDOWN), too few replicas
+# (NOREPLICAS), a failed background save (MISCONF), another client's long script (BUSY), a restart
+# loading its data (LOADING), a resharding (TRYAGAIN, CLUSTERDOWN). Recording an outcome waits them out.
+TEMPORARY_PREFIXES = ("READONLY", "NOREPLICAS", "MISCONF", "BUSY", "LOADING", "MASTERDOWN", "TRYAGAIN",
+                      "CLUSTERDOWN")
+_TEMPORARY_TEXT = ("You can't write against a read only replica", "Redis is loading the dataset in memory",
+                   "Redis is busy running a script", "max number of clients reached")
+
+
+def is_temporary(exc: BaseException) -> bool:
+    """A Redis refusal that goes away on its own (retry it), as opposed to a bug or a wrong setting."""
+    if isinstance(exc, (redis_errors.ReadOnlyError, redis_errors.BusyLoadingError)):
+        return True
+    if not isinstance(exc, redis_errors.ResponseError):
+        return False
+    text = str(exc).lstrip()
+    return text.startswith(TEMPORARY_PREFIXES) or any(t in text for t in _TEMPORARY_TEXT)
+
+
+def is_wrong_type(exc: BaseException) -> bool:
+    """A PyTaskQ script refused to touch a key that holds the wrong type (nothing was written)."""
+    return "PYTASKQ_WRONGTYPE" in str(exc)
+
+
+def explain(exc: BaseException) -> str:
+    """One line for the log: what Redis said and what to do about it."""
+    text = str(exc).strip() or type(exc).__name__
+    if is_oom(exc):
+        return "Redis is out of memory"
+    if is_config_error(exc):
+        return f"Redis refused the password or permissions ({text})"
+    if "max number of clients reached" in text:
+        return ("Redis has no free connections (maxclients reached). Each worker holds about 6, each API "
+                "process up to REDIS_MAX_CONNECTIONS; raise maxclients or use fewer processes")
+    if is_wrong_type(exc):
+        key = text.split("key ", 1)[-1]
+        return (f"a Redis key has the wrong type: {key}. Another app or a hand edit wrote it. Rename or delete "
+                f"that key, or give PyTaskQ its own keys with REDIS_KEY_PREFIX")
+    if isinstance(exc, redis_errors.ReadOnlyError) or text.startswith("READONLY"):
+        return f"Redis is read-only right now (a replica, or a failover in progress): {text}"
+    if is_temporary(exc):
+        return f"Redis refused it for now: {text}"
+    return f"{type(exc).__name__}: {text}"
+
+
 def is_config_error(exc: BaseException) -> bool:
     """Errors that retrying won't fix: a wrong password, a user without permission."""
     if isinstance(exc, (redis_errors.AuthenticationError, redis_errors.AuthenticationWrongNumberOfArgsError,

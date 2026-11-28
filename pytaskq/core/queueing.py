@@ -262,6 +262,21 @@ end
 """
 
 
+# Refuse to touch a key that holds the wrong type (another app sharing the Redis, a hand edit),
+# BEFORE a script writes anything: Redis doesn't roll back a script that fails half-way, so a
+# WRONGTYPE error after a job left its list would lose it. Use as
+#   local bad = pytaskq_need(KEYS[4], 'list') or pytaskq_need(KEYS[6], 'zset'); if bad then return bad end
+TYPE_LUA = """
+local function pytaskq_need(key, kind)
+    local t = redis.call('TYPE', key)['ok']
+    if t ~= 'none' and t ~= kind then
+        return redis.error_reply('PYTASKQ_WRONGTYPE key ' .. key .. ' holds a ' .. t .. ', PyTaskQ needs a ' .. kind)
+    end
+    return nil
+end
+"""
+
+
 # Wake-up tokens: queueing a job pushes a token on its queue's wake list, and idle
 # workers BLPOP on it, so a job is picked up within milliseconds. Tokens are only a
 # hint: the pop script takes the job; a stale token costs one empty pop.
@@ -391,12 +406,17 @@ async def find_duplicate(r, key: Optional[str], payload: dict, delay_seconds: fl
 #         11 "1" = may run when Redis is full (internal follow-ups), 12 MAX_QUEUES (0 = none),
 #         13.. task hash fields (name, value, …)
 # Returns {1} queued, {2, record} idempotency key already used, {3} lock already taken, {0, waiting} full,
-#         {4, status} the task id belongs to a job that hasn't finished, {5, count} too many queues.
+#         {4, status} the task id belongs to a job that hasn't finished, {5, count} too many queues;
+#         a PYTASKQ_WRONGTYPE error (nothing written) when one of these keys holds another type.
 # Reusing the id of a finished job drops its old record, fence, history entry and cancel request.
 # A cancel request for an id with no record yet is kept: it stops a cancelled workflow's later steps.
 # The task hash has no expiry while the job waits: it gets RESULT_TTL when the job finishes.
-ENQUEUE_SCRIPT = WAKE_LUA + """
+ENQUEUE_SCRIPT = WAKE_LUA + TYPE_LUA + """
 local unpack = unpack or table.unpack
+local bad = pytaskq_need(KEYS[1], ARGV[2] == 'list' and 'list' or 'zset') or pytaskq_need(KEYS[2], 'hash')
+    or pytaskq_need(KEYS[3], 'list') or pytaskq_need(KEYS[4], 'set') or pytaskq_need(KEYS[7], 'list')
+    or pytaskq_need(KEYS[8], 'list') or pytaskq_need(KEYS[9], 'list') or pytaskq_need(KEYS[11], 'zset')
+if bad then return bad end
 if ARGV[11] == '1' then redis.call('DEL', '__PYTASKQ__pytaskq:oom-probe') end
 -- Re-sent after a lost reply: this call already queued the job.
 for i = 13, #ARGV - 1, 2 do

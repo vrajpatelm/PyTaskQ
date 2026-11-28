@@ -58,6 +58,11 @@ async def reset_worker_globals():
     worker.active_tasks.clear()
     worker._held.clear()
     worker._suspects = set()
+    worker._name_lost = False
+    worker._skip_grace = asyncio.Event()
+    worker._abandoned_async.clear()
+    worker._finishing.clear()
+    worker._promote_from = 0
     pressure._pending.clear()
     yield
     pressure._pending.clear()

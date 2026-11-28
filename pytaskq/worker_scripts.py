@@ -32,9 +32,11 @@ return -1
 # Starts with OOM_PROBE: taking a job must work when Redis is full (finishing jobs frees memory).
 # KEYS: processing list, the queue lists in order [, paused-queues hash]
 # ARGV (optional): the queue name of each list; paused queues are skipped in the same step.
+# Returns the job, or nil. A list key holding another type is skipped (so one bad key can't stop
+# every queue); if nothing was found, the reply is {"PYTASKQ_WRONGTYPE", key, …} instead of nil.
 PRIORITY_POP_SCRIPT = OOM_PROBE + """
 local dest = KEYS[1]
-local last, paused, skip = #KEYS, nil, {}
+local last, paused, skip, bad = #KEYS, nil, {}, nil
 if #ARGV > 0 then
     paused, last = KEYS[#KEYS], #KEYS - 1
 end
@@ -44,13 +46,26 @@ for i = 2, last do
         skip[name] = redis.call('HEXISTS', paused, name) == 1
     end
     if not (paused and skip[name]) then
-        local val = redis.call('RPOPLPUSH', KEYS[i], dest)
-        if val then
+        local val = redis.pcall('RPOPLPUSH', KEYS[i], dest)
+        if type(val) == 'table' and val.err then
+            if string.find(tostring(val.err), 'WRONGTYPE', 1, true) then
+                bad = bad or {'PYTASKQ_WRONGTYPE'}
+                table.insert(bad, KEYS[i])
+            else
+                return redis.error_reply(tostring(val.err))
+            end
+        elseif val then
             return val
         end
     end
 end
-return nil
+return bad
+"""
+
+# Give up the leader lock on a clean stop, so another worker leads at once.  KEYS: lock   ARGV: worker id
+LEADER_RELEASE_SCRIPT = """
+if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('DEL', KEYS[1]) end
+return 0
 """
 
 # Take or renew the leader lock atomically.  KEYS: lock   ARGV: worker id, seconds
@@ -68,8 +83,11 @@ return 0
 #       [, the job's cancel request: deleted]
 # ARGV: payload, my fence token, strict (1 = a retry after a lost reply), task id, result,
 #       finished_at, duration_ms, result_dropped, result TTL, jobs kept, task-key prefix
-# Returns 1 saved, 0 stale attempt (a newer one owns the job), -1 nothing to do (already done).
-COMPLETE_SCRIPT = queueing.KEEP_LUA + """
+# Returns 1 saved, 0 stale attempt (a newer one owns the job), -1 nothing to do (already done);
+# a PYTASKQ_WRONGTYPE error (nothing written) when a key holds another type.
+COMPLETE_SCRIPT = queueing.KEEP_LUA + queueing.TYPE_LUA + """
+local bad = pytaskq_need(KEYS[1], 'list') or pytaskq_need(KEYS[3], 'hash') or pytaskq_need(KEYS[6], 'zset')
+if bad then return bad end
 local removed = redis.call('LREM', KEYS[1], 1, ARGV[1])
 -- Already done by this call: a re-send after a lost reply.
 if removed == 0 and (ARGV[3] == '1' or redis.call('HGET', KEYS[3], 'status') == 'Success') then return -1 end
@@ -88,8 +106,8 @@ end
 redis.call('EXPIRE', KEYS[3], tonumber(ARGV[9]))
 pytaskq_keep(KEYS[6], ARGV[4], ARGV[6], tonumber(ARGV[10]), ARGV[11])
 if KEYS[7] then redis.call('DEL', KEYS[7]) end
-redis.call('INCR', KEYS[5])
-redis.call('HINCRBY', KEYS[4], 'processed', 1)
+redis.pcall('INCR', KEYS[5])                       -- counters only: a broken one never loses a job
+redis.pcall('HINCRBY', KEYS[4], 'processed', 1)
 redis.call('PUBLISH', '__PYTASKQ__events:global', 'update')
 return 1
 """
@@ -100,9 +118,13 @@ return 1
 # ARGV: payload, my fence token, strict, "dead" | "retry", dlq entry or retry payload, retry due time,
 #       hash TTL ("" = keep until finished), dead-letter limit, task id, now, jobs kept, task-key prefix,
 #       then task hash fields (name, value, …)
-# Returns 1 recorded, 2 recorded and old dead letters trimmed, 0 stale attempt, -1 already done.
-FAIL_SCRIPT = queueing.KEEP_LUA + """
+# Returns 1 recorded, 2 recorded and old dead letters trimmed, 0 stale attempt, -1 already done;
+# a PYTASKQ_WRONGTYPE error (nothing written) when a key holds another type.
+FAIL_SCRIPT = queueing.KEEP_LUA + queueing.TYPE_LUA + """
 local unpack = unpack or table.unpack
+local bad = pytaskq_need(KEYS[1], 'list') or pytaskq_need(KEYS[3], 'hash')
+    or pytaskq_need(KEYS[4], ARGV[4] == 'dead' and 'list' or 'zset') or pytaskq_need(KEYS[7], 'zset')
+if bad then return bad end
 local removed = redis.call('LREM', KEYS[1], 1, ARGV[1])
 if removed == 0 then
     -- Already recorded by this call (a re-send after a lost reply): no second dead letter or retry.
@@ -114,8 +136,8 @@ if current and current ~= ARGV[2] then
     redis.call('PUBLISH', '__PYTASKQ__events:global', 'update')
     return 0
 end
-redis.call('INCR', KEYS[6])
-redis.call('HINCRBY', KEYS[5], 'failed', 1)
+redis.pcall('INCR', KEYS[6])                       -- counters only: a broken one never loses a job
+redis.pcall('HINCRBY', KEYS[5], 'failed', 1)
 local trimmed = 0
 if ARGV[4] == 'dead' then
     redis.call('LPUSH', KEYS[4], ARGV[5])
@@ -142,16 +164,43 @@ return 1 + trimmed
 # Put a job from a processing list back on its queue, only if it's still listed
 # (a job that just finished is never queued again).
 # KEYS: processing list, fence, target list, task hash, queue-name set, the queue's wake list
+#       [, dlq, finished-jobs set, failed counter: only with a recovery limit]
 # ARGV: payload as listed, new payload, fence value read before ("" = none), new fence, note, "front" | "back",
-#       queue name
-# Returns 1 put back, 2 was already finished (entry dropped), 0 not in the list, -2 fence changed (read again).
-PUT_BACK_SCRIPT = queueing.WAKE_LUA + """
+#       queue name [, recovery limit (0 = none), dead-letter entry, now, result TTL, dead-letter limit, jobs kept,
+#       task-key prefix, error]
+# With a recovery limit, a job that was running (status Processing) counts one more recovery; at the
+# limit it is dead-lettered instead of put back (its worker stopped that many times while running it).
+# Returns 1 put back, 2 was already finished (entry dropped), 3 dead-lettered (recovery limit), 0 not in the
+# list, -2 fence changed (read again); a PYTASKQ_WRONGTYPE error (nothing written) when a key holds another type.
+PUT_BACK_SCRIPT = queueing.WAKE_LUA + queueing.KEEP_LUA + queueing.TYPE_LUA + """
+local limit = tonumber(ARGV[8] or '0') or 0
+local bad = pytaskq_need(KEYS[1], 'list') or pytaskq_need(KEYS[3], 'list') or pytaskq_need(KEYS[4], 'hash')
+    or pytaskq_need(KEYS[5], 'set')
+if not bad and limit > 0 then bad = pytaskq_need(KEYS[7], 'list') or pytaskq_need(KEYS[8], 'zset') end
+if bad then return bad end
 local current = redis.call('GET', KEYS[2])
 if (current or '') ~= ARGV[3] then return -2 end
 if redis.call('LREM', KEYS[1], 1, ARGV[1]) == 0 then return 0 end
 local status = redis.call('HGET', KEYS[4], 'status')
 if status == 'Success' or status == 'DeadLetter' or status == 'Cancelled' or status == 'Failed' then
     return 2
+end
+if limit > 0 and status == 'Processing' then
+    local n = redis.call('HINCRBY', KEYS[4], 'recoveries', 1)
+    if n >= limit then
+        redis.call('LPUSH', KEYS[7], ARGV[9])
+        local dl = tonumber(ARGV[12])
+        if dl > 0 and redis.call('LLEN', KEYS[7]) > dl then redis.call('LTRIM', KEYS[7], 0, dl - 1) end
+        redis.call('HSET', KEYS[4], 'status', 'DeadLetter', 'finished_at', ARGV[10], 'error', ARGV[15],
+                   'note', ARGV[5])
+        redis.call('HDEL', KEYS[4], 'worker_id')
+        redis.call('EXPIRE', KEYS[4], tonumber(ARGV[11]))
+        local id = redis.call('HGET', KEYS[4], 'task_id')
+        if id then pytaskq_keep(KEYS[8], id, ARGV[10], tonumber(ARGV[13]), ARGV[14]) end
+        redis.pcall('INCR', KEYS[9])
+        redis.call('PUBLISH', '__PYTASKQ__events:global', 'update')
+        return 3
+    end
 end
 redis.call('SET', KEYS[2], ARGV[4], 'EX', 86400)
 if ARGV[6] == 'front' then
@@ -160,7 +209,8 @@ else
     redis.call('LPUSH', KEYS[3], ARGV[2])
 end
 redis.call('SADD', KEYS[5], ARGV[7])
-pytaskq_wake(KEYS[6], 100)
+redis.pcall('LPUSH', KEYS[6], '1')                  -- the wake-up token is only a hint
+redis.pcall('LTRIM', KEYS[6], 0, 99)
 if status then
     redis.call('HSET', KEYS[4], 'status', 'Queued', 'payload', ARGV[2], 'note', ARGV[5])
     redis.call('HDEL', KEYS[4], 'started_at', 'worker_id')
@@ -184,7 +234,10 @@ return 1
 # A cancelled job stopped while running. KEYS: processing list, fence, task hash, finished set, cancel request
 # ARGV: payload as listed, fence token, retrying after a lost reply, task id, now, ttl, keep limit, task key
 # prefix, note, duration (ms)
-CANCELLED_RUN_SCRIPT = queueing.KEEP_LUA + """
+# Returns 1 recorded, 0 stale attempt, -1 already done; a PYTASKQ_WRONGTYPE error (nothing written).
+CANCELLED_RUN_SCRIPT = queueing.KEEP_LUA + queueing.TYPE_LUA + """
+local bad = pytaskq_need(KEYS[1], 'list') or pytaskq_need(KEYS[3], 'hash') or pytaskq_need(KEYS[4], 'zset')
+if bad then return bad end
 local removed = redis.call('LREM', KEYS[1], 1, ARGV[1])
 if removed == 0 and (ARGV[3] == '1' or redis.call('HGET', KEYS[3], 'status') == 'Cancelled') then return -1 end
 local current = redis.call('GET', KEYS[2])
@@ -321,13 +374,14 @@ return string.format('%.6f', slot)
 # KEYS: delayed set, queue-name set, each queue's 3 lists, each queue's wake list, then per job: target list,
 #       task hash
 # ARGV: capacity (0 = none), number of queues, the queue names, then per job: payload, queue index (1-based)
-# Returns {moved, skipped because the queue was full}
+# Returns {moved, skipped because the queue was full, the indexes (1-based) of the queues that were full}
 PROMOTE_SCRIPT = queueing.WAKE_LUA + """
 local cap = tonumber(ARGV[1])
 local nq = tonumber(ARGV[2])
 local counts = {}
 local used = {}
 local moved, full = 0, 0
+local fullq, fulllist = {}, {}
 local base = 2 + nq * 4
 local first = 2 + nq
 local n = (#ARGV - first) / 2
@@ -345,6 +399,10 @@ for i = 1, n do
     end
     if not room then
         full = full + 1
+        if not fullq[qi] then
+            fullq[qi] = true
+            table.insert(fulllist, qi)
+        end
     elseif redis.call('ZREM', KEYS[1], raw) == 1 then
         redis.call('LPUSH', KEYS[base + 2 * i - 1], raw)
         if cap > 0 then counts[qi] = counts[qi] + 1 end
@@ -362,7 +420,7 @@ for qi, _ in pairs(used) do
     pytaskq_wake(KEYS[2 + nq * 3 + qi], 100)
 end
 if moved > 0 then redis.call('PUBLISH', '__PYTASKQ__events:global', 'update') end
-return {moved, full}
+return {moved, full, fulllist}
 """
 
 # An invalid job found in a queue or the delayed set becomes a dead letter instead of being dropped.
@@ -406,9 +464,18 @@ return 1
 
 # "This worker is alive" (works when Redis is full).
 # KEYS: active_workers, worker hash, workers set, queue-name set
-# ARGV: worker id, alive until, hash TTL, number of queue names, queue names…, hash fields…
+# ARGV: worker id, alive until, hash TTL, number of queue names, queue names…, hash fields… (with boot_id)
+# Returns 1, or 0 when the name now belongs to another process (a different boot_id): nothing written.
 HEARTBEAT_SCRIPT = OOM_PROBE + """
 local unpack = unpack or table.unpack
+-- Another live process took this name (after this one was paused past its heartbeat): stop.
+local nq0 = tonumber(ARGV[4])
+for i = 5 + nq0, #ARGV - 1, 2 do
+    if ARGV[i] == 'boot_id' then
+        local owner = redis.call('HGET', KEYS[2], 'boot_id')
+        if owner and owner ~= '' and owner ~= ARGV[i + 1] then return 0 end
+    end
+end
 redis.call('ZADD', KEYS[1], ARGV[2], ARGV[1])
 redis.call('SADD', KEYS[3], ARGV[1])
 local nq = tonumber(ARGV[4])
